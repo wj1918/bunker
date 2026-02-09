@@ -1,0 +1,152 @@
+# Bunker Proxy Server Configuration
+# All values shown are defaults unless otherwise noted
+
+# Address to listen for HTTP/HTTPS proxy requests
+listen_addr: "192.168.1.1:8080"
+
+# Enable system tray icon (Windows only)
+tray_enabled: true
+
+# DNS server configuration (optional - comment out to disable)
+dns:
+  # Address to listen for DNS queries
+  listen: "192.168.1.1:53"
+
+  # Single upstream DNS server (for backward compatibility)
+  upstream: "8.8.8.8:53"
+
+  # Multiple upstream DNS servers for failover (tried in order)
+  # upstreams:
+  #   - "8.8.8.8:53"
+  #   - "1.1.1.1:53"
+  #   - "[2001:4860:4860::8888]:53"  # Google IPv6 DNS
+
+  # DNS security settings
+  security:
+    # Rate limiting (queries per second per IP)
+    rate_limit_enabled: true
+    max_qps: 20
+    # Block ANY queries (amplification attack risk)
+    block_any_queries: true
+    # Block zone transfer queries (AXFR/IXFR)
+    block_zone_transfers: true
+    # Verify response comes from expected upstream (anti-spoofing)
+    verify_upstream_source: true
+    # Maximum number of IPs to track for rate limiting
+    max_tracked_ips: 50000
+    # Use /64 subnet for IPv6 rate limiting (prevents bypass via address rotation)
+    ipv6_subnet_rate_limit: true
+
+  # DNS caching settings
+  cache:
+    enabled: true
+    max_entries: 10000
+    min_ttl_seconds: 60      # Minimum TTL (even if DNS says 0)
+    max_ttl_seconds: 86400   # Maximum TTL (24 hours)
+
+  # DNS failover settings (for multiple upstreams)
+  failover:
+    timeout_ms: 2000         # Timeout per upstream (2 seconds)
+    max_retries: 1           # Retry entire chain once
+    serve_stale: true        # Return expired cache entries on total failure
+
+# Security configuration (SSRF prevention, rate limiting)
+security:
+  # Block CONNECT to private/internal IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x)
+  block_private_ips: true
+
+  # Additional hosts to block (supports wildcards)
+  blocked_hosts: []
+  #  - "*.internal"
+  #  - "secret-server.local"
+  #  - "metadata.*"
+
+  # If set, only allow CONNECT to these ports (empty = allow all)
+  allowed_ports: []
+  #  - 80
+  #  - 443
+  #  - 8443
+  #  - 22
+
+  # Only allow connections from these source IPs (empty = allow all)
+  # Supports individual IPs and CIDR notation (IPv4 and IPv6)
+  allowed_source_ips:
+    - "127.0.0.1"
+    - "192.168.1.0/24"
+  #  - "192.168.1.3"
+  #  - "192.168.1.4"
+  #  - "192.168.1.10"
+  #  - "::1"
+  #  - "2001:db8::/32"
+
+  # Maximum concurrent connections (0 = unlimited)
+  max_connections: 1000
+
+  # Maximum request body size in bytes (0 = unlimited)
+  max_request_body_bytes: 10485760  # 10MB
+
+  # Header read timeout in seconds (slowloris protection, 0 = disabled)
+  header_read_timeout_seconds: 30
+
+  # Maximum requests per keep-alive connection (0 = unlimited)
+  max_requests_per_connection: 1000
+
+  # Rate limiting per source IP
+  rate_limit:
+    enabled: true
+    max_requests: 100        # Requests per window
+    window_seconds: 60       # Time window in seconds
+    max_tracked_ips: 100000  # Maximum IPs to track (memory protection)
+    ipv6_subnet_rate_limit: true  # Use /64 subnet for IPv6
+
+# Connection pool configuration (HTTP/1.1 keep-alive)
+connection_pool:
+  # Enable connection pooling for upstream connections
+  enabled: true
+  # Maximum pooled connections per target host
+  max_connections_per_host: 10
+  # Maximum total connections across all hosts (memory protection)
+  max_total_connections: 1000
+  # Close idle connections after this many seconds
+  idle_timeout_seconds: 60
+  # Close connections after this many seconds regardless of activity
+  max_lifetime_seconds: 300
+  # Timeout for establishing new connections
+  connect_timeout_seconds: 10
+
+# TCP keep-alive configuration (for long-lived connections)
+tcp_keepalive:
+  # Enable OS-level TCP keep-alive
+  enabled: true
+  # Start probes after this many seconds of idle
+  time_seconds: 60
+  # Send probes at this interval
+  interval_seconds: 10
+  # Number of failed probes before closing (Linux/macOS only)
+  # retries: 3
+
+# Logging configuration
+logging:
+  # Enable request logging
+  log_requests: true
+  # Log format: "text" or "json"
+  format: text
+  # Redact sensitive headers in logs
+  redact_sensitive_headers: true
+  # Headers to redact (case-insensitive)
+  sensitive_headers:
+    - "authorization"
+    - "proxy-authorization"
+    - "cookie"
+    - "set-cookie"
+    - "x-api-key"
+    - "x-auth-token"
+
+  # File logging ( Uncomment the following lines to enable file logging)
+  # 
+  # file:
+  #   log_dir: "logs"
+  #   file_prefix: "proxy.log"
+  #   rotation: daily          # "daily", "hourly", or "never"
+  #   max_age_days: 7          # Days to keep old logs (0 = keep forever)
+  #   compress: true           # Compress rotated logs with gzip (.gz)
