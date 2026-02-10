@@ -112,11 +112,7 @@ impl DnsCache {
     pub fn stats(&self) -> (usize, usize) {
         let total = self.entries.len();
         let now = Instant::now();
-        let valid = self
-            .entries
-            .values()
-            .filter(|e| e.expires_at > now)
-            .count();
+        let valid = self.entries.values().filter(|e| e.expires_at > now).count();
         (total, valid)
     }
 }
@@ -336,7 +332,12 @@ mod tests {
     #[test]
     fn test_cache_ptr_record() {
         let mut cache = DnsCache::new(default_config());
-        cache.put("1.168.192.in-addr.arpa", RecordType::PTR, vec![0, 1, 2, 3], 300);
+        cache.put(
+            "1.168.192.in-addr.arpa",
+            RecordType::PTR,
+            vec![0, 1, 2, 3],
+            300,
+        );
 
         let result = cache.get("1.168.192.in-addr.arpa", RecordType::PTR, 0);
         assert!(result.is_some());

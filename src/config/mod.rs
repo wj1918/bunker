@@ -436,7 +436,6 @@ pub enum LogFormat {
     Json,
 }
 
-
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
@@ -446,7 +445,6 @@ pub enum LogRotation {
     Hourly,
     Never,
 }
-
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {

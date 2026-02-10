@@ -27,8 +27,7 @@ pub fn init_logging(config: &LoggingConfig) -> LogGuard {
         return LogGuard { _file_guard: None };
     }
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     match (&config.format, &config.file) {
         // Text to stdout only
@@ -57,7 +56,9 @@ pub fn init_logging(config: &LoggingConfig) -> LogGuard {
                 .with(fmt::layer().with_writer(io::stdout))
                 .with(fmt::layer().json().with_writer(file_writer))
                 .init();
-            LogGuard { _file_guard: Some(guard) }
+            LogGuard {
+                _file_guard: Some(guard),
+            }
         }
 
         // JSON to stdout + JSON to file
@@ -68,7 +69,9 @@ pub fn init_logging(config: &LoggingConfig) -> LogGuard {
                 .with(fmt::layer().json().with_writer(io::stdout))
                 .with(fmt::layer().json().with_writer(file_writer))
                 .init();
-            LogGuard { _file_guard: Some(guard) }
+            LogGuard {
+                _file_guard: Some(guard),
+            }
         }
     }
 }

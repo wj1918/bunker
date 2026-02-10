@@ -199,10 +199,8 @@ mod tests {
     #[tokio::test]
     async fn test_failover_tries_multiple_upstreams() {
         let resolver = MockDnsResolver::new(1, vec![1, 2, 3, 4]);
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
         let result = handle_dns_query_with_resolver(
             &resolver,
@@ -240,10 +238,8 @@ mod tests {
     #[tokio::test]
     async fn test_all_upstreams_fail() {
         let resolver = MockDnsResolver::new(10, vec![1, 2, 3, 4]);
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
         let result = handle_dns_query_with_resolver(
             &resolver,

@@ -5,9 +5,7 @@ use crate::config::{LoggingConfig, SecurityConfig, TcpKeepaliveConfig};
 use crate::helpers::{apply_tcp_keepalive, error_response};
 use crate::proxy::connect::handle_connect;
 use crate::proxy::pool::SenderPool;
-use crate::security::{
-    is_blocked_target, log_headers_sanitized, resolve_and_validate_host,
-};
+use crate::security::{is_blocked_target, log_headers_sanitized, resolve_and_validate_host};
 use crate::tokio_io::TokioIo;
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -585,7 +583,10 @@ mod tests {
         let req = create_test_request("http://example.com/api/v1/users?id=123&name=test", None);
         let uri = req.uri();
         let path_and_query = uri.path_and_query().map(|x| x.to_string());
-        assert_eq!(path_and_query, Some("/api/v1/users?id=123&name=test".to_string()));
+        assert_eq!(
+            path_and_query,
+            Some("/api/v1/users?id=123&name=test".to_string())
+        );
     }
 
     #[test]
@@ -626,15 +627,30 @@ mod tests {
         ];
 
         // Test that common headers are NOT hop-by-hop
-        let should_forward = ["content-type", "accept", "user-agent", "accept-encoding",
-                              "authorization", "cookie", "x-custom-header"];
+        let should_forward = [
+            "content-type",
+            "accept",
+            "user-agent",
+            "accept-encoding",
+            "authorization",
+            "cookie",
+            "x-custom-header",
+        ];
         for header in should_forward {
-            assert!(!hop_by_hop.contains(&header), "Header {} should be forwarded", header);
+            assert!(
+                !hop_by_hop.contains(&header),
+                "Header {} should be forwarded",
+                header
+            );
         }
 
         // Test that hop-by-hop headers ARE in the list
         for header in &hop_by_hop {
-            assert!(hop_by_hop.contains(header), "Header {} should be hop-by-hop", header);
+            assert!(
+                hop_by_hop.contains(header),
+                "Header {} should be hop-by-hop",
+                header
+            );
         }
     }
 

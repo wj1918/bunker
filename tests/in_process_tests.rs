@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 
 // Import the crate's modules
 use bunker::config::{
-    ConnectionPoolConfig, DnsCacheConfig, DnsFailoverConfig, DnsSecurityConfig,
-    LogFormat, LoggingConfig, RateLimitConfig, SecurityConfig, TcpKeepaliveConfig,
+    ConnectionPoolConfig, DnsCacheConfig, DnsFailoverConfig, DnsSecurityConfig, LogFormat,
+    LoggingConfig, RateLimitConfig, SecurityConfig, TcpKeepaliveConfig,
 };
 use bunker::dns::run_dns_server;
 use bunker::helpers::create_tls_connector;
@@ -50,7 +50,7 @@ fn test_security_config() -> SecurityConfig {
             ipv6_subnet_rate_limit: true,
         },
         max_connections: 0,
-        max_request_body_bytes: 0, // Unlimited for tests
+        max_request_body_bytes: 0,      // Unlimited for tests
         header_read_timeout_seconds: 0, // No timeout for tests
         max_requests_per_connection: 0, // Unlimited for tests
     }
@@ -142,8 +142,7 @@ async fn start_test_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
             let pool = Arc::clone(&sender_pool);
 
             tokio::spawn(async move {
-                let _ = handle_client(stream, client_addr, tls, sec, log, keepalive, pool)
-                    .await;
+                let _ = handle_client(stream, client_addr, tls, sec, log, keepalive, pool).await;
             });
         }
     });
@@ -191,15 +190,19 @@ async fn proxy_request(proxy_addr: SocketAddr, request: &str) -> Result<String, 
         .await
         .map_err(|e| format!("Connect error: {}", e))?;
 
-    stream.write_all(request.as_bytes()).await.map_err(|e| format!("Write error: {}", e))?;
-    stream.flush().await.map_err(|e| format!("Flush error: {}", e))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("Write error: {}", e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("Flush error: {}", e))?;
 
     let mut response = vec![0u8; 8192];
 
-    let read_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        stream.read(&mut response)
-    ).await;
+    let read_result =
+        tokio::time::timeout(Duration::from_secs(10), stream.read(&mut response)).await;
 
     match read_result {
         Ok(Ok(0)) => Err("Connection closed".to_string()),
@@ -304,7 +307,10 @@ async fn test_proxy_bad_request_no_host() {
         }
         Err(e) => {
             // Connection close is also acceptable for bad requests
-            println!("Connection closed/error (acceptable for bad request): {}", e);
+            println!(
+                "Connection closed/error (acceptable for bad request): {}",
+                e
+            );
         }
     }
 }
@@ -351,7 +357,8 @@ async fn test_proxy_blocked_localhost() {
 async fn test_proxy_blocked_metadata_endpoint() {
     let (proxy_addr, _handle) = start_test_proxy().await;
 
-    let request = "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n";
+    let request =
+        "GET http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n";
     let response = proxy_request(proxy_addr, request).await;
 
     match response {
@@ -408,14 +415,18 @@ async fn test_proxy_connect_blocked_loopback() {
 async fn test_proxy_http_request_to_external() {
     let (proxy_addr, _handle) = start_test_proxy().await;
 
-    let request = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let request =
+        "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
     let response = proxy_request(proxy_addr, request).await;
 
     match response {
         Ok(resp) => {
             // Should get 200 OK, 502, 503, or 504 (network issues/timeout)
             assert!(
-                resp.contains("200") || resp.contains("502") || resp.contains("503") || resp.contains("504"),
+                resp.contains("200")
+                    || resp.contains("502")
+                    || resp.contains("503")
+                    || resp.contains("504"),
                 "Expected 200, 502, 503, or 504, got: {}",
                 &resp[..resp.len().min(200)]
             );
@@ -663,7 +674,10 @@ async fn test_proxy_empty_request() {
     let response = proxy_request(proxy_addr, "\r\n\r\n").await;
     // Should handle gracefully (either error or close connection)
     match response {
-        Ok(resp) => println!("Got response for empty request: {}", &resp[..resp.len().min(100)]),
+        Ok(resp) => println!(
+            "Got response for empty request: {}",
+            &resp[..resp.len().min(100)]
+        ),
         Err(e) => println!("Empty request handled: {}", e),
     }
 }
@@ -675,7 +689,10 @@ async fn test_proxy_malformed_request() {
     let response = proxy_request(proxy_addr, "INVALID REQUEST\r\n\r\n").await;
     // Should handle gracefully
     match response {
-        Ok(resp) => println!("Got response for malformed request: {}", &resp[..resp.len().min(100)]),
+        Ok(resp) => println!(
+            "Got response for malformed request: {}",
+            &resp[..resp.len().min(100)]
+        ),
         Err(e) => println!("Malformed request handled: {}", e),
     }
 }
@@ -700,7 +717,11 @@ async fn test_proxy_request_with_body() {
         Ok(resp) => {
             // Should get 200 OK, 502, 503, 504 (network issues/timeout)
             assert!(
-                resp.contains("200") || resp.contains("502") || resp.contains("503") || resp.contains("504") || resp.is_empty(),
+                resp.contains("200")
+                    || resp.contains("502")
+                    || resp.contains("503")
+                    || resp.contains("504")
+                    || resp.is_empty(),
                 "Expected 200, 502, 503, 504, or empty"
             );
         }
@@ -722,7 +743,8 @@ async fn test_proxy_connection_close() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Make another request to verify server is still working
-    let request = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let request =
+        "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
     let response = proxy_request(proxy_addr, request).await;
     match response {
         Ok(resp) => println!("Server still responsive: {}", &resp[..resp.len().min(50)]),
@@ -789,7 +811,10 @@ async fn test_proxy_non_standard_port() {
     match response {
         Ok(resp) => {
             // Should work (unless port allowlist is configured)
-            println!("Non-standard port response: {}", &resp[..resp.len().min(100)]);
+            println!(
+                "Non-standard port response: {}",
+                &resp[..resp.len().min(100)]
+            );
         }
         Err(e) => println!("Non-standard port error: {}", e),
     }

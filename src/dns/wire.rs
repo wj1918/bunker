@@ -595,8 +595,13 @@ mod tests {
 
     #[test]
     fn test_parse_response() {
-        let response =
-            builder::build_response("example.com", "93.184.216.34", 0x1234, 300, ResponseCode::NoError);
+        let response = builder::build_response(
+            "example.com",
+            "93.184.216.34",
+            0x1234,
+            300,
+            ResponseCode::NoError,
+        );
         let parsed = DnsResponse::parse(&response).unwrap();
 
         assert_eq!(parsed.id(), 0x1234);
@@ -800,7 +805,7 @@ mod tests {
         buf.extend_from_slice(&[0x00, 0x00]); // ANCOUNT = 0
         buf.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
         buf.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
-        // Question section
+                                              // Question section
         buf.push(7);
         buf.extend_from_slice(b"example");
         buf.push(3);

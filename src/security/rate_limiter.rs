@@ -21,8 +21,14 @@ fn normalize_ip_for_rate_limit(ip: IpAddr, ipv6_subnet: bool) -> IpAddr {
                 // Zero out the last 64 bits (interface identifier)
                 let segments = v6.segments();
                 let normalized = Ipv6Addr::new(
-                    segments[0], segments[1], segments[2], segments[3],
-                    0, 0, 0, 0,
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
                 );
                 IpAddr::V6(normalized)
             } else {
@@ -117,7 +123,8 @@ impl RateLimiter {
         });
 
         // Also clean up insertion_order
-        self.insertion_order.retain(|ip| self.requests.contains_key(ip));
+        self.insertion_order
+            .retain(|ip| self.requests.contains_key(ip));
     }
 
     /// Get current number of tracked IPs (for monitoring)
@@ -198,7 +205,8 @@ impl DnsRateLimiter {
         });
 
         // Also clean up insertion_order
-        self.insertion_order.retain(|ip| self.queries.contains_key(ip));
+        self.insertion_order
+            .retain(|ip| self.queries.contains_key(ip));
     }
 
     /// Get current number of tracked IPs (for monitoring)

@@ -58,7 +58,9 @@ pub fn error_response(status: u16, msg: &'static str) -> Response<BoxBody<Bytes,
 
 /// Create an empty response body
 pub fn empty_body() -> BoxBody<Bytes, hyper::Error> {
-    Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 #[cfg(test)]

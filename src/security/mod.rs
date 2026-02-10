@@ -41,7 +41,12 @@ pub fn sanitize_header_value(name: &str, value: &str, logging: &LoggingConfig) -
 /// Log headers with sensitive data redacted
 pub fn log_headers_sanitized<'a, I>(headers: I, logging: &LoggingConfig)
 where
-    I: Iterator<Item = (&'a hyper::header::HeaderName, &'a hyper::header::HeaderValue)>,
+    I: Iterator<
+        Item = (
+            &'a hyper::header::HeaderName,
+            &'a hyper::header::HeaderValue,
+        ),
+    >,
 {
     for (name, value) in headers {
         let value_str = value.to_str().unwrap_or("[binary]");

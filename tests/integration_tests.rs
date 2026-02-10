@@ -92,7 +92,7 @@ impl TestHttpServer {
 
 #[cfg(test)]
 mod config_tests {
-    
+
     use std::fs;
 
     #[test]
@@ -351,11 +351,11 @@ mod dns_tests {
 
         // First label: "test" (length 4)
         assert_eq!(query[domain_start], 4);
-        assert_eq!(&query[domain_start+1..domain_start+5], b"test");
+        assert_eq!(&query[domain_start + 1..domain_start + 5], b"test");
 
         // Second label: "example" (length 7)
-        assert_eq!(query[domain_start+5], 7);
-        assert_eq!(&query[domain_start+6..domain_start+13], b"example");
+        assert_eq!(query[domain_start + 5], 7);
+        assert_eq!(&query[domain_start + 6..domain_start + 13], b"example");
     }
 
     #[test]
@@ -371,7 +371,9 @@ mod dns_tests {
     #[test]
     fn test_dns_timeout_handling() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
 
         let mut buf = [0u8; 512];
         let result = socket.recv_from(&mut buf);
@@ -387,9 +389,8 @@ mod tls_tests {
 
     #[test]
     fn test_root_cert_store_creation() {
-        let root_store = rustls::RootCertStore::from_iter(
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
-        );
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         // Should have many root certificates
         assert!(root_store.len() > 100);
@@ -397,9 +398,8 @@ mod tls_tests {
 
     #[test]
     fn test_tls_client_config_creation() {
-        let root_store = rustls::RootCertStore::from_iter(
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
-        );
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -499,7 +499,9 @@ mod integration_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
 
         // Send HTTP request through proxy to a real external server
         let request = "GET http://example.com/ HTTP/1.1\r\n\
@@ -514,12 +516,16 @@ mod integration_tests {
         let response_str = String::from_utf8_lossy(&response);
 
         println!("Response length: {} bytes", response.len());
-        println!("Response preview: {}", &response_str[..response_str.len().min(200)]);
+        println!(
+            "Response preview: {}",
+            &response_str[..response_str.len().min(200)]
+        );
 
         // Should get 200 OK or 502 Bad Gateway (if network issues)
         assert!(
             response_str.contains("200") || response_str.contains("502"),
-            "Expected 200 or 502, got: {}", &response_str[..response_str.len().min(100)]
+            "Expected 200 or 502, got: {}",
+            &response_str[..response_str.len().min(100)]
         );
     }
 
@@ -535,7 +541,9 @@ mod integration_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
 
         // Send CONNECT request
         let request = "CONNECT example.com:443 HTTP/1.1\r\n\
@@ -553,7 +561,8 @@ mod integration_tests {
         // Should get 200 Connection Established or 502 Bad Gateway
         assert!(
             response_str.contains("200") || response_str.contains("502"),
-            "Expected 200 or 502, got: {}", response_str
+            "Expected 200 or 502, got: {}",
+            response_str
         );
     }
 
@@ -569,7 +578,9 @@ mod integration_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         // Send request without Host header and without absolute URI
         let request = "GET /test HTTP/1.1\r\n\r\n";
@@ -584,7 +595,8 @@ mod integration_tests {
         // Should get 400 Bad Request
         assert!(
             response_str.contains("400") || response_str.contains("Bad Request"),
-            "Expected 400, got: {}", response_str
+            "Expected 400, got: {}",
+            response_str
         );
     }
 
@@ -595,7 +607,9 @@ mod integration_tests {
         thread::sleep(Duration::from_millis(500));
 
         let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind UDP socket");
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         // Build DNS query for google.com
         let query = build_simple_dns_query("google.com");
@@ -659,8 +673,8 @@ mod integration_tests {
 
 #[cfg(test)]
 mod stress_tests {
-    use std::net::TcpStream;
     use std::io::Write;
+    use std::net::TcpStream;
     use std::thread;
     use std::time::Duration;
 
@@ -727,11 +741,7 @@ mod error_tests {
 
     #[test]
     fn test_yaml_parse_errors() {
-        let invalid_yamls = [
-            "key: [unclosed",
-            "key: value\n  bad indent",
-            "{{invalid}}",
-        ];
+        let invalid_yamls = ["key: [unclosed", "key: value\n  bad indent", "{{invalid}}"];
 
         for yaml in invalid_yamls {
             let result: Result<serde_yaml_ng::Value, _> = serde_yaml_ng::from_str(yaml);
@@ -855,8 +865,12 @@ mod websocket_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         stream.set_nodelay(true).unwrap();
 
         // Send CONNECT request to echo.websocket.org:443
@@ -899,7 +913,8 @@ mod websocket_tests {
 
         assert!(
             response_str.contains("200") || response_str.contains("502"),
-            "Expected 200 or 502, got: {}", response_str
+            "Expected 200 or 502, got: {}",
+            response_str
         );
     }
 
@@ -917,8 +932,12 @@ mod websocket_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
 
         // Step 1: Establish CONNECT tunnel
         let connect_request = "CONNECT echo.websocket.org:443 HTTP/1.1\r\n\
@@ -956,8 +975,12 @@ mod websocket_tests {
             return;
         }
         let mut stream = stream_result.unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(15))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
 
         // Step 1: CONNECT tunnel
         let connect_request = "CONNECT ws.postman-echo.com:443 HTTP/1.1\r\n\
@@ -976,9 +999,8 @@ mod websocket_tests {
         println!("Step 1: CONNECT tunnel established");
 
         // Step 2: TLS handshake
-        let root_store = rustls::RootCertStore::from_iter(
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
-        );
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -989,10 +1011,8 @@ mod websocket_tests {
             .try_into()
             .expect("Invalid server name");
 
-        let mut conn = rustls::ClientConnection::new(
-            Arc::new(config),
-            server_name
-        ).expect("Failed to create TLS connection");
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .expect("Failed to create TLS connection");
 
         // Perform TLS handshake
         let mut tls_stream = rustls::Stream::new(&mut conn, &mut stream);
@@ -1026,10 +1046,15 @@ mod websocket_tests {
                 // Should get 101 Switching Protocols
                 if ws_response_str.contains("101") {
                     println!("SUCCESS: wss:// WebSocket connection established!");
-                    assert!(ws_response_str.contains("Upgrade: websocket") ||
-                            ws_response_str.contains("upgrade: websocket"));
+                    assert!(
+                        ws_response_str.contains("Upgrade: websocket")
+                            || ws_response_str.contains("upgrade: websocket")
+                    );
                 } else {
-                    println!("Got response but not 101: {}", &ws_response_str[..ws_response_str.len().min(200)]);
+                    println!(
+                        "Got response but not 101: {}",
+                        &ws_response_str[..ws_response_str.len().min(200)]
+                    );
                 }
             }
             Err(e) => {
@@ -1076,11 +1101,13 @@ mod websocket_tests {
 mod cli_tests {
     #[test]
     fn test_arg_parsing_logic() {
-        let args = ["proxy".to_string(),
+        let args = [
+            "proxy".to_string(),
             "192.168.1.1:8080".to_string(),
             "--dns".to_string(),
             "192.168.1.1:53".to_string(),
-            "--no-tray".to_string()];
+            "--no-tray".to_string(),
+        ];
 
         let mut listen_addr: Option<String> = None;
         let mut dns_addr: Option<String> = None;
@@ -1111,9 +1138,11 @@ mod cli_tests {
 
     #[test]
     fn test_config_flag_parsing() {
-        let args = ["proxy".to_string(),
+        let args = [
+            "proxy".to_string(),
             "--config".to_string(),
-            "/path/to/config.yaml".to_string()];
+            "/path/to/config.yaml".to_string(),
+        ];
 
         let mut config_path: Option<String> = None;
         let mut i = 1;

@@ -1,8 +1,6 @@
 //! DNS server implementation with caching, rate limiting, and failover.
 
-use crate::config::{
-    DnsCacheConfig, DnsFailoverConfig, DnsSecurityConfig, LoggingConfig,
-};
+use crate::config::{DnsCacheConfig, DnsFailoverConfig, DnsSecurityConfig, LoggingConfig};
 use crate::dns::cache::DnsCache;
 use crate::dns::resolver::{DnsResolver, UdpDnsResolver};
 use crate::dns::validation::{create_dns_error_response, validate_dns_query};
@@ -147,8 +145,7 @@ pub async fn run_dns_server(
                         error!(client = %src, error = %e, "DNS query handling failed");
                     }
                     // Try to send error response
-                    if let Some(response) =
-                        create_dns_error_response(&buf, ResponseCode::ServFail)
+                    if let Some(response) = create_dns_error_response(&buf, ResponseCode::ServFail)
                     {
                         let _ = socket_clone.send_to(&response, src).await;
                     }
@@ -270,7 +267,12 @@ pub async fn handle_dns_query<R: DnsResolver>(
                     let min_ttl = response.min_ttl();
 
                     let mut cache_guard = cache.lock().await;
-                    cache_guard.put(&query_name, query_type, response_buf.clone(), min_ttl as u64);
+                    cache_guard.put(
+                        &query_name,
+                        query_type,
+                        response_buf.clone(),
+                        min_ttl as u64,
+                    );
                     if enable_logging {
                         debug!(
                             name = %query_name,
@@ -485,10 +487,8 @@ mod tests {
     async fn test_try_upstreams_failover_to_second() {
         let response = vec![1, 2, 3, 4];
         let resolver = MockDnsResolver::new(1, response.clone()); // Fail once
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
         let result = try_upstreams_with_resolver(
             &resolver,
@@ -527,10 +527,8 @@ mod tests {
     #[tokio::test]
     async fn test_try_upstreams_all_fail() {
         let resolver = MockDnsResolver::always_fail();
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
         let result = try_upstreams_with_resolver(
             &resolver,
@@ -562,14 +560,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -625,14 +616,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -657,14 +641,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -688,7 +665,12 @@ mod tests {
         {
             let mut cache_guard = cache.lock().await;
             // Store with TTL 0 so it becomes stale immediately
-            cache_guard.put("stale.example.com.", RecordType::A, stale_response.clone(), 0);
+            cache_guard.put(
+                "stale.example.com.",
+                RecordType::A,
+                stale_response.clone(),
+                0,
+            );
         }
 
         let resolver = MockDnsResolver::always_fail(); // All upstreams fail
@@ -728,14 +710,7 @@ mod tests {
         failover.serve_stale = false; // Disable serve_stale
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -820,24 +795,15 @@ mod tests {
         let response = build_dns_response("failover.example.com", "11.22.33.44", query_id, 300);
         let resolver = MockDnsResolver::new(1, response.clone()); // First fails
 
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
         let client: SocketAddr = "192.168.1.100:12345".parse().unwrap();
         let cache = Arc::new(Mutex::new(DnsCache::new(test_cache_config())));
         let security = test_security_config();
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -864,14 +830,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -895,14 +854,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 
@@ -927,13 +879,7 @@ mod tests {
 
         // Test with logging ENABLED
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
+            &resolver, &query, client, &upstreams, &security, cache, &failover,
             true, // enable_logging = true
         )
         .await;
@@ -988,13 +934,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
+            &resolver, &query, client, &upstreams, &security, cache, &failover,
             true, // enable_logging
         )
         .await;
@@ -1032,10 +972,8 @@ mod tests {
     async fn test_try_upstreams_with_logging() {
         let response = vec![1, 2, 3, 4];
         let resolver = MockDnsResolver::new(1, response.clone()); // Fail once
-        let upstreams: Vec<SocketAddr> = vec![
-            "8.8.8.8:53".parse().unwrap(),
-            "1.1.1.1:53".parse().unwrap(),
-        ];
+        let upstreams: Vec<SocketAddr> =
+            vec!["8.8.8.8:53".parse().unwrap(), "1.1.1.1:53".parse().unwrap()];
 
         let result = try_upstreams_with_resolver(
             &resolver,
@@ -1118,13 +1056,7 @@ mod tests {
         failover.serve_stale = false;
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
+            &resolver, &query, client, &upstreams, &security, cache, &failover,
             true, // enable_logging
         )
         .await;
@@ -1147,14 +1079,7 @@ mod tests {
         let failover = test_failover_config();
 
         let result = handle_dns_query(
-            &resolver,
-            &query,
-            client,
-            &upstreams,
-            &security,
-            cache,
-            &failover,
-            false,
+            &resolver, &query, client, &upstreams, &security, cache, &failover, false,
         )
         .await;
 

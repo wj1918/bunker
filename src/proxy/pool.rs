@@ -69,9 +69,7 @@ impl SenderPool {
 
     /// Evict oldest connections to make room for new ones
     fn evict_if_needed(&mut self) {
-        while self.total_count >= self.config.max_total_connections
-            && !self.host_order.is_empty()
-        {
+        while self.total_count >= self.config.max_total_connections && !self.host_order.is_empty() {
             // Find oldest host with connections
             let mut evicted = false;
             for i in 0..self.host_order.len() {

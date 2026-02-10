@@ -187,7 +187,12 @@ fn show_context_menu(hwnd: isize) {
         let minimize = to_wide("Minimize");
         let quit = to_wide("Quit");
 
-        AppendMenuW(hmenu, MF_STRING, ID_BRING_TO_FRONT as usize, bring_to_front.as_ptr());
+        AppendMenuW(
+            hmenu,
+            MF_STRING,
+            ID_BRING_TO_FRONT as usize,
+            bring_to_front.as_ptr(),
+        );
         AppendMenuW(hmenu, MF_STRING, ID_MINIMIZE as usize, minimize.as_ptr());
         AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(hmenu, MF_STRING, ID_QUIT as usize, quit.as_ptr());
@@ -233,7 +238,12 @@ fn handle_menu_command(cmd: u16) {
     }
 }
 
-unsafe extern "system" fn window_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+unsafe extern "system" fn window_proc(
+    hwnd: isize,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
     match msg {
         WM_TRAYICON => {
             let event = (lparam & 0xFFFF) as u32;
@@ -273,11 +283,11 @@ fn create_tray_icon(hwnd: isize) -> bool {
         // IMAGE_ICON = 1, Icon resource ID = 1 (winres default)
         let mut hicon = LoadImageW(
             hinstance,
-            1 as *const u16,  // MAKEINTRESOURCE(1)
-            1,                // IMAGE_ICON
-            0,                // cx (0 = use default)
-            0,                // cy (0 = use default)
-            0x40,             // LR_DEFAULTSIZE
+            1 as *const u16, // MAKEINTRESOURCE(1)
+            1,               // IMAGE_ICON
+            0,               // cx (0 = use default)
+            0,               // cy (0 = use default)
+            0x40,            // LR_DEFAULTSIZE
         );
 
         // Fall back to system default icon if custom icon not found
@@ -338,9 +348,7 @@ fn remove_tray_icon(hwnd: isize) {
 }
 
 /// Set up the system tray
-pub fn setup_tray(
-    tx: mpsc::Sender<TrayMessage>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn setup_tray(tx: mpsc::Sender<TrayMessage>) -> Result<(), Box<dyn std::error::Error>> {
     // Store the sender globally
     {
         let mut tx_guard = TRAY_TX.lock().unwrap();
@@ -499,7 +507,10 @@ mod tests {
     #[test]
     fn test_to_wide() {
         let wide = to_wide("Test");
-        assert_eq!(wide, vec!['T' as u16, 'e' as u16, 's' as u16, 't' as u16, 0]);
+        assert_eq!(
+            wide,
+            vec!['T' as u16, 'e' as u16, 's' as u16, 't' as u16, 0]
+        );
     }
 
     #[test]

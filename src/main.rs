@@ -348,9 +348,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            if let Err(err) =
-                handle_client(stream, client_addr, tls_connector, security, logging, tcp_keepalive, pool)
-                    .await
+            if let Err(err) = handle_client(
+                stream,
+                client_addr,
+                tls_connector,
+                security,
+                logging,
+                tcp_keepalive,
+                pool,
+            )
+            .await
             {
                 error!(client = %client_addr, error = ?err, "Error serving client");
             }
@@ -381,12 +388,13 @@ fn print_usage(program: &str) {
     eprintln!("  tray_enabled: true");
     eprintln!("  dns:");
     eprintln!("    listen: \"0.0.0.0:53\"");
-    eprintln!(
-        "    upstream: \"8.8.8.8:53\"       # or \"[2001:4860:4860::8888]:53\" for IPv6"
-    );
+    eprintln!("    upstream: \"8.8.8.8:53\"       # or \"[2001:4860:4860::8888]:53\" for IPv6");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  {} 0.0.0.0:8080                              # IPv4 only", program);
+    eprintln!(
+        "  {} 0.0.0.0:8080                              # IPv4 only",
+        program
+    );
     eprintln!(
         "  {} [::]:8080                                 # IPv6 (also accepts IPv4)",
         program
@@ -407,9 +415,18 @@ fn print_usage(program: &str) {
     {
         eprintln!();
         eprintln!("Windows startup:");
-        eprintln!("  {} --install                                  # Add to Windows startup", program);
-        eprintln!("  {} --install -c config.yaml                   # Add with config file", program);
-        eprintln!("  {} --uninstall                                # Remove from Windows startup", program);
+        eprintln!(
+            "  {} --install                                  # Add to Windows startup",
+            program
+        );
+        eprintln!(
+            "  {} --install -c config.yaml                   # Add with config file",
+            program
+        );
+        eprintln!(
+            "  {} --uninstall                                # Remove from Windows startup",
+            program
+        );
     }
 }
 
@@ -479,7 +496,9 @@ mod registry {
 
 /// Install Bunker to Windows startup (Registry Run key)
 #[cfg(windows)]
-fn install_startup(config_path: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn install_startup(
+    config_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use config::load_config;
     use registry::*;
 
@@ -498,7 +517,10 @@ fn install_startup(config_path: Option<&str>) -> Result<(), Box<dyn std::error::
     let (work_dir, cfg_abs_path) = if let Some(cfg_path) = config_path {
         let cfg_abs = std::fs::canonicalize(cfg_path)?;
         let cfg_abs_str = cfg_abs.to_string_lossy();
-        let cfg_abs_str = cfg_abs_str.strip_prefix(r"\\?\").unwrap_or(&cfg_abs_str).to_string();
+        let cfg_abs_str = cfg_abs_str
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&cfg_abs_str)
+            .to_string();
         let dir = std::path::Path::new(&cfg_abs_str)
             .parent()
             .map(|p| p.to_path_buf())
@@ -537,10 +559,7 @@ fn install_startup(config_path: Option<&str>) -> Result<(), Box<dyn std::error::
             work_dir_str, exe_path, cfg_abs
         )
     } else {
-        format!(
-            r#"cmd /c cd /d "{}" && "{}""#,
-            work_dir_str, exe_path
-        )
+        format!(r#"cmd /c cd /d "{}" && "{}""#, work_dir_str, exe_path)
     };
 
     // Add to registry using Win32 API
@@ -631,10 +650,18 @@ fn uninstall_startup() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         // Open with write access to delete
-        let result = RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_WRITE, &mut hkey);
+        let result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            0,
+            KEY_WRITE,
+            &mut hkey,
+        );
 
         if result != ERROR_SUCCESS {
-            return Err(format!("Failed to open registry key for writing: error {}", result).into());
+            return Err(
+                format!("Failed to open registry key for writing: error {}", result).into(),
+            );
         }
 
         let result = RegDeleteValueW(hkey, value_name.as_ptr());

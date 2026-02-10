@@ -102,7 +102,7 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
             ipv6.is_loopback()              // ::1
             || ipv6.is_unspecified()        // ::
             || is_ipv6_unique_local(ipv6)   // fc00::/7 (unique local addresses)
-            || is_ipv6_link_local(ipv6)     // fe80::/10 (link-local addresses)
+            || is_ipv6_link_local(ipv6) // fe80::/10 (link-local addresses)
         }
     }
 }
