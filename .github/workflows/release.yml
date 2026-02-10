@@ -122,13 +122,13 @@ jobs:
           SHA256: ${{ steps.hash.outputs.sha256 }}
         run: |
           URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
-          MANIFEST_DIR="winget-manifests/manifests/w/wj1918/bunker/${VERSION}"
+          MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
           mkdir -p "$MANIFEST_DIR"
 
           # Version manifest
-          cat > "$MANIFEST_DIR/wj1918.bunker.yaml" <<YAML
+          cat > "$MANIFEST_DIR/Bunker.Bunker.yaml" <<YAML
           # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
-          PackageIdentifier: wj1918.bunker
+          PackageIdentifier: Bunker.Bunker
           PackageVersion: ${VERSION}
           DefaultLocale: en-US
           ManifestType: version
@@ -136,13 +136,13 @@ jobs:
           YAML
 
           # Locale manifest
-          cat > "$MANIFEST_DIR/wj1918.bunker.locale.en-US.yaml" <<YAML
+          cat > "$MANIFEST_DIR/Bunker.Bunker.locale.en-US.yaml" <<YAML
           # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-          PackageIdentifier: wj1918.bunker
+          PackageIdentifier: Bunker.Bunker
           PackageVersion: ${VERSION}
           PackageLocale: en-US
-          Publisher: wj1918
-          PublisherUrl: https://github.com/wj1918
+          Publisher: Bunker Contributors
+          PublisherUrl: https://github.com/wj1918/bunker
           PackageName: Bunker
           PackageUrl: https://github.com/wj1918/bunker
           License: Apache-2.0
@@ -165,9 +165,9 @@ jobs:
           YAML
 
           # Installer manifest
-          cat > "$MANIFEST_DIR/wj1918.bunker.installer.yaml" <<YAML
+          cat > "$MANIFEST_DIR/Bunker.Bunker.installer.yaml" <<YAML
           # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-          PackageIdentifier: wj1918.bunker
+          PackageIdentifier: Bunker.Bunker
           PackageVersion: ${VERSION}
           Platform:
             - Windows.Desktop
@@ -191,13 +191,13 @@ jobs:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          MANIFEST_DIR="winget-manifests/manifests/w/wj1918/bunker/${VERSION}"
+          MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
 
           # Clone winget-pkgs (shallow)
           git clone --depth 1 https://x-access-token:${WINGET_TOKEN}@github.com/microsoft/winget-pkgs.git winget-pkgs-repo
 
           # Copy manifests
-          TARGET_DIR="winget-pkgs-repo/manifests/w/wj1918/bunker/${VERSION}"
+          TARGET_DIR="winget-pkgs-repo/manifests/B/Bunker/Bunker/${VERSION}"
           mkdir -p "$TARGET_DIR"
           cp "$MANIFEST_DIR"/*.yaml "$TARGET_DIR/"
 
@@ -209,8 +209,8 @@ jobs:
           # Create branch and commit
           BRANCH="bunker-${VERSION}"
           git checkout -b "$BRANCH"
-          git add "manifests/w/wj1918/bunker/${VERSION}/"
-          git commit -m "New version: wj1918.bunker version ${VERSION}"
+          git add "manifests/B/Bunker/Bunker/${VERSION}/"
+          git commit -m "New version: Bunker.Bunker version ${VERSION}"
 
           # Push to fork and create PR
           git remote add fork "https://x-access-token:${WINGET_TOKEN}@github.com/wj1918/winget-pkgs.git"
@@ -222,8 +222,8 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/microsoft/winget-pkgs/pulls \
             -d "{
-              \"title\": \"New version: wj1918.bunker version ${VERSION}\",
-              \"body\": \"## New package version\\n\\n- PackageIdentifier: wj1918.bunker\\n- PackageVersion: ${VERSION}\\n\\nAutomated submission from [bunker](https://github.com/wj1918/bunker) CI/CD.\",
+              \"title\": \"New version: Bunker.Bunker version ${VERSION}\",
+              \"body\": \"## New package version\\n\\n- PackageIdentifier: Bunker.Bunker\\n- PackageVersion: ${VERSION}\\n\\nAutomated submission from [bunker](https://github.com/wj1918/bunker) CI/CD.\",
               \"head\": \"wj1918:${BRANCH}\",
               \"base\": \"master\"
             }"

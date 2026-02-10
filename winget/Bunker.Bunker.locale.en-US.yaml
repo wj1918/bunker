@@ -1,10 +1,10 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 
-PackageIdentifier: wj1918.bunker
+PackageIdentifier: Bunker.Bunker
 PackageVersion: 0.1.0
 PackageLocale: en-US
-Publisher: wj1918
-PublisherUrl: https://github.com/wj1918
+Publisher: Bunker Contributors
+PublisherUrl: https://github.com/wj1918/bunker
 PackageName: Bunker
 PackageUrl: https://github.com/wj1918/bunker
 License: Apache-2.0

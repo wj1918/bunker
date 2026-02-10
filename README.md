@@ -11,12 +11,27 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 - **Secure** - SSRF protection, rate limiting, IP allowlists
 - **Windows Optimized** - System tray icon, auto-start support
 
+## Installation
+
+### Windows (winget)
+
+```powershell
+winget install Bunker.Bunker
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/wj1918/bunker.git
+cd bunker
+cargo build --release
+```
+
+The binary will be at `target/release/bunker` (or `bunker.exe` on Windows).
+
 ## Quick Start
 
 ```powershell
-# Build release binary
-cargo build --release
-
 # Run with config file
 .\bunker.exe --config config.yaml
 
@@ -28,11 +43,19 @@ cargo build --release
 
 ## Windows Server Setup
 
-### Step 1: Build and Install
+### Step 1: Install
+
+**Option A: Install via winget**
+
+```powershell
+winget install Bunker.Bunker
+```
+
+**Option B: Build from source**
 
 ```powershell
 # Clone and build
-git clone https://github.com/user/bunker.git
+git clone https://github.com/wj1918/bunker.git
 cd bunker
 cargo build --release
 
