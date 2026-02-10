@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "A lightweight HTTP/HTTPS and DNS proxy"
-repository = "https://github.com/user/bunker"
+repository = "https://github.com/wj1918/bunker"
 keywords = ["proxy", "http", "https", "dns", "networking"]
 categories = ["network-programming", "web-programming"]
 
