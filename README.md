@@ -7,33 +7,9 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 - **HTTP Forward Proxy** - Proxy HTTP requests with connection pooling
 - **HTTPS Tunneling** - Transparent CONNECT tunneling for HTTPS/SSH/TLS traffic
 - **DNS Server** - Optional DNS forwarding with caching and failover
-- **Lightweight** - Single binary (~5.8 MB), minimal resource usage
+- **Lightweight** - Single binary (~4.8 MB), minimal resource usage
 - **Secure** - SSRF protection, rate limiting, IP allowlists
 - **Windows Optimized** - System tray icon, auto-start support
-
-## Installation
-
-### Windows (Download)
-
-1. Download the latest zip from [GitHub Releases](https://github.com/wj1918/bunker/releases)
-2. Extract to a directory (e.g., `C:\Bunker`)
-3. The zip contains `bunker.exe` and a sample `config.yaml`
-
-Or if you only have the exe (e.g., standalone download), generate the default config:
-
-```powershell
-bunker.exe --init
-```
-
-### Build from Source
-
-```bash
-git clone https://github.com/wj1918/bunker.git
-cd bunker
-cargo build --release
-```
-
-The binary will be at `target/release/bunker` (or `bunker.exe` on Windows).
 
 ## Quick Start
 
@@ -51,15 +27,22 @@ The binary will be at `target/release/bunker` (or `bunker.exe` on Windows).
 
 ### Step 1: Install
 
-**Option A: Download from GitHub Releases**
+**Option A: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
 
 ```powershell
-# Download and extract the latest release
 mkdir C:\Bunker
 cd C:\Bunker
-# Extract the zip from https://github.com/wj1918/bunker/releases
-# Contains: bunker.exe + config.yaml
+
+# Download the latest release (replace VERSION with actual version, e.g., v0.1.0)
+$VERSION = "v0.1.0"
+Invoke-WebRequest -Uri "https://github.com/wj1918/bunker/releases/download/$VERSION/bunker-$VERSION-x86_64-pc-windows-msvc.zip" -OutFile bunker.zip
+
+# Extract and clean up
+Expand-Archive bunker.zip -DestinationPath .
+Remove-Item bunker.zip
 ```
+
+The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
 
 **Option B: Build from source**
 
@@ -126,7 +109,7 @@ tcp_keepalive:
 
 # Logging
 logging:
-  enable_logging: true
+  log_requests: true
   format: text
   redact_sensitive_headers: true
   file:
