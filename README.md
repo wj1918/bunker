@@ -11,13 +11,6 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 - **Secure** - SSRF protection, rate limiting, IP allowlists
 - **Windows Optimized** - System tray icon, auto-start support
 
-## Install via Scoop
-
-```powershell
-scoop bucket add bunker https://github.com/wj1918/bunker
-scoop install bunker
-```
-
 ## Quick Start
 
 Bunker automatically loads `config.yaml` from the current directory or the executable's directory. Just run:
@@ -45,25 +38,41 @@ bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 mkdir C:\Bunker
 cd C:\Bunker
 
-# Download the latest release (replace VERSION with actual version, e.g., v0.1.0)
+# Download the latest release
 $VERSION = "v0.1.0"
 Invoke-WebRequest -Uri "https://github.com/wj1918/bunker/releases/download/$VERSION/bunker-$VERSION-x86_64-pc-windows-msvc.zip" -OutFile bunker.zip
+```
 
-# Extract and clean up
+Verify download integrity before extracting:
+
+```powershell
+# Compare against SHA256SUMS.txt from the release page
+(Get-FileHash bunker.zip -Algorithm SHA256).Hash
+```
+
+Extract and clean up:
+
+```powershell
 Expand-Archive bunker.zip -DestinationPath .
 Remove-Item bunker.zip
 ```
 
 The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
 
-**Verify download integrity:**
+**Option B: Install via [Scoop](https://scoop.sh)**
 
 ```powershell
-# Compare against SHA256SUMS.txt from the release page
-(Get-FileHash bunker.exe -Algorithm SHA256).Hash
+scoop bucket add bunker https://github.com/wj1918/bunker
+scoop install bunker
 ```
 
-**Option B: Build from source**
+Scoop places `bunker.exe` and `config.yaml` together in its app directory. The config is automatically persisted across updates. Skip to [Step 2](#step-2-configure-configyaml) to edit the config — Scoop users can open it with:
+
+```powershell
+notepad "$(scoop prefix bunker)\config.yaml"
+```
+
+**Option C: Build from source**
 
 ```powershell
 git clone https://github.com/wj1918/bunker.git
@@ -77,7 +86,7 @@ copy config.yaml C:\Bunker\
 
 ### Step 2: Configure `config.yaml`
 
-Edit `C:\Bunker\config.yaml`:
+Edit the config file (for Option A/C: `C:\Bunker\config.yaml`):
 
 ```yaml
 # Server listen address (use your Windows machine's LAN IP)
@@ -138,90 +147,48 @@ logging:
     compress: true
 ```
 
-### Step 3: Windows Firewall Configuration
+### Step 3: Windows Firewall
 
-Open **PowerShell as Administrator** and run:
+Open **PowerShell as Administrator**:
 
 ```powershell
 # Allow HTTP Proxy (TCP 8080)
 New-NetFirewallRule -DisplayName "Bunker HTTP Proxy" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort 8080 `
-    -Action Allow `
-    -Profile Private,Domain `
-    -Description "Bunker proxy server for HTTP/HTTPS forwarding"
+    -Direction Inbound -Protocol TCP -LocalPort 8080 `
+    -Action Allow -Profile Private,Domain
 
 # Allow DNS Server (UDP 53) - only if using DNS feature
 New-NetFirewallRule -DisplayName "Bunker DNS Server" `
-    -Direction Inbound `
-    -Protocol UDP `
-    -LocalPort 53 `
-    -Action Allow `
-    -Profile Private,Domain `
-    -Description "Bunker DNS server for LAN clients"
+    -Direction Inbound -Protocol UDP -LocalPort 53 `
+    -Action Allow -Profile Private,Domain
 ```
 
-**For Public network profile** (more restrictive environments):
+Verify: `Get-NetFirewallRule -DisplayName "Bunker*" | Select-Object DisplayName, Enabled, Profile`
 
-```powershell
-# Use GPO-based rules for Public profile
-New-NetFirewallRule -DisplayName "Bunker HTTP Proxy (Public)" `
-    -Direction Inbound `
-    -Protocol TCP `
-    -LocalPort 8080 `
-    -Action Allow `
-    -Profile Public `
-    -PolicyStore PersistentStore
-
-New-NetFirewallRule -DisplayName "Bunker DNS Server (Public)" `
-    -Direction Inbound `
-    -Protocol UDP `
-    -LocalPort 53 `
-    -Action Allow `
-    -Profile Public `
-    -PolicyStore PersistentStore
-```
-
-**Verify firewall rules:**
-
-```powershell
-Get-NetFirewallRule -DisplayName "Bunker*" |
-    Select-Object DisplayName, Enabled, Action, Profile
-```
-
-**Remove rules (if needed):**
-
-```powershell
-Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule
-```
+Remove: `Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule`
 
 ### Step 4: Run Bunker
 
-**Manual start:**
-
 ```powershell
 cd C:\Bunker
-.\bunker.exe --config config.yaml
+.\bunker.exe
 ```
 
-**Run at Windows startup (auto-start):**
+Bunker auto-detects `config.yaml` in the current directory. To use a different config:
 
 ```powershell
-# Register for auto-start
-.\bunker.exe --install
-
-# Remove from auto-start
-.\bunker.exe --uninstall
+.\bunker.exe -c C:\path\to\config.yaml
 ```
 
-**Run without system tray (headless/service mode):**
+Other options:
 
 ```powershell
-.\bunker.exe --config config.yaml --no-tray
+.\bunker.exe --install     # Auto-start at Windows login
+.\bunker.exe --uninstall   # Remove auto-start
+.\bunker.exe --no-tray     # Run without system tray (headless)
 ```
 
-### Step 5: Verify Server is Running
+### Step 5: Verify
 
 ```powershell
 # Check if listening
@@ -243,10 +210,9 @@ Configure Linux machines to use the Bunker proxy server running on Windows.
 
 ### Proxy Configuration
 
-#### Environment Variables (Session)
+Add to `~/.bashrc` or `~/.zshrc`, then run `source ~/.bashrc`:
 
 ```bash
-# Set for current session
 export http_proxy=http://192.168.1.1:8080
 export https_proxy=http://192.168.1.1:8080
 export HTTP_PROXY=http://192.168.1.1:8080
@@ -254,67 +220,16 @@ export HTTPS_PROXY=http://192.168.1.1:8080
 export no_proxy=localhost,127.0.0.1,192.168.1.0/24
 ```
 
-#### Permanent Configuration
+This covers most CLI tools (curl, wget, git, pip, etc). Some applications need their own config:
 
-Add to `~/.bashrc` or `~/.zshrc`:
+<details>
+<summary>Per-application proxy settings</summary>
 
-```bash
-# Bunker proxy settings
-export http_proxy=http://192.168.1.1:8080
-export https_proxy=http://192.168.1.1:8080
-export HTTP_PROXY=http://192.168.1.1:8080
-export HTTPS_PROXY=http://192.168.1.1:8080
-export no_proxy=localhost,127.0.0.1,192.168.1.0/24
-```
-
-Apply changes:
-
-```bash
-source ~/.bashrc
-```
-
-#### Per-Application Configuration
-
-**Git (HTTPS repositories):**
-
-```bash
-git config --global http.proxy http://192.168.1.1:8080
-git config --global https.proxy http://192.168.1.1:8080
-
-# Remove proxy config
-git config --global --unset http.proxy
-git config --global --unset https.proxy
-```
-
-**Git (SSH repositories via CONNECT tunnel):**
-
-Add to `~/.ssh/config`:
+**Git SSH (via CONNECT tunnel)** — add to `~/.ssh/config`:
 
 ```
 Host github.com gitlab.com bitbucket.org
     ProxyCommand nc -X connect -x 192.168.1.1:8080 %h %p
-```
-
-Or using `corkscrew`:
-
-```bash
-sudo apt install corkscrew
-```
-
-```
-Host github.com
-    ProxyCommand corkscrew 192.168.1.1 8080 %h %p
-```
-
-**npm:**
-
-```bash
-npm config set proxy http://192.168.1.1:8080
-npm config set https-proxy http://192.168.1.1:8080
-
-# Remove
-npm config delete proxy
-npm config delete https-proxy
 ```
 
 **apt (Debian/Ubuntu):**
@@ -326,19 +241,15 @@ Acquire::https::Proxy "http://192.168.1.1:8080";
 EOF
 ```
 
-**yum/dnf (RHEL/CentOS/Fedora):**
-
-Add to `/etc/yum.conf` or `/etc/dnf/dnf.conf`:
+**yum/dnf** — add to `/etc/yum.conf` or `/etc/dnf/dnf.conf`:
 
 ```ini
 proxy=http://192.168.1.1:8080
 ```
 
-**Docker:**
+**Docker** — add to `~/.docker/config.json`:
 
-```bash
-mkdir -p ~/.docker
-cat > ~/.docker/config.json << 'EOF'
+```json
 {
   "proxies": {
     "default": {
@@ -348,116 +259,44 @@ cat > ~/.docker/config.json << 'EOF'
     }
   }
 }
-EOF
 ```
 
-**wget:**
+</details>
 
-Add to `~/.wgetrc`:
+### DNS Configuration
 
-```
-http_proxy = http://192.168.1.1:8080
-https_proxy = http://192.168.1.1:8080
-use_proxy = on
-```
+Point your Linux DNS to the Bunker server.
 
-**curl:**
-
-Add to `~/.curlrc`:
-
-```
-proxy = http://192.168.1.1:8080
-```
-
-### DNS Client Configuration
-
-Configure Linux to use Bunker's DNS server.
-
-#### systemd-resolved (Ubuntu 18+, Fedora, Arch)
+**systemd-resolved (Ubuntu 18+, Fedora, Arch):**
 
 ```bash
-# Edit resolved.conf
-sudo nano /etc/systemd/resolved.conf
-```
-
-Add:
-
-```ini
-[Resolve]
-DNS=192.168.1.1
-FallbackDNS=8.8.8.8
-```
-
-Apply:
-
-```bash
+# Edit /etc/systemd/resolved.conf
+sudo sed -i 's/^#DNS=.*/DNS=192.168.1.1/' /etc/systemd/resolved.conf
 sudo systemctl restart systemd-resolved
-sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 ```
 
-Verify:
+**NetworkManager:**
 
 ```bash
-resolvectl status
-resolvectl query google.com
-```
-
-#### NetworkManager (Desktop Linux)
-
-```bash
-# List connections
-nmcli con show
-
-# Set DNS for your connection (replace "Wired connection 1" with your connection name)
 nmcli con mod "Wired connection 1" ipv4.dns "192.168.1.1"
 nmcli con mod "Wired connection 1" ipv4.ignore-auto-dns yes
-
-# Reconnect to apply
 nmcli con down "Wired connection 1" && nmcli con up "Wired connection 1"
 ```
 
-#### netplan (Ubuntu Server)
-
-Edit `/etc/netplan/01-netcfg.yaml`:
-
-```yaml
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      nameservers:
-        addresses: [192.168.1.1]
-```
-
-Apply:
-
-```bash
-sudo netplan apply
-```
-
-#### Manual (Temporary)
+**Manual (temporary):**
 
 ```bash
 sudo sh -c 'echo "nameserver 192.168.1.1" > /etc/resolv.conf'
 ```
 
-### Verify Client Configuration
+### Verify Client
 
 ```bash
-# Test proxy connection
-curl -x http://192.168.1.1:8080 http://httpbin.org/ip
+# Test proxy
 curl -x http://192.168.1.1:8080 https://httpbin.org/ip
 
-# Test DNS resolution
-nslookup google.com 192.168.1.1
+# Test DNS
 dig @192.168.1.1 google.com
-
-# Test SSH through proxy
-ssh -T git@github.com
-
-# Test Git clone
-git clone https://github.com/rust-lang/rust.git --depth 1
 ```
 
 ---
@@ -483,14 +322,14 @@ git clone https://github.com/rust-lang/rust.git --depth 1
 
 | Protocol | Support | Method |
 |----------|---------|--------|
-| HTTP | ✅ | Direct proxy |
-| HTTPS | ✅ | CONNECT tunnel |
-| SSH/SFTP | ✅ | CONNECT tunnel |
-| WebSocket (wss://) | ✅ | CONNECT tunnel |
-| Any TLS/TCP | ✅ | CONNECT tunnel |
-| DNS (UDP) | ✅ | Built-in server |
-| SOCKS5 | ❌ | Not supported |
-| HTTP/2 | ❌ | Not supported |
+| HTTP | Yes | Direct proxy |
+| HTTPS | Yes | CONNECT tunnel |
+| SSH/SFTP | Yes | CONNECT tunnel |
+| WebSocket (wss://) | Yes | CONNECT tunnel |
+| Any TLS/TCP | Yes | CONNECT tunnel |
+| DNS (UDP) | Yes | Built-in server |
+| SOCKS5 | No | Not supported |
+| HTTP/2 | No | Not supported |
 
 ---
 
@@ -501,23 +340,15 @@ git clone https://github.com/rust-lang/rust.git --depth 1
 **Proxy not accessible from LAN:**
 
 ```powershell
-# Check Windows Firewall rules
 Get-NetFirewallRule -DisplayName "Bunker*" | Format-List
-
-# Check if listening on correct interface
 netstat -an | findstr ":8080"
-
-# Verify network profile
 Get-NetConnectionProfile
 ```
 
 **DNS not responding:**
 
 ```powershell
-# Check UDP 53 is open
 netstat -an | findstr ":53"
-
-# Test locally
 nslookup google.com 127.0.0.1
 ```
 
@@ -526,35 +357,24 @@ nslookup google.com 127.0.0.1
 **Proxy connection refused:**
 
 ```bash
-# Test connectivity to Windows server
 ping 192.168.1.1
 nc -zv 192.168.1.1 8080
-
-# Check environment variables
 env | grep -i proxy
 ```
 
 **DNS not resolving:**
 
 ```bash
-# Test direct DNS query
 dig @192.168.1.1 google.com
-
-# Check resolv.conf
 cat /etc/resolv.conf
-
-# Check systemd-resolved status
 resolvectl status
 ```
 
 **Git SSH not working through proxy:**
 
 ```bash
-# Test SSH proxy connection
 ssh -vvv -o ProxyCommand="nc -X connect -x 192.168.1.1:8080 %h %p" git@github.com
-
-# Verify nc supports -X flag (may need netcat-openbsd)
-sudo apt install netcat-openbsd
+# If nc doesn't support -X flag: sudo apt install netcat-openbsd
 ```
 
 ---
