@@ -28,7 +28,7 @@ bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 
 ---
 
-## Windows Server Setup
+## Windows Setup
 
 ### Step 1: Install
 
