@@ -10,55 +10,31 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            ext: .exe
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            ext: ""
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            ext: ""
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            ext: ""
-
+    name: Build Windows
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Prepare artifact (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/bunker${{ matrix.ext }} dist/
-          cd dist
-          tar -czvf bunker-${{ github.ref_name }}-${{ matrix.target }}.tar.gz bunker${{ matrix.ext }}
-
-      - name: Prepare artifact (Windows)
-        if: runner.os == 'Windows'
+      - name: Prepare artifact
         run: |
           mkdir dist
-          copy target\${{ matrix.target }}\release\bunker${{ matrix.ext }} dist\
+          copy target\x86_64-pc-windows-msvc\release\bunker.exe dist\
+          copy config.yaml dist\
           cd dist
-          7z a bunker-${{ github.ref_name }}-${{ matrix.target }}.zip bunker${{ matrix.ext }}
+          7z a bunker-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip bunker.exe config.yaml
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bunker-${{ matrix.target }}
+          name: bunker-x86_64-pc-windows-msvc
           path: dist/bunker-*
 
   release:

@@ -4,6 +4,9 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
+/// Default config.yaml embedded at compile time
+pub const DEFAULT_CONFIG_YAML: &str = include_str!("../../config.yaml");
+
 /// Main configuration struct for the proxy
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {

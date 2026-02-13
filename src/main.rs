@@ -16,7 +16,7 @@ mod tokio_io;
 
 use config::{
     default_dns_listen, default_dns_upstream, load_config, DnsCacheConfig, DnsConfig,
-    DnsFailoverConfig, DnsSecurityConfig,
+    DnsFailoverConfig, DnsSecurityConfig, DEFAULT_CONFIG_YAML,
 };
 use dns::run_dns_server;
 use helpers::create_tls_connector;
@@ -68,6 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 return Ok(());
+            }
+            "--init" => {
+                return init_config();
             }
             #[cfg(windows)]
             "--install" => {
@@ -365,6 +368,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
+/// Write the embedded default config.yaml to the current directory
+fn init_config() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = std::path::Path::new("config.yaml");
+    if path.exists() {
+        eprintln!("config.yaml already exists in the current directory.");
+        eprintln!("Remove or rename it first if you want to regenerate.");
+        std::process::exit(1);
+    }
+    std::fs::write(path, DEFAULT_CONFIG_YAML)?;
+    eprintln!("Created config.yaml in current directory.");
+    eprintln!("Edit it to match your environment, then run:");
+    eprintln!("  bunker -c config.yaml");
+    Ok(())
+}
+
 fn print_usage(program: &str) {
     eprintln!("Usage: {} [listen_addr] [options]", program);
     eprintln!();
@@ -376,6 +394,7 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -c, --config <path>     Load config from YAML file");
+    eprintln!("  --init                  Create default config.yaml in current directory");
     eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
     eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
     eprintln!("  --no-tray               Disable system tray (Windows only)");
