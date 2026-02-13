@@ -74,6 +74,57 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  scoop:
+    name: Update Scoop manifest
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bunker-x86_64-pc-windows-msvc
+          path: artifacts
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SHA256 of zip
+        id: hash
+        run: |
+          ZIP_FILE=$(ls artifacts/*.zip | head -1)
+          HASH=$(sha256sum "$ZIP_FILE" | awk '{print $1}')
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $HASH"
+
+      - name: Update Scoop manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
+          jq --arg ver "$VERSION" --arg url "$URL" --arg hash "$SHA256" \
+            '.version = $ver | .architecture."64bit".url = $url | .architecture."64bit".hash = $hash' \
+            bunker.json > bunker.json.tmp
+          mv bunker.json.tmp bunker.json
+          cat bunker.json
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bunker.json
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update Scoop manifest to v${GITHUB_REF_NAME#v}"
+          git push
+
   # TODO: Re-enable after code signing is set up (exe must be signed to pass winget SmartScreen validation)
   # winget:
   #   name: Publish to winget
