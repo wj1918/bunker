@@ -559,18 +559,11 @@ pub fn default_tray_enabled() -> bool {
 
 // ============== Config Loading ==============
 
-/// Get the platform-specific config directory
-pub fn config_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var("APPDATA").ok().map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".config"))
-    }
+/// Get the directory containing the executable
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
 /// Load configuration from file
@@ -579,13 +572,14 @@ pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Err
     let config_paths = if let Some(p) = path {
         vec![PathBuf::from(p)]
     } else {
-        vec![
+        let mut paths = vec![
             PathBuf::from("config.yaml"),
-            PathBuf::from("config.yml"),
-            config_dir()
-                .map(|d| d.join("proxy").join("config.yaml"))
-                .unwrap_or_default(),
-        ]
+        ];
+        // Look next to the executable (handles Scoop installs and portable setups)
+        if let Some(dir) = exe_dir() {
+            paths.push(dir.join("config.yaml"));
+        }
+        paths
     };
 
     for config_path in config_paths {

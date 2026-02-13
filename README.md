@@ -20,12 +20,17 @@ scoop install bunker
 
 ## Quick Start
 
-```powershell
-# Run with config file
-.\bunker.exe --config config.yaml
+Bunker automatically loads `config.yaml` from the current directory or the executable's directory. Just run:
 
-# Or run with CLI arguments
-.\bunker.exe 192.168.1.1:8080 --dns 192.168.1.1:53
+```powershell
+bunker
+```
+
+Or specify a config file or CLI arguments:
+
+```powershell
+bunker -c C:\path\to\config.yaml
+bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 ```
 
 ---
