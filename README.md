@@ -11,6 +11,13 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 - **Secure** - SSRF protection, rate limiting, IP allowlists
 - **Windows Optimized** - System tray icon, auto-start support
 
+## Install via Scoop
+
+```powershell
+scoop bucket add bunker https://github.com/wj1918/bunker
+scoop install bunker
+```
+
 ## Quick Start
 
 ```powershell
