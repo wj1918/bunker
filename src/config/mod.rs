@@ -572,9 +572,7 @@ pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Err
     let config_paths = if let Some(p) = path {
         vec![PathBuf::from(p)]
     } else {
-        let mut paths = vec![
-            PathBuf::from("config.yaml"),
-        ];
+        let mut paths = vec![PathBuf::from("config.yaml")];
         // Look next to the executable (handles Scoop installs and portable setups)
         if let Some(dir) = exe_dir() {
             paths.push(dir.join("config.yaml"));
@@ -845,10 +843,10 @@ dns:
     }
 
     #[test]
-    fn test_config_dir() {
-        let dir = config_dir();
-        // Should return Some on most systems
-        assert!(dir.is_some() || std::env::var("HOME").is_err());
+    fn test_exe_dir() {
+        let dir = exe_dir();
+        // Should return Some when running from a binary
+        assert!(dir.is_some());
     }
 
     #[test]
