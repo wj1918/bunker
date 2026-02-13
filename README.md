@@ -44,6 +44,13 @@ Remove-Item bunker.zip
 
 The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
 
+**Verify download integrity:**
+
+```powershell
+# Compare against SHA256SUMS.txt from the release page
+(Get-FileHash bunker.exe -Algorithm SHA256).Hash
+```
+
 **Option B: Build from source**
 
 ```powershell

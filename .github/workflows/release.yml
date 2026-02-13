@@ -52,10 +52,19 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate checksums
+        run: |
+          cd artifacts/bunker-x86_64-pc-windows-msvc
+          sha256sum * > ../SHA256SUMS.txt
+          echo "=== SHA256SUMS ==="
+          cat ../SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*
+            artifacts/SHA256SUMS.txt
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
