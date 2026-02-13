@@ -61,145 +61,146 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  winget:
-    name: Publish to winget
-    needs: release
-    runs-on: windows-latest
-    if: ${{ !contains(github.ref_name, '-') }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: bunker-x86_64-pc-windows-msvc
-          path: artifacts
-
-      - name: Get version from tag
-        id: version
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Compute SHA256 of zip
-        id: hash
-        shell: pwsh
-        run: |
-          $zipFile = Get-ChildItem -Path artifacts -Filter "*.zip" | Select-Object -First 1
-          $hash = (Get-FileHash -Path $zipFile.FullName -Algorithm SHA256).Hash
-          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
-          echo "filename=$($zipFile.Name)" >> $env:GITHUB_OUTPUT
-          Write-Host "SHA256: $hash"
-          Write-Host "File: $($zipFile.Name)"
-
-      - name: Generate winget manifests
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.hash.outputs.sha256 }}
-        run: |
-          URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
-          MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
-          mkdir -p "$MANIFEST_DIR"
-
-          # Version manifest
-          cat > "$MANIFEST_DIR/Bunker.Bunker.yaml" <<YAML
-          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
-          PackageIdentifier: Bunker.Bunker
-          PackageVersion: ${VERSION}
-          DefaultLocale: en-US
-          ManifestType: version
-          ManifestVersion: 1.6.0
-          YAML
-
-          # Locale manifest
-          cat > "$MANIFEST_DIR/Bunker.Bunker.locale.en-US.yaml" <<YAML
-          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-          PackageIdentifier: Bunker.Bunker
-          PackageVersion: ${VERSION}
-          PackageLocale: en-US
-          Publisher: Bunker Contributors
-          PublisherUrl: https://github.com/wj1918/bunker
-          PackageName: Bunker
-          PackageUrl: https://github.com/wj1918/bunker
-          License: Apache-2.0
-          LicenseUrl: https://github.com/wj1918/bunker/blob/master/LICENSE
-          ShortDescription: A lightweight HTTP/HTTPS and DNS proxy
-          Description: |-
-            Bunker is a lightweight HTTP/HTTPS and DNS proxy built with Rust.
-            Features include HTTP forward proxy with connection pooling, HTTPS
-            tunneling via CONNECT method, DNS server with caching and failover,
-            SSRF protection, and rate limiting.
-          Tags:
-            - proxy
-            - http
-            - https
-            - dns
-            - networking
-            - rust
-          ManifestType: defaultLocale
-          ManifestVersion: 1.6.0
-          YAML
-
-          # Installer manifest
-          cat > "$MANIFEST_DIR/Bunker.Bunker.installer.yaml" <<YAML
-          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-          PackageIdentifier: Bunker.Bunker
-          PackageVersion: ${VERSION}
-          Platform:
-            - Windows.Desktop
-          MinimumOSVersion: 10.0.0.0
-          InstallerType: zip
-          NestedInstallerType: portable
-          NestedInstallerFiles:
-            - RelativeFilePath: bunker.exe
-              PortableCommandAlias: bunker
-          Installers:
-            - Architecture: x64
-              InstallerUrl: ${URL}
-              InstallerSha256: ${SHA256}
-          ManifestType: installer
-          ManifestVersion: 1.6.0
-          YAML
-
-      - name: Submit PR to winget-pkgs
-        shell: bash
-        env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
-
-          # Clone winget-pkgs (shallow)
-          git clone --depth 1 https://x-access-token:${WINGET_TOKEN}@github.com/microsoft/winget-pkgs.git winget-pkgs-repo
-
-          # Copy manifests
-          TARGET_DIR="winget-pkgs-repo/manifests/B/Bunker/Bunker/${VERSION}"
-          mkdir -p "$TARGET_DIR"
-          cp "$MANIFEST_DIR"/*.yaml "$TARGET_DIR/"
-
-          # Configure git
-          cd winget-pkgs-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Create branch and commit
-          BRANCH="bunker-${VERSION}"
-          git checkout -b "$BRANCH"
-          git add "manifests/B/Bunker/Bunker/${VERSION}/"
-          git commit -m "New version: Bunker.Bunker version ${VERSION}"
-
-          # Push to fork and create PR
-          git remote add fork "https://x-access-token:${WINGET_TOKEN}@github.com/wj1918/winget-pkgs.git"
-          git push fork "$BRANCH" --force
-
-          # Create PR using GitHub API
-          curl -X POST \
-            -H "Authorization: token ${WINGET_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/microsoft/winget-pkgs/pulls \
-            -d "{
-              \"title\": \"New version: Bunker.Bunker version ${VERSION}\",
-              \"body\": \"## New package version\\n\\n- PackageIdentifier: Bunker.Bunker\\n- PackageVersion: ${VERSION}\\n\\nAutomated submission from [bunker](https://github.com/wj1918/bunker) CI/CD.\",
-              \"head\": \"wj1918:${BRANCH}\",
-              \"base\": \"master\"
-            }"
+  # TODO: Re-enable after code signing is set up (exe must be signed to pass winget SmartScreen validation)
+  # winget:
+  #   name: Publish to winget
+  #   needs: release
+  #   runs-on: windows-latest
+  #   if: ${{ !contains(github.ref_name, '-') }}
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Download Windows artifact
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: bunker-x86_64-pc-windows-msvc
+  #         path: artifacts
+  #
+  #     - name: Get version from tag
+  #       id: version
+  #       shell: bash
+  #       run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+  #
+  #     - name: Compute SHA256 of zip
+  #       id: hash
+  #       shell: pwsh
+  #       run: |
+  #         $zipFile = Get-ChildItem -Path artifacts -Filter "*.zip" | Select-Object -First 1
+  #         $hash = (Get-FileHash -Path $zipFile.FullName -Algorithm SHA256).Hash
+  #         echo "sha256=$hash" >> $env:GITHUB_OUTPUT
+  #         echo "filename=$($zipFile.Name)" >> $env:GITHUB_OUTPUT
+  #         Write-Host "SHA256: $hash"
+  #         Write-Host "File: $($zipFile.Name)"
+  #
+  #     - name: Generate winget manifests
+  #       shell: bash
+  #       env:
+  #         VERSION: ${{ steps.version.outputs.version }}
+  #         SHA256: ${{ steps.hash.outputs.sha256 }}
+  #       run: |
+  #         URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
+  #         MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
+  #         mkdir -p "$MANIFEST_DIR"
+  #
+  #         # Version manifest
+  #         cat > "$MANIFEST_DIR/Bunker.Bunker.yaml" <<YAML
+  #         # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+  #         PackageIdentifier: Bunker.Bunker
+  #         PackageVersion: ${VERSION}
+  #         DefaultLocale: en-US
+  #         ManifestType: version
+  #         ManifestVersion: 1.6.0
+  #         YAML
+  #
+  #         # Locale manifest
+  #         cat > "$MANIFEST_DIR/Bunker.Bunker.locale.en-US.yaml" <<YAML
+  #         # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+  #         PackageIdentifier: Bunker.Bunker
+  #         PackageVersion: ${VERSION}
+  #         PackageLocale: en-US
+  #         Publisher: Bunker Contributors
+  #         PublisherUrl: https://github.com/wj1918/bunker
+  #         PackageName: Bunker
+  #         PackageUrl: https://github.com/wj1918/bunker
+  #         License: Apache-2.0
+  #         LicenseUrl: https://github.com/wj1918/bunker/blob/master/LICENSE
+  #         ShortDescription: A lightweight HTTP/HTTPS and DNS proxy
+  #         Description: |-
+  #           Bunker is a lightweight HTTP/HTTPS and DNS proxy built with Rust.
+  #           Features include HTTP forward proxy with connection pooling, HTTPS
+  #           tunneling via CONNECT method, DNS server with caching and failover,
+  #           SSRF protection, and rate limiting.
+  #         Tags:
+  #           - proxy
+  #           - http
+  #           - https
+  #           - dns
+  #           - networking
+  #           - rust
+  #         ManifestType: defaultLocale
+  #         ManifestVersion: 1.6.0
+  #         YAML
+  #
+  #         # Installer manifest
+  #         cat > "$MANIFEST_DIR/Bunker.Bunker.installer.yaml" <<YAML
+  #         # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+  #         PackageIdentifier: Bunker.Bunker
+  #         PackageVersion: ${VERSION}
+  #         Platform:
+  #           - Windows.Desktop
+  #         MinimumOSVersion: 10.0.0.0
+  #         InstallerType: zip
+  #         NestedInstallerType: portable
+  #         NestedInstallerFiles:
+  #           - RelativeFilePath: bunker.exe
+  #             PortableCommandAlias: bunker
+  #         Installers:
+  #           - Architecture: x64
+  #             InstallerUrl: ${URL}
+  #             InstallerSha256: ${SHA256}
+  #         ManifestType: installer
+  #         ManifestVersion: 1.6.0
+  #         YAML
+  #
+  #     - name: Submit PR to winget-pkgs
+  #       shell: bash
+  #       env:
+  #         WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+  #         VERSION: ${{ steps.version.outputs.version }}
+  #       run: |
+  #         MANIFEST_DIR="winget-manifests/manifests/B/Bunker/Bunker/${VERSION}"
+  #
+  #         # Clone winget-pkgs (shallow)
+  #         git clone --depth 1 https://x-access-token:${WINGET_TOKEN}@github.com/microsoft/winget-pkgs.git winget-pkgs-repo
+  #
+  #         # Copy manifests
+  #         TARGET_DIR="winget-pkgs-repo/manifests/B/Bunker/Bunker/${VERSION}"
+  #         mkdir -p "$TARGET_DIR"
+  #         cp "$MANIFEST_DIR"/*.yaml "$TARGET_DIR/"
+  #
+  #         # Configure git
+  #         cd winget-pkgs-repo
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #
+  #         # Create branch and commit
+  #         BRANCH="bunker-${VERSION}"
+  #         git checkout -b "$BRANCH"
+  #         git add "manifests/B/Bunker/Bunker/${VERSION}/"
+  #         git commit -m "New version: Bunker.Bunker version ${VERSION}"
+  #
+  #         # Push to fork and create PR
+  #         git remote add fork "https://x-access-token:${WINGET_TOKEN}@github.com/wj1918/winget-pkgs.git"
+  #         git push fork "$BRANCH" --force
+  #
+  #         # Create PR using GitHub API
+  #         curl -X POST \
+  #           -H "Authorization: token ${WINGET_TOKEN}" \
+  #           -H "Accept: application/vnd.github.v3+json" \
+  #           https://api.github.com/repos/microsoft/winget-pkgs/pulls \
+  #           -d "{
+  #             \"title\": \"New version: Bunker.Bunker version ${VERSION}\",
+  #             \"body\": \"## New package version\\n\\n- PackageIdentifier: Bunker.Bunker\\n- PackageVersion: ${VERSION}\\n\\nAutomated submission from [bunker](https://github.com/wj1918/bunker) CI/CD.\",
+  #             \"head\": \"wj1918:${BRANCH}\",
+  #             \"base\": \"master\"
+  #           }"
