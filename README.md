@@ -13,10 +13,16 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 
 ## Installation
 
-### Windows (winget)
+### Windows (Download)
+
+1. Download the latest zip from [GitHub Releases](https://github.com/wj1918/bunker/releases)
+2. Extract to a directory (e.g., `C:\Bunker`)
+3. The zip contains `bunker.exe` and a sample `config.yaml`
+
+Or if you only have the exe (e.g., standalone download), generate the default config:
 
 ```powershell
-winget install Bunker.Bunker
+bunker.exe --init
 ```
 
 ### Build from Source
@@ -45,21 +51,23 @@ The binary will be at `target/release/bunker` (or `bunker.exe` on Windows).
 
 ### Step 1: Install
 
-**Option A: Install via winget**
+**Option A: Download from GitHub Releases**
 
 ```powershell
-winget install Bunker.Bunker
+# Download and extract the latest release
+mkdir C:\Bunker
+cd C:\Bunker
+# Extract the zip from https://github.com/wj1918/bunker/releases
+# Contains: bunker.exe + config.yaml
 ```
 
 **Option B: Build from source**
 
 ```powershell
-# Clone and build
 git clone https://github.com/wj1918/bunker.git
 cd bunker
 cargo build --release
 
-# Copy to installation directory
 mkdir C:\Bunker
 copy target\release\bunker.exe C:\Bunker\
 copy config.yaml C:\Bunker\

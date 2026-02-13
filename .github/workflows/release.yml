@@ -28,8 +28,9 @@ jobs:
           mkdir dist
           copy target\x86_64-pc-windows-msvc\release\bunker.exe dist\
           copy config.yaml dist\
+          copy README.md dist\
           cd dist
-          7z a bunker-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip bunker.exe config.yaml
+          7z a bunker-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip bunker.exe config.yaml README.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
