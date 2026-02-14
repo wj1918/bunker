@@ -155,6 +155,27 @@ Test-Step "Version matches release" {
     }
 }
 
+Test-Step "Code signature valid" {
+    $prefix = (scoop prefix bunker).Trim()
+    $sig = Get-AuthenticodeSignature "$prefix\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    $subject = $sig.SignerCertificate.Subject
+    if ($subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $subject" }
+    $issuer = $sig.SignerCertificate.Issuer
+    if ($issuer -notmatch "Microsoft") { throw "Unexpected issuer: $issuer" }
+}
+
+Test-Step "SmartScreen trusted" {
+    $prefix = (scoop prefix bunker).Trim()
+    $sig = Get-AuthenticodeSignature "$prefix\bunker.exe"
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") {
+        throw "Not Microsoft-issued cert - SmartScreen may warn. Issuer: $($sig.SignerCertificate.Issuer)"
+    }
+    if ($sig.TimeStamperCertificate -eq $null) {
+        throw "No timestamp - signature will expire with cert"
+    }
+}
+
 Test-Step "Windows Defender scan" {
     $prefix = (scoop prefix bunker).Trim()
     $exe = "$prefix\bunker.exe"
@@ -202,6 +223,22 @@ Test-Step "Extract zip" {
     $expected = @("bunker.exe", "config.yaml", "README.md")
     foreach ($file in $expected) {
         if (-not (Test-Path "$bunkerDir\$file")) { throw "$file missing from $bunkerDir" }
+    }
+}
+
+Test-Step "Release code signature valid" {
+    $sig = Get-AuthenticodeSignature "$bunkerDir\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    if ($sig.SignerCertificate.Subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $($sig.SignerCertificate.Subject)" }
+}
+
+Test-Step "Release SmartScreen trusted" {
+    $sig = Get-AuthenticodeSignature "$bunkerDir\bunker.exe"
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") {
+        throw "Not Microsoft-issued cert. Issuer: $($sig.SignerCertificate.Issuer)"
+    }
+    if ($sig.TimeStamperCertificate -eq $null) {
+        throw "No timestamp - signature will expire with cert"
     }
 }
 
