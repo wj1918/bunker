@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/wj1918/bunker/releases/download/v0.1.0/bunker-v0.1.0-x86_64-pc-windows-msvc.zip",
-      "hash": "052110437cc21b9b5ccbd23d6689483cd39d240ce8e38dbf807acb1a1f7bb67a"
+      "hash": "1c00cb6ced340d300a73aaa645bdd3ff38fd2e4397e1a03b56445877181ad06d"
     }
   },
   "bin": "bunker.exe",
