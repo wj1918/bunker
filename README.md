@@ -32,7 +32,13 @@ bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 
 ### Step 1: Install
 
-**Option A: Install via [Scoop](https://scoop.sh)**
+**Option A: Install via [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/)**
+
+```powershell
+winget install Bunker.Bunker
+```
+
+**Option B: Install via [Scoop](https://scoop.sh)**
 
 ```powershell
 scoop bucket add bunker https://github.com/wj1918/bunker
@@ -45,7 +51,7 @@ Scoop places `bunker.exe` and `config.yaml` together in its app directory. The c
 notepad "$(scoop prefix bunker)\config.yaml"
 ```
 
-**Option B: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
+**Option C: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
 
 ```powershell
 mkdir C:\Bunker
@@ -72,7 +78,7 @@ Remove-Item bunker.zip
 
 The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
 
-**Option C: Build from source**
+**Option D: Build from source**
 
 ```powershell
 git clone https://github.com/wj1918/bunker.git
@@ -86,7 +92,7 @@ copy config.yaml C:\Bunker\
 
 ### Step 2: Configure `config.yaml`
 
-Edit the config file (for Option B/C: `C:\Bunker\config.yaml`):
+Edit the config file (for Option C/D: `C:\Bunker\config.yaml`):
 
 ```yaml
 # Server listen address (use your Windows machine's LAN IP)
@@ -169,13 +175,13 @@ Remove: `Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule`
 
 ### Step 4: Run Bunker
 
-Scoop users (Option A) can run bunker from anywhere — the shim and config auto-detection handle everything:
+Winget and Scoop users (Option A/B) can run bunker from anywhere:
 
 ```powershell
 bunker
 ```
 
-For Option B/C, run from the install directory:
+For Option C/D, run from the install directory:
 
 ```powershell
 cd C:\Bunker
