@@ -179,21 +179,21 @@ For Option B/C, run from the install directory:
 
 ```powershell
 cd C:\Bunker
-.\bunker.exe
+bunker
 ```
 
 Bunker auto-detects `config.yaml` in the current directory or the executable's directory. To use a different config:
 
 ```powershell
-.\bunker.exe -c C:\path\to\config.yaml
+bunker -c C:\path\to\config.yaml
 ```
 
 Other options:
 
 ```powershell
-.\bunker.exe --install     # Auto-start at Windows login
-.\bunker.exe --uninstall   # Remove auto-start
-.\bunker.exe --no-tray     # Run without system tray (headless)
+bunker --install     # Auto-start at Windows login
+bunker --uninstall   # Remove auto-start
+bunker --no-tray     # Run without system tray (headless)
 ```
 
 ### Step 5: Verify
