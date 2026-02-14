@@ -35,7 +35,7 @@ bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 **Option A: Install via [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/)**
 
 ```powershell
-winget install Bunker.Bunker
+winget install bunker
 ```
 
 **Option B: Install via [Scoop](https://scoop.sh)**
