@@ -116,12 +116,23 @@ Test-Step "Config auto-detection from exe dir" {
     }
 }
 
-Test-Step "bunker --install" {
-    $output = Invoke-Cmd "bunker --install"
-    if ($output -notmatch "added to Windows startup") { throw "Install failed: $output" }
-    $reg = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
-    $val = $reg.Bunker
-    if ($val -notmatch "scoop.*bunker\.exe") { throw "Registry value incorrect: $val" }
+Test-Step "bunker --install from temp dir" {
+    $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
+    New-Item -ItemType Directory -Path $testDir | Out-Null
+    try {
+        Push-Location $testDir
+        $output = Invoke-Cmd "bunker --install"
+        if ($output -notmatch "added to Windows startup") { throw "Install failed: $output" }
+        $reg = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
+        $val = $reg.Bunker
+        $prefix = (scoop prefix bunker).Trim()
+        if ($val -notmatch [regex]::Escape($prefix)) {
+            throw "Registry should use app dir ($prefix), got: $val"
+        }
+        Pop-Location
+    } finally {
+        Remove-Item -Recurse -Force $testDir 2>$null
+    }
 }
 
 Test-Step "bunker --uninstall" {
