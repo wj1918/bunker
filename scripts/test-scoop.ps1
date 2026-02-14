@@ -1,4 +1,4 @@
-# Test Scoop package installation and functionality
+# Test Scoop (Option A) and GitHub Releases (Option B) installation
 # Run: powershell -ExecutionPolicy Bypass -File scripts\test-scoop.ps1
 
 $ErrorActionPreference = "Continue"
@@ -144,6 +144,50 @@ Test-Step "SHA256 matches release" {
         throw "Hash mismatch: manifest=$manifestHash release=$releaseHash"
     }
 }
+
+# --- Option B: GitHub Releases download ---
+Write-Host "`n=== Option B: GitHub Releases ===" -ForegroundColor Yellow
+$bunkerDir = "C:\Bunker"
+if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
+
+Test-Step "Download release zip" {
+    New-Item -ItemType Directory -Path $bunkerDir | Out-Null
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $url = "https://github.com/wj1918/bunker/releases/download/$release/bunker-$release-x86_64-pc-windows-msvc.zip"
+    Invoke-WebRequest -Uri $url -OutFile "$bunkerDir\bunker.zip"
+    if (-not (Test-Path "$bunkerDir\bunker.zip")) { throw "Download failed" }
+}
+
+Test-Step "Release SHA256 matches" {
+    $hash = (Get-FileHash "$bunkerDir\bunker.zip" -Algorithm SHA256).Hash
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $sums = (gh release download $release --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $releaseHash = ($sums.Trim() -split '\s+')[0]
+    if ($hash -ne $releaseHash) { throw "Hash mismatch: download=$hash release=$releaseHash" }
+}
+
+Test-Step "Extract zip" {
+    Expand-Archive "$bunkerDir\bunker.zip" -DestinationPath $bunkerDir
+    Remove-Item "$bunkerDir\bunker.zip"
+    $expected = @("bunker.exe", "config.yaml", "README.md")
+    foreach ($file in $expected) {
+        if (-not (Test-Path "$bunkerDir\$file")) { throw "$file missing from $bunkerDir" }
+    }
+}
+
+Test-Step "Release bunker --help" {
+    $output = cmd /c "$bunkerDir\bunker.exe --help 2>&1" | Out-String
+    if ($output -notmatch "listen_addr") { throw "Missing listen_addr in help" }
+    if ($output -notmatch "--config") { throw "Missing --config in help" }
+}
+
+Test-Step "Release Defender scan" {
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$bunkerDir\bunker.exe" 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
+}
+
+# Clean up Option B
+if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
 
 # Summary
 Write-Host "`n=============================" -ForegroundColor White
