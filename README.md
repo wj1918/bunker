@@ -169,12 +169,20 @@ Remove: `Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule`
 
 ### Step 4: Run Bunker
 
+Scoop users (Option A) can run bunker from anywhere — the shim and config auto-detection handle everything:
+
+```powershell
+bunker
+```
+
+For Option B/C, run from the install directory:
+
 ```powershell
 cd C:\Bunker
 .\bunker.exe
 ```
 
-Bunker auto-detects `config.yaml` in the current directory. To use a different config:
+Bunker auto-detects `config.yaml` in the current directory or the executable's directory. To use a different config:
 
 ```powershell
 .\bunker.exe -c C:\path\to\config.yaml
