@@ -116,6 +116,25 @@ Test-Step "Config auto-detection from exe dir" {
     }
 }
 
+Test-Step "bunker --install" {
+    $output = Invoke-Cmd "bunker --install"
+    if ($output -notmatch "added to Windows startup") { throw "Install failed: $output" }
+    $reg = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
+    $val = $reg.Bunker
+    if ($val -notmatch "scoop.*bunker\.exe") { throw "Registry value incorrect: $val" }
+}
+
+Test-Step "bunker --uninstall" {
+    $output = Invoke-Cmd "bunker --uninstall"
+    if ($output -notmatch "removed from Windows startup") { throw "Uninstall failed: $output" }
+    try {
+        Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
+        throw "Registry entry still exists after uninstall"
+    } catch [System.Management.Automation.PSArgumentException] {
+        # Expected - key doesn't exist
+    }
+}
+
 Test-Step "Version matches release" {
     $info = Invoke-Cmd "scoop info bunker"
     $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
