@@ -28,6 +28,16 @@ function Invoke-Cmd {
 # Ensure scoop is in PATH
 $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
 
+# Update Windows Defender definitions to latest
+Write-Host "Updating Windows Defender definitions..." -ForegroundColor Yellow
+& "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate -MMPC 2>$null
+$status = Get-MpComputerStatus
+$sigAge = ((Get-Date) - $status.AntivirusSignatureLastUpdated).TotalHours
+Write-Host "Defender version: $($status.AntivirusSignatureVersion) (updated $([math]::Round($sigAge, 1))h ago)" -ForegroundColor Cyan
+if ($sigAge -gt 24) {
+    Write-Host "WARNING: Defender definitions are over 24h old!" -ForegroundColor Red
+}
+
 # Clean up any previous install
 Write-Host "Cleaning up previous install..." -ForegroundColor Yellow
 scoop uninstall bunker 2>$null
@@ -90,8 +100,13 @@ Test-Step "Config auto-detection from exe dir" {
     New-Item -ItemType Directory -Path $testDir | Out-Null
     try {
         Push-Location $testDir
-        # bunker will error (port in use) but we check config loading message
-        $output = Invoke-Cmd "bunker"
+        # Run bunker with a timeout - it may start successfully and block
+        $outFile = Join-Path $env:TEMP "bunker-test-output-$(Get-Random).txt"
+        $proc = Start-Process -FilePath "bunker" -RedirectStandardError $outFile -WindowStyle Hidden -PassThru
+        Start-Sleep -Seconds 3
+        if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force 2>$null }
+        $output = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
+        Remove-Item $outFile -Force 2>$null
         if ($output -notmatch "Loading config from:.*scoop.*config\.yaml") {
             throw "Config not auto-detected from exe dir. Output: $output"
         }
@@ -108,6 +123,13 @@ Test-Step "Version matches release" {
     if ($info -notmatch [regex]::Escape($version)) {
         throw "Version $version not found in scoop info"
     }
+}
+
+Test-Step "Windows Defender scan" {
+    $prefix = (scoop prefix bunker).Trim()
+    $exe = "$prefix\bunker.exe"
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $exe 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
 }
 
 Test-Step "SHA256 matches release" {

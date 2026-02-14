@@ -32,7 +32,20 @@ bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 
 ### Step 1: Install
 
-**Option A: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
+**Option A: Install via [Scoop](https://scoop.sh)**
+
+```powershell
+scoop bucket add bunker https://github.com/wj1918/bunker
+scoop install bunker
+```
+
+Scoop places `bunker.exe` and `config.yaml` together in its app directory. The config is automatically persisted across updates. Skip to [Step 2](#step-2-configure-configyaml) to edit the config — Scoop users can open it with:
+
+```powershell
+notepad "$(scoop prefix bunker)\config.yaml"
+```
+
+**Option B: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
 
 ```powershell
 mkdir C:\Bunker
@@ -59,19 +72,6 @@ Remove-Item bunker.zip
 
 The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
 
-**Option B: Install via [Scoop](https://scoop.sh)**
-
-```powershell
-scoop bucket add bunker https://github.com/wj1918/bunker
-scoop install bunker
-```
-
-Scoop places `bunker.exe` and `config.yaml` together in its app directory. The config is automatically persisted across updates. Skip to [Step 2](#step-2-configure-configyaml) to edit the config — Scoop users can open it with:
-
-```powershell
-notepad "$(scoop prefix bunker)\config.yaml"
-```
-
 **Option C: Build from source**
 
 ```powershell
@@ -86,7 +86,7 @@ copy config.yaml C:\Bunker\
 
 ### Step 2: Configure `config.yaml`
 
-Edit the config file (for Option A/C: `C:\Bunker\config.yaml`):
+Edit the config file (for Option B/C: `C:\Bunker\config.yaml`):
 
 ```yaml
 # Server listen address (use your Windows machine's LAN IP)
@@ -415,7 +415,7 @@ Linux Clients                     Windows Server (Bunker)
 
 ### Commands
 
-```bash
+```powershell
 cargo build --release    # Release build
 cargo build              # Debug build
 cargo test               # Run tests
