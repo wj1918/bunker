@@ -1,4 +1,4 @@
-# Test Scoop (Option A) and GitHub Releases (Option B) installation
+# Test Scoop (Option A), winget (Option B), and GitHub Releases (Option C) installation
 # Run: powershell -ExecutionPolicy Bypass -File scripts\test-scoop.ps1
 
 $ErrorActionPreference = "Continue"
@@ -196,8 +196,58 @@ Test-Step "SHA256 matches release" {
     }
 }
 
-# --- Option B: GitHub Releases download ---
-Write-Host "`n=== Option B: GitHub Releases ===" -ForegroundColor Yellow
+# --- Option B: winget install ---
+Write-Host "`n=== Option B: winget ===" -ForegroundColor Yellow
+$wingetManifestDir = "$PSScriptRoot\..\winget-test\manifests"
+
+Test-Step "Winget validate manifest" {
+    if (-not (Test-Path $wingetManifestDir)) { throw "Manifest dir not found: $wingetManifestDir" }
+    $output = winget validate $wingetManifestDir 2>&1 | Out-String
+    if ($output -notmatch "succeeded") { throw "Validation failed: $output" }
+}
+
+Test-Step "Winget install from manifest" {
+    $output = winget install --manifest $wingetManifestDir --accept-source-agreements 2>&1 | Out-String
+    if ($output -notmatch "Successfully installed") { throw "Install failed: $output" }
+}
+
+$wingetPkgDir = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+$wingetBunkerDir = Get-ChildItem $wingetPkgDir -Directory -Filter "Bunker*" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+Test-Step "Winget files present" {
+    if (-not $wingetBunkerDir) { throw "Bunker package dir not found in $wingetPkgDir" }
+    $expected = @("bunker.exe", "config.yaml", "README.md")
+    foreach ($file in $expected) {
+        if (-not (Test-Path "$($wingetBunkerDir.FullName)\$file")) { throw "$file missing from $($wingetBunkerDir.FullName)" }
+    }
+}
+
+Test-Step "Winget bunker --help" {
+    $output = cmd /c "$($wingetBunkerDir.FullName)\bunker.exe --help 2>&1" | Out-String
+    if ($output -notmatch "listen_addr") { throw "Missing listen_addr in help" }
+    if ($output -notmatch "--config") { throw "Missing --config in help" }
+}
+
+Test-Step "Winget code signature valid" {
+    $sig = Get-AuthenticodeSignature "$($wingetBunkerDir.FullName)\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    if ($sig.SignerCertificate.Subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $($sig.SignerCertificate.Subject)" }
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") { throw "Unexpected issuer: $($sig.SignerCertificate.Issuer)" }
+}
+
+Test-Step "Winget Defender scan" {
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$($wingetBunkerDir.FullName)\bunker.exe" 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
+}
+
+Test-Step "Winget uninstall" {
+    # Portable packages: remove the package directory
+    Remove-Item -Recurse -Force $wingetBunkerDir.FullName
+    if (Test-Path $wingetBunkerDir.FullName) { throw "Package dir still exists after removal" }
+}
+
+# --- Option C: GitHub Releases download ---
+Write-Host "`n=== Option C: GitHub Releases ===" -ForegroundColor Yellow
 $bunkerDir = "C:\Bunker"
 if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
 
