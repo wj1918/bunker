@@ -198,7 +198,7 @@ Test-Step "SHA256 matches release" {
 
 # --- Option B: winget install ---
 Write-Host "`n=== Option B: winget ===" -ForegroundColor Yellow
-$wingetManifestDir = "$PSScriptRoot\..\winget-test\manifests"
+$wingetManifestDir = "$PSScriptRoot\..\winget\manifests"
 
 Test-Step "Winget validate manifest" {
     if (-not (Test-Path $wingetManifestDir)) { throw "Manifest dir not found: $wingetManifestDir" }
