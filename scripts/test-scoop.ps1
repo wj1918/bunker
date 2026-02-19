@@ -196,6 +196,12 @@ Test-Step "SHA256 matches release" {
     }
 }
 
+Test-Step "Scoop uninstall" {
+    $output = Invoke-Cmd "scoop uninstall bunker"
+    if ($output -notmatch "was uninstalled") { throw "Uninstall failed: $output" }
+    if (Test-Path "$env:USERPROFILE\scoop\apps\bunker\current") { throw "App dir still exists" }
+}
+
 # --- Option B: winget install ---
 Write-Host "`n=== Option B: winget ===" -ForegroundColor Yellow
 $wingetManifestDir = "$PSScriptRoot\..\winget\manifests"
@@ -241,9 +247,18 @@ Test-Step "Winget Defender scan" {
 }
 
 Test-Step "Winget uninstall" {
-    # Portable packages: remove the package directory
-    Remove-Item -Recurse -Force $wingetBunkerDir.FullName
-    if (Test-Path $wingetBunkerDir.FullName) { throw "Package dir still exists after removal" }
+    $output = winget uninstall --id Bunker.Bunker --version 0.1.0 --source winget 2>&1 | Out-String
+    if ($output -notmatch "Successfully uninstalled") { throw "Uninstall failed: $output" }
+}
+
+Test-Step "Winget install via moniker" {
+    $output = winget install bunker --accept-source-agreements 2>&1 | Out-String
+    if ($output -notmatch "Successfully installed") { throw "Install failed: $output" }
+}
+
+Test-Step "Winget uninstall via moniker" {
+    $output = winget uninstall bunker 2>&1 | Out-String
+    if ($output -notmatch "Successfully uninstalled") { throw "Uninstall failed: $output" }
 }
 
 # --- Option C: GitHub Releases download ---
