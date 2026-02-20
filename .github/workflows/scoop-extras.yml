@@ -16,22 +16,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          # Clone Extras repo (shallow)
-          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/ScoopInstaller/Extras.git extras-repo
+          # Sync fork with upstream
+          gh repo sync wj1918/Extras --source ScoopInstaller/Extras --force
+
+          # Clone fork (shallow)
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/wj1918/Extras.git extras-repo
 
           # Copy manifest
           cp bucket/bunker.json extras-repo/bucket/bunker.json
 
-          # Create branch, commit, push to fork
+          # Create branch, commit, push
           cd extras-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/wj1918/Extras.git"
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
           BRANCH="bunker-${{ inputs.version }}"
           git checkout -b "$BRANCH"
           git add bucket/bunker.json
           git commit -m "bunker: Add version ${{ inputs.version }}"
-          git push fork "$BRANCH" --force
+          git push origin "$BRANCH" --force
 
           # Create PR
           gh pr create \
