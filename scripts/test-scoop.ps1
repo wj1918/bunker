@@ -344,8 +344,57 @@ Test-Step "Release Defender scan" {
     if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
 }
 
-# Clean up Option B
+# Clean up Option C
 if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
+
+# --- Option D: Scoop Extras workflow dry run ---
+Write-Host "`n=== Option D: Scoop Extras dry run ===" -ForegroundColor Yellow
+
+Test-Step "Sync fork with upstream" {
+    $output = Invoke-Cmd "gh repo sync wj1918/Extras --source ScoopInstaller/Extras --force"
+    if ($LASTEXITCODE -ne 0) { throw "Fork sync failed: $output" }
+}
+
+Test-Step "Clone fork" {
+    $script:extrasDir = Join-Path $env:TEMP "extras-dryrun-$(Get-Random)"
+    $output = Invoke-Cmd "git clone --depth 1 https://github.com/wj1918/Extras.git `"$script:extrasDir`""
+    if (-not (Test-Path "$script:extrasDir\bucket")) { throw "Clone failed: $output" }
+}
+
+Test-Step "Copy manifest to Extras" {
+    Copy-Item "$PSScriptRoot\..\bucket\bunker.json" "$script:extrasDir\bucket\bunker.json"
+    if (-not (Test-Path "$script:extrasDir\bucket\bunker.json")) { throw "Copy failed" }
+}
+
+Test-Step "No name conflict in Extras" {
+    $existing = Invoke-Cmd "git -C `"$script:extrasDir`" log --oneline --all -- bucket/bunker.json"
+    if ($existing.Trim()) { throw "bunker.json already exists in Extras history: $existing" }
+}
+
+Test-Step "Manifest valid JSON" {
+    $manifest = Get-Content "$script:extrasDir\bucket\bunker.json" -Raw | ConvertFrom-Json
+    if (-not $manifest.version) { throw "Missing version" }
+    if (-not $manifest.description) { throw "Missing description" }
+    if (-not $manifest.homepage) { throw "Missing homepage" }
+    if (-not $manifest.license) { throw "Missing license" }
+    if (-not $manifest.architecture) { throw "Missing architecture" }
+    if (-not $manifest.checkver) { throw "Missing checkver" }
+    if (-not $manifest.autoupdate) { throw "Missing autoupdate" }
+}
+
+Test-Step "Branch and commit (dry run)" {
+    Push-Location $script:extrasDir
+    git config user.name "test" 2>$null
+    git config user.email "test@test.com" 2>$null
+    git checkout -b "bunker-test" 2>$null
+    git add bucket/bunker.json 2>$null
+    $output = Invoke-Cmd "git commit --dry-run -m `"bunker: Add version test`""
+    if ($output -notmatch "bucket/bunker.json") { throw "Dry run commit failed: $output" }
+    Pop-Location
+}
+
+# Clean up dry run
+if ($script:extrasDir -and (Test-Path $script:extrasDir)) { Remove-Item -Recurse -Force $script:extrasDir }
 
 # Summary
 Write-Host "`n=============================" -ForegroundColor White
