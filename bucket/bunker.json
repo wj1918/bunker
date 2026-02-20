@@ -3,6 +3,10 @@
     "description": "A lightweight HTTP/HTTPS and DNS proxy",
     "homepage": "https://github.com/wj1918/bunker",
     "license": "Apache-2.0",
+    "notes": [
+        "To add Bunker to Windows startup, run: bunker --install",
+        "To remove from startup, run: bunker --uninstall"
+    ],
     "architecture": {
         "64bit": {
             "url": "https://github.com/wj1918/bunker/releases/download/v0.1.0/bunker-v0.1.0-x86_64-pc-windows-msvc.zip",
@@ -17,9 +21,6 @@
             "64bit": {
                 "url": "https://github.com/wj1918/bunker/releases/download/v$version/bunker-v$version-x86_64-pc-windows-msvc.zip"
             }
-        },
-        "hash": {
-            "url": "https://github.com/wj1918/bunker/releases/download/v$version/SHA256SUMS.txt"
         }
     }
 }

@@ -49,8 +49,9 @@ Test-Step "Add bucket" {
     if ($output -notmatch "added successfully") { throw "Unexpected: $output" }
 }
 
-Test-Step "Install and hash check" {
-    $output = Invoke-Cmd "scoop install bunker"
+Test-Step "Install from local manifest" {
+    $manifest = (Resolve-Path "$PSScriptRoot\..\bucket\bunker.json").Path
+    $output = Invoke-Cmd "scoop install `"$manifest`""
     if ($output -notmatch "installed successfully") { throw "Install failed: $output" }
     if ($output -notmatch "ok\.") { throw "Hash check not confirmed: $output" }
 }
@@ -193,6 +194,31 @@ Test-Step "SHA256 matches release" {
 
     if ($manifestHash -ne $releaseHash) {
         throw "Hash mismatch: manifest=$manifestHash release=$releaseHash"
+    }
+}
+
+Test-Step "Checkver detects version" {
+    $scoopDir = (scoop prefix scoop).Trim()
+    $output = Invoke-Cmd "powershell -ExecutionPolicy Bypass -File `"$scoopDir\bin\checkver.ps1`" bunker -Dir `"$PSScriptRoot\..\bucket`""
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim() -replace '^v', ''
+    if ($output -notmatch [regex]::Escape($release)) {
+        throw "checkver did not detect version $release. Output: $output"
+    }
+}
+
+Test-Step "Autoupdate computes hash" {
+    $scoopDir = (scoop prefix scoop).Trim()
+    $output = Invoke-Cmd "powershell -ExecutionPolicy Bypass -File `"$scoopDir\bin\checkver.ps1`" bunker -Dir `"$PSScriptRoot\..\bucket`" -ForceUpdate"
+    if ($output -notmatch "Autoupdating bunker") { throw "Autoupdate did not trigger. Output: $output" }
+    if ($output -notmatch "Found:.*using") { throw "Hash not computed. Output: $output" }
+    # Verify the hash in updated manifest matches release
+    $manifest = Get-Content "$PSScriptRoot\..\bucket\bunker.json" | ConvertFrom-Json
+    $manifestHash = $manifest.architecture.'64bit'.hash
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $sums = (gh release download $release --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $releaseHash = ($sums.Trim() -split '\s+')[0]
+    if ($manifestHash -ne $releaseHash) {
+        throw "Autoupdate hash mismatch: manifest=$manifestHash release=$releaseHash"
     }
 }
 
