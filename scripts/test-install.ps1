@@ -1,5 +1,5 @@
-# Test Scoop (Option A), winget (Option B), and GitHub Releases (Option C) installation
-# Run: powershell -ExecutionPolicy Bypass -File scripts\test-scoop.ps1
+# Verify Bunker install paths: Scoop, winget, GitHub Releases zip, Scoop-Extras submission dry-run
+# Run: powershell -ExecutionPolicy Bypass -File scripts\test-install.ps1
 
 $ErrorActionPreference = "Continue"
 $failed = 0
@@ -23,6 +23,25 @@ function Invoke-Cmd {
     param([string]$Cmd)
     $output = cmd /c "$Cmd 2>&1"
     return ($output | Out-String)
+}
+
+# Backup any existing %USERPROFILE%\.bunker\config.yaml around tests that touch --init,
+# so we never clobber a real user config.
+function Backup-UserConfig {
+    param([scriptblock]$Block)
+    $cfg = "$env:USERPROFILE\.bunker\config.yaml"
+    $backup = "$cfg.test-backup"
+    $hadBackup = $false
+    if (Test-Path $cfg) {
+        Move-Item $cfg $backup -Force
+        $hadBackup = $true
+    }
+    try {
+        & $Block
+    } finally {
+        if (Test-Path $cfg) { Remove-Item $cfg -Force }
+        if ($hadBackup -and (Test-Path $backup)) { Move-Item $backup $cfg -Force }
+    }
 }
 
 # Ensure scoop is in PATH
@@ -58,7 +77,7 @@ Test-Step "Install from local manifest" {
 
 Test-Step "Files present" {
     $prefix = (scoop prefix bunker).Trim()
-    $expected = @("bunker.exe", "config.yaml", "README.md")
+    $expected = @("bunker.exe", "README.md")
     foreach ($file in $expected) {
         if (-not (Test-Path "$prefix\$file")) { throw "$file missing from $prefix" }
     }
@@ -69,11 +88,6 @@ Test-Step "Shim exists" {
     if (-not (Test-Path $shim)) { throw "Shim not found at $shim" }
 }
 
-Test-Step "Config persisted" {
-    $persist = "$env:USERPROFILE\scoop\persist\bunker\config.yaml"
-    if (-not (Test-Path $persist)) { throw "Persisted config not found at $persist" }
-}
-
 Test-Step "bunker --help" {
     $output = Invoke-Cmd "bunker --help"
     if ($output -notmatch "listen_addr") { throw "Missing listen_addr in help" }
@@ -81,47 +95,50 @@ Test-Step "bunker --help" {
     if ($output -notmatch "--init") { throw "Missing --init in help" }
 }
 
-Test-Step "bunker --init" {
-    $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
-    New-Item -ItemType Directory -Path $testDir | Out-Null
-    try {
-        Push-Location $testDir
+Test-Step "bunker --init writes to user dir" {
+    Backup-UserConfig {
+        $cfg = "$env:USERPROFILE\.bunker\config.yaml"
         $output = Invoke-Cmd "bunker --init"
-        if (-not (Test-Path "config.yaml")) { throw "config.yaml not created" }
-        $content = Get-Content "config.yaml" -Raw
+        if ($output -notmatch [regex]::Escape($cfg)) {
+            throw "--init output did not reference $cfg. Output: $output"
+        }
+        if (-not (Test-Path $cfg)) { throw "Config file not created at $cfg" }
+        $content = Get-Content $cfg -Raw
         if ($content -notmatch "listen_addr") { throw "Invalid config content" }
-        Pop-Location
-    } finally {
-        Remove-Item -Recurse -Force $testDir 2>$null
     }
 }
 
-Test-Step "Config auto-detection from exe dir" {
-    $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
-    New-Item -ItemType Directory -Path $testDir | Out-Null
-    try {
+Test-Step "Config auto-detection from user dir" {
+    Backup-UserConfig {
+        # Seed user-dir config via --init
+        Invoke-Cmd "bunker --init" | Out-Null
+        $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
+        New-Item -ItemType Directory -Path $testDir | Out-Null
         Push-Location $testDir
-        # Run bunker with a timeout - it may start successfully and block
-        $outFile = Join-Path $env:TEMP "bunker-test-output-$(Get-Random).txt"
-        $proc = Start-Process -FilePath "bunker" -RedirectStandardError $outFile -WindowStyle Hidden -PassThru
-        Start-Sleep -Seconds 3
-        if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force 2>$null }
-        $output = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
-        Remove-Item $outFile -Force 2>$null
-        if ($output -notmatch "Loading config from:.*scoop.*config\.yaml") {
-            throw "Config not auto-detected from exe dir. Output: $output"
+        try {
+            # Start bunker with no flags from a CWD that has no config.yaml;
+            # it should pick up %USERPROFILE%\.bunker\config.yaml.
+            $outFile = Join-Path $env:TEMP "bunker-test-output-$(Get-Random).txt"
+            $proc = Start-Process -FilePath "bunker" -RedirectStandardError $outFile -WindowStyle Hidden -PassThru
+            Start-Sleep -Seconds 3
+            if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force 2>$null }
+            $output = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
+            Remove-Item $outFile -Force 2>$null
+            if ($output -notmatch "Loading config from:.*\.bunker\\config\.yaml") {
+                throw "Config not auto-detected from user dir. Output: $output"
+            }
+        } finally {
+            Pop-Location
+            Remove-Item -Recurse -Force $testDir 2>$null
         }
-        Pop-Location
-    } finally {
-        Remove-Item -Recurse -Force $testDir 2>$null
     }
 }
 
 Test-Step "bunker --install from temp dir" {
     $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
     New-Item -ItemType Directory -Path $testDir | Out-Null
+    Push-Location $testDir
     try {
-        Push-Location $testDir
         $output = Invoke-Cmd "bunker --install"
         if ($output -notmatch "added to Windows startup") { throw "Install failed: $output" }
         $reg = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
@@ -130,8 +147,8 @@ Test-Step "bunker --install from temp dir" {
         if ($val -notmatch [regex]::Escape($prefix)) {
             throw "Registry should use app dir ($prefix), got: $val"
         }
-        Pop-Location
     } finally {
+        Pop-Location
         Remove-Item -Recurse -Force $testDir 2>$null
     }
 }
@@ -238,8 +255,11 @@ Test-Step "Winget validate manifest" {
     if ($output -notmatch "succeeded") { throw "Validation failed: $output" }
 }
 
-Test-Step "Winget install from manifest" {
-    $output = winget install --manifest $wingetManifestDir --accept-source-agreements 2>&1 | Out-String
+# Install via the public moniker (same path real users take). The local-manifest
+# install path was dropped because winget's IAttachmentExecute MOTW step hangs
+# on some hosts; `winget validate` above already covers manifest schema.
+Test-Step "Winget install via moniker" {
+    $output = winget install bunker --accept-source-agreements 2>&1 | Out-String
     if ($output -notmatch "Successfully installed") { throw "Install failed: $output" }
 }
 
@@ -248,7 +268,7 @@ $wingetBunkerDir = Get-ChildItem $wingetPkgDir -Directory -Filter "Bunker*" -Err
 
 Test-Step "Winget files present" {
     if (-not $wingetBunkerDir) { throw "Bunker package dir not found in $wingetPkgDir" }
-    $expected = @("bunker.exe", "config.yaml", "README.md")
+    $expected = @("bunker.exe", "README.md")
     foreach ($file in $expected) {
         if (-not (Test-Path "$($wingetBunkerDir.FullName)\$file")) { throw "$file missing from $($wingetBunkerDir.FullName)" }
     }
@@ -258,6 +278,17 @@ Test-Step "Winget bunker --help" {
     $output = cmd /c "$($wingetBunkerDir.FullName)\bunker.exe --help 2>&1" | Out-String
     if ($output -notmatch "listen_addr") { throw "Missing listen_addr in help" }
     if ($output -notmatch "--config") { throw "Missing --config in help" }
+}
+
+Test-Step "Winget bunker --init writes to user dir" {
+    Backup-UserConfig {
+        $cfg = "$env:USERPROFILE\.bunker\config.yaml"
+        $output = cmd /c "$($wingetBunkerDir.FullName)\bunker.exe --init 2>&1" | Out-String
+        if ($output -notmatch [regex]::Escape($cfg)) {
+            throw "--init output did not reference $cfg. Output: $output"
+        }
+        if (-not (Test-Path $cfg)) { throw "Config file not created at $cfg" }
+    }
 }
 
 Test-Step "Winget code signature valid" {
@@ -273,16 +304,6 @@ Test-Step "Winget Defender scan" {
 }
 
 Test-Step "Winget uninstall" {
-    $output = winget uninstall --id Bunker.Bunker --version 0.1.0 --source winget 2>&1 | Out-String
-    if ($output -notmatch "Successfully uninstalled") { throw "Uninstall failed: $output" }
-}
-
-Test-Step "Winget install via moniker" {
-    $output = winget install bunker --accept-source-agreements 2>&1 | Out-String
-    if ($output -notmatch "Successfully installed") { throw "Install failed: $output" }
-}
-
-Test-Step "Winget uninstall via moniker" {
     $output = winget uninstall bunker 2>&1 | Out-String
     if ($output -notmatch "Successfully uninstalled") { throw "Uninstall failed: $output" }
 }
@@ -311,7 +332,7 @@ Test-Step "Release SHA256 matches" {
 Test-Step "Extract zip" {
     Expand-Archive "$bunkerDir\bunker.zip" -DestinationPath $bunkerDir
     Remove-Item "$bunkerDir\bunker.zip"
-    $expected = @("bunker.exe", "config.yaml", "README.md")
+    $expected = @("bunker.exe", "README.md")
     foreach ($file in $expected) {
         if (-not (Test-Path "$bunkerDir\$file")) { throw "$file missing from $bunkerDir" }
     }
