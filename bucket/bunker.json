@@ -4,6 +4,8 @@
     "homepage": "https://github.com/wj1918/bunker",
     "license": "Apache-2.0",
     "notes": [
+        "First-time setup: run 'bunker --init' to create %USERPROFILE%\\.bunker\\config.yaml, then edit it.",
+        "Run with 'bunker' (auto-loads %USERPROFILE%\\.bunker\\config.yaml).",
         "To add Bunker to Windows startup, run: bunker --install",
         "To remove from startup, run: bunker --uninstall"
     ],
@@ -14,7 +16,6 @@
         }
     },
     "bin": "bunker.exe",
-    "persist": "config.yaml",
     "checkver": "github",
     "autoupdate": {
         "architecture": {
