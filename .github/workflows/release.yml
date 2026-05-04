@@ -197,7 +197,7 @@ jobs:
           SHA256: ${{ steps.hash.outputs.sha256 }}
         run: |
           URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
-          MANIFEST_DIR="winget-staging/manifests/B/Bunker/Bunker/${VERSION}"
+          MANIFEST_DIR="winget-staging/manifests/b/Bunker/Bunker/${VERSION}"
           mkdir -p "$MANIFEST_DIR"
 
           cat > "$MANIFEST_DIR/Bunker.Bunker.yaml" <<YAML
@@ -272,7 +272,7 @@ jobs:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          MANIFEST_DIR="winget-staging/manifests/B/Bunker/Bunker/${VERSION}"
+          MANIFEST_DIR="winget-staging/manifests/b/Bunker/Bunker/${VERSION}"
 
           # Sync fork with upstream
           gh repo sync wj1918/winget-pkgs --source microsoft/winget-pkgs --force
@@ -281,7 +281,7 @@ jobs:
           git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/wj1918/winget-pkgs.git winget-pkgs-repo
 
           # Copy manifests
-          TARGET_DIR="winget-pkgs-repo/manifests/B/Bunker/Bunker/${VERSION}"
+          TARGET_DIR="winget-pkgs-repo/manifests/b/Bunker/Bunker/${VERSION}"
           mkdir -p "$TARGET_DIR"
           cp "$MANIFEST_DIR"/*.yaml "$TARGET_DIR/"
 
@@ -291,7 +291,7 @@ jobs:
           git config user.email "${{ github.actor }}@users.noreply.github.com"
           BRANCH="bunker-${VERSION}"
           git checkout -b "$BRANCH"
-          git add "manifests/B/Bunker/Bunker/${VERSION}/"
+          git add "manifests/b/Bunker/Bunker/${VERSION}/"
           git commit -m "New version: Bunker.Bunker version ${VERSION}"
           git push origin "$BRANCH" --force
 
