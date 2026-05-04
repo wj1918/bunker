@@ -13,18 +13,21 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 
 ## Quick Start
 
-Bunker automatically loads `config.yaml` from the current directory or the executable's directory. Just run:
+After installing, create a default config and run:
 
 ```powershell
-bunker
+bunker --init     # writes %USERPROFILE%\.bunker\config.yaml
+bunker            # auto-loads %USERPROFILE%\.bunker\config.yaml
 ```
 
-Or specify a config file or CLI arguments:
+The config in `%USERPROFILE%\.bunker\` lives outside any package-managed directory, so it survives `winget upgrade` and `scoop update`. You can also point at any other config file:
 
 ```powershell
 bunker -c C:\path\to\config.yaml
 bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 ```
+
+`bunker` searches for config in this order: `--config <path>` → `./config.yaml` → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml` → built-in defaults.
 
 ---
 
@@ -45,10 +48,11 @@ scoop bucket add bunker https://github.com/wj1918/bunker
 scoop install bunker
 ```
 
-Scoop places `bunker.exe` and `config.yaml` together in its app directory. The config is automatically persisted across updates. Skip to [Step 2](#step-2-configure-configyaml) to edit the config — Scoop users can open it with:
+Scoop places `bunker.exe` in its app directory. The release zip ships only the binary — config lives at `%USERPROFILE%\.bunker\config.yaml` and survives `scoop update`. Bootstrap it with:
 
 ```powershell
-notepad "$(scoop prefix bunker)\config.yaml"
+bunker --init
+notepad "$env:USERPROFILE\.bunker\config.yaml"
 ```
 
 **Option C: Download from [GitHub Releases](https://github.com/wj1918/bunker/releases)**
@@ -76,7 +80,7 @@ Expand-Archive bunker.zip -DestinationPath .
 Remove-Item bunker.zip
 ```
 
-The zip contains `bunker.exe`, a sample `config.yaml`, and `README.md`.
+The zip contains `bunker.exe` and `README.md`. Run `bunker --init` to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template.
 
 **Option D: Build from source**
 
@@ -87,12 +91,11 @@ cargo build --release
 
 mkdir C:\Bunker
 copy target\release\bunker.exe C:\Bunker\
-copy config.yaml C:\Bunker\
 ```
 
 ### Step 2: Configure `config.yaml`
 
-Edit the config file (for Option C/D: `C:\Bunker\config.yaml`):
+Run `bunker --init` once to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template, then edit it:
 
 ```yaml
 # Server listen address (use your Windows machine's LAN IP)
@@ -175,24 +178,19 @@ Remove: `Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule`
 
 ### Step 4: Run Bunker
 
-Winget and Scoop users (Option A/B) can run bunker from anywhere:
+Run from anywhere — Bunker picks up `%USERPROFILE%\.bunker\config.yaml` automatically:
 
 ```powershell
 bunker
 ```
 
-For Option C/D, run from the install directory:
-
-```powershell
-cd C:\Bunker
-bunker
-```
-
-Bunker auto-detects `config.yaml` in the current directory or the executable's directory. To use a different config:
+To use a different config explicitly:
 
 ```powershell
 bunker -c C:\path\to\config.yaml
 ```
+
+Search order: `--config <path>` → `./config.yaml` (CWD) → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml` → built-in defaults.
 
 Other options:
 
@@ -232,9 +230,18 @@ export https_proxy=http://192.168.1.1:8080
 export HTTP_PROXY=http://192.168.1.1:8080
 export HTTPS_PROXY=http://192.168.1.1:8080
 export no_proxy=localhost,127.0.0.1,192.168.1.0/24
+export NO_PROXY=localhost,127.0.0.1,192.168.1.0/24
 ```
 
-This covers most CLI tools (curl, wget, git, pip, etc). Some applications need their own config:
+This covers most CLI tools (curl, wget, git, pip, etc).
+
+> **Note:** `sudo` clears the environment by default, so `sudo apt update`, `sudo curl …`, etc. won't see the proxy variables above. Use `sudo -E` to preserve them — for example, `sudo -E apt update`. To make it permanent, add this line to `/etc/sudoers` via `sudo visudo`:
+>
+> ```
+> Defaults env_keep += "http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY"
+> ```
+
+Some applications need their own config:
 
 <details>
 <summary>Per-application proxy settings</summary>
