@@ -371,7 +371,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Write the embedded default config.yaml to the per-user config dir
 /// (`%USERPROFILE%\.bunker\config.yaml` on Windows, `$HOME/.bunker/config.yaml` on Unix).
 fn init_config() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = user_config_path().ok_or("Could not determine home directory (USERPROFILE/HOME not set)")?;
+    let path = user_config_path()
+        .ok_or("Could not determine home directory (USERPROFILE/HOME not set)")?;
     if path.exists() {
         eprintln!("Config already exists at: {}", path.display());
         eprintln!("Remove or rename it first if you want to regenerate.");
@@ -398,7 +399,9 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -c, --config <path>     Load config from YAML file");
-    eprintln!("  --init                  Create default config at %USERPROFILE%\\.bunker\\config.yaml");
+    eprintln!(
+        "  --init                  Create default config at %USERPROFILE%\\.bunker\\config.yaml"
+    );
     eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
     eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
     eprintln!("  --no-tray               Disable system tray (Windows only)");
