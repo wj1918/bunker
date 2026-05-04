@@ -1,5 +1,4 @@
 # Bunker Proxy Server Configuration
-# All values shown are defaults unless otherwise noted
 
 # Address to listen for HTTP/HTTPS proxy requests
 listen_addr: "192.168.1.1:8080"
@@ -94,7 +93,7 @@ security:
   # Rate limiting per source IP
   rate_limit:
     enabled: true
-    max_requests: 100        # Requests per window
+    max_requests: 1000       # Requests per window
     window_seconds: 60       # Time window in seconds
     max_tracked_ips: 100000  # Maximum IPs to track (memory protection)
     ipv6_subnet_rate_limit: true  # Use /64 subnet for IPv6
