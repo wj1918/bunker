@@ -566,6 +566,17 @@ fn exe_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
+/// Path to the per-user config: `<home>/.bunker/config.yaml`.
+/// Windows uses `%USERPROFILE%`, Unix uses `$HOME`.
+pub fn user_config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+
+    home.map(|h| PathBuf::from(h).join(".bunker").join("config.yaml"))
+}
+
 /// Load configuration from file
 pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     // Try to find config file
@@ -573,7 +584,11 @@ pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Err
         vec![PathBuf::from(p)]
     } else {
         let mut paths = vec![PathBuf::from("config.yaml")];
-        // Look next to the executable (handles Scoop installs and portable setups)
+        // Per-user config (survives package upgrades)
+        if let Some(p) = user_config_path() {
+            paths.push(p);
+        }
+        // Look next to the executable (handles portable setups that bundle a config)
         if let Some(dir) = exe_dir() {
             paths.push(dir.join("config.yaml"));
         }

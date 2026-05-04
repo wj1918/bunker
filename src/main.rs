@@ -15,8 +15,8 @@ mod security;
 mod tokio_io;
 
 use config::{
-    default_dns_listen, default_dns_upstream, load_config, DnsCacheConfig, DnsConfig,
-    DnsFailoverConfig, DnsSecurityConfig, DEFAULT_CONFIG_YAML,
+    default_dns_listen, default_dns_upstream, load_config, user_config_path, DnsCacheConfig,
+    DnsConfig, DnsFailoverConfig, DnsSecurityConfig, DEFAULT_CONFIG_YAML,
 };
 use dns::run_dns_server;
 use helpers::create_tls_connector;
@@ -368,18 +368,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
-/// Write the embedded default config.yaml to the current directory
+/// Write the embedded default config.yaml to the per-user config dir
+/// (`%USERPROFILE%\.bunker\config.yaml` on Windows, `$HOME/.bunker/config.yaml` on Unix).
 fn init_config() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = std::path::Path::new("config.yaml");
+    let path = user_config_path().ok_or("Could not determine home directory (USERPROFILE/HOME not set)")?;
     if path.exists() {
-        eprintln!("config.yaml already exists in the current directory.");
+        eprintln!("Config already exists at: {}", path.display());
         eprintln!("Remove or rename it first if you want to regenerate.");
         std::process::exit(1);
     }
-    std::fs::write(path, DEFAULT_CONFIG_YAML)?;
-    eprintln!("Created config.yaml in current directory.");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, DEFAULT_CONFIG_YAML)?;
+    eprintln!("Created config at: {}", path.display());
     eprintln!("Edit it to match your environment, then run:");
-    eprintln!("  bunker -c config.yaml");
+    eprintln!("  bunker");
     Ok(())
 }
 
@@ -394,7 +398,7 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -c, --config <path>     Load config from YAML file");
-    eprintln!("  --init                  Create default config.yaml in current directory");
+    eprintln!("  --init                  Create default config at %USERPROFILE%\\.bunker\\config.yaml");
     eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
     eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
     eprintln!("  --no-tray               Disable system tray (Windows only)");
