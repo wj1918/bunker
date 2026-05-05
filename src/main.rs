@@ -69,6 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 print_usage(&args[0]);
                 return Ok(());
             }
+            "-V" | "--version" => {
+                println!("bunker {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--init" => {
                 return init_config();
             }
@@ -408,6 +412,7 @@ fn print_usage(program: &str) {
     eprintln!("  --install               Add to Windows startup (Windows only)");
     eprintln!("  --uninstall             Remove from Windows startup (Windows only)");
     eprintln!("  -h, --help              Show this help message");
+    eprintln!("  -V, --version           Print version and exit");
     eprintln!();
     eprintln!("Config file (config.yaml):");
     eprintln!("  listen_addr: \"0.0.0.0:8080\"    # or \"[::]:8080\" for IPv6");
