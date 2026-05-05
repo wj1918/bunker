@@ -62,6 +62,7 @@ Write-Host "Cleaning up previous install..." -ForegroundColor Yellow
 scoop uninstall bunker 2>$null
 scoop bucket rm bunker 2>$null
 scoop cache rm bunker 2>$null
+winget uninstall bunker --silent 2>$null | Out-Null
 
 Test-Step "Add bucket" {
     $output = Invoke-Cmd "scoop bucket add bunker https://github.com/wj1918/bunker"
@@ -205,12 +206,13 @@ Test-Step "SHA256 matches release" {
     $prefix = (scoop prefix bunker).Trim()
     $manifest = Get-Content "$prefix\manifest.json" | ConvertFrom-Json
     $manifestHash = $manifest.architecture.'64bit'.hash
+    $version = $manifest.version
 
-    $sums = (gh release download v0.1.0 --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $sums = (gh release download "v$version" --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
     $releaseHash = ($sums.Trim() -split '\s+')[0]
 
     if ($manifestHash -ne $releaseHash) {
-        throw "Hash mismatch: manifest=$manifestHash release=$releaseHash"
+        throw "Hash mismatch: manifest=$manifestHash release=$releaseHash (v$version)"
     }
 }
 
