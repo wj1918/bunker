@@ -1,6 +1,6 @@
 [package]
 name = "bunker"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "A lightweight HTTP/HTTPS and DNS proxy"
@@ -17,8 +17,8 @@ name = "bunker"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
