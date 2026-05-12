@@ -74,10 +74,10 @@ pub async fn run_dns_server(
         }
     });
 
+    let mut recv_buf = [0u8; 512];
     loop {
-        let mut buf = vec![0u8; 512];
-        let (len, src) = socket.recv_from(&mut buf).await?;
-        buf.truncate(len);
+        let (len, src) = socket.recv_from(&mut recv_buf).await?;
+        let buf = recv_buf[..len].to_vec();
 
         // Check source IP allowlist
         if has_ip_allowlist && !is_source_ip_allowed(&src.ip(), &allowed_source_ips) {
