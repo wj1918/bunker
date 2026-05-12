@@ -266,28 +266,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
-    // Handle tray messages in background
+    // Handle tray messages in background (blocking thread — channel is std::sync::mpsc)
     #[cfg(windows)]
     if let Some(rx) = tray_rx {
-        tokio::spawn(async move {
-            loop {
-                match rx.try_recv() {
-                    Ok(TrayMessage::Quit) => {
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    TrayMessage::Quit => {
                         println!("Quit requested from tray");
                         std::process::exit(0);
                     }
-                    Ok(TrayMessage::Minimize) => {
+                    TrayMessage::Minimize => {
                         println!("Minimize requested from tray");
                         hide_window();
                     }
-                    Ok(TrayMessage::BringToFront) => {
+                    TrayMessage::BringToFront => {
                         println!("Bring to front requested from tray");
                         show_window();
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         });
     }
