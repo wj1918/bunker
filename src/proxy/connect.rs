@@ -49,7 +49,17 @@ pub async fn handle_connect(
     // Parse host and port for DNS resolution
     let (host, port) = if let Some(colon_pos) = authority.rfind(':') {
         let h = &authority[..colon_pos];
-        let p: u16 = authority[colon_pos + 1..].parse().unwrap_or(443);
+        let p: u16 = match authority[colon_pos + 1..].parse() {
+            Ok(p) if p > 0 => p,
+            _ => {
+                warn!(
+                    client = %client_addr,
+                    target = %authority,
+                    "CONNECT bad request: invalid port"
+                );
+                return Ok(error_response(400, "Bad Request: invalid port"));
+            }
+        };
         (h.to_string(), p)
     } else {
         (authority.clone(), 443)
