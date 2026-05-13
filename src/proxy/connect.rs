@@ -68,6 +68,15 @@ pub async fn handle_connect(
     // DNS Rebinding Protection: Resolve and validate ALL IPs before connecting
     let resolved_addrs = match resolve_and_validate_host(&host, port, security).await {
         Ok(addrs) => addrs,
+        Err(reason) if reason.starts_with("DNS resolution") => {
+            warn!(
+                client = %client_addr,
+                target = %authority,
+                reason = %reason,
+                "CONNECT DNS lookup failed"
+            );
+            return Ok(error_response(502, "Bad Gateway: DNS resolution failed"));
+        }
         Err(reason) => {
             warn!(
                 client = %client_addr,
