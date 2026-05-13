@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 #[cfg(windows)]
 use std::sync::mpsc;
@@ -363,7 +363,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
             {
-                error!(client = %client_addr, error = ?err, "Error serving client");
+                // Demote benign client-lifecycle errors (idle keep-alive timeout, peer FIN
+                // mid-parse) to debug. Real proxy errors still log at error level.
+                let benign = err
+                    .downcast_ref::<hyper::Error>()
+                    .map(|e| e.is_timeout() || e.is_incomplete_message())
+                    .unwrap_or(false);
+                if benign {
+                    debug!(client = %client_addr, error = ?err, "Client connection closed");
+                } else {
+                    error!(client = %client_addr, error = ?err, "Error serving client");
+                }
             }
         });
     }
