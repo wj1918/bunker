@@ -1,11 +1,8 @@
 name: CI
 
-# Run only on pull requests. Every PR is tested before merge, so the
-# post-merge push to main would just repeat the same work — the PR head
-# and the merge commit are byte-identical when main hasn't moved (which
-# is the common case here). If someone pushes directly to main, those
-# commits intentionally bypass CI; PRs are the supported path.
 on:
+  push:
+    branches: [master, main]
   pull_request:
     branches: [master, main]
 
