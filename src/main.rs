@@ -15,8 +15,8 @@ mod security;
 mod tokio_io;
 
 use config::{
-    default_dns_listen, default_dns_upstream, load_config, user_config_path, DnsCacheConfig,
-    DnsConfig, DnsFailoverConfig, DnsSecurityConfig, DEFAULT_CONFIG_YAML,
+    customize_default_config, default_dns_listen, default_dns_upstream, load_config,
+    user_config_path, Config, DnsCacheConfig, DnsConfig, DnsFailoverConfig, DnsSecurityConfig,
 };
 use dns::run_dns_server;
 use helpers::create_tls_connector;
@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cli_dns_addr: Option<String> = None;
     let mut cli_dns_upstream: Option<String> = None;
     let mut use_tray = true;
+    let mut do_init = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -53,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "--config" | "-c" => {
                 i += 1;
                 config_path = args.get(i).map(|s| s.as_str());
+            }
+            "--listen" => {
+                i += 1;
+                cli_listen_addr = args.get(i).cloned();
             }
             "--dns" => {
                 i += 1;
@@ -74,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
             "--init" => {
-                return init_config();
+                do_init = true;
             }
             #[cfg(windows)]
             "--install" => {
@@ -94,6 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
         i += 1;
+    }
+
+    if do_init {
+        return init_config(
+            cli_listen_addr.as_deref(),
+            cli_dns_addr.as_deref(),
+            cli_dns_upstream.as_deref(),
+        );
     }
 
     // Load config from file
@@ -392,7 +405,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Write the embedded default config.yaml to the per-user config dir
 /// (`%USERPROFILE%\.bunker\config.yaml` on Windows, `$HOME/.bunker/config.yaml` on Unix).
-fn init_config() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn init_config(
+    proxy_listen: Option<&str>,
+    dns_listen: Option<&str>,
+    dns_upstream: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Validate any overrides as SocketAddrs *before* touching disk, so a typo
+    // surfaces immediately instead of producing a broken config.
+    for (flag, value) in [
+        ("--listen", proxy_listen),
+        ("--dns", dns_listen),
+        ("--dns-upstream", dns_upstream),
+    ] {
+        if let Some(v) = value {
+            v.parse::<SocketAddr>()
+                .map_err(|e| format!("Invalid value for {}: {} ({})", flag, v, e))?;
+        }
+    }
+
     let path = user_config_path()
         .ok_or("Could not determine home directory (USERPROFILE/HOME not set)")?;
     if path.exists() {
@@ -403,8 +433,28 @@ fn init_config() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, DEFAULT_CONFIG_YAML)?;
+
+    let yaml = customize_default_config(proxy_listen, dns_listen, dns_upstream);
+
+    // Round-trip through the strict deserializer so we never write a file the
+    // proxy itself would refuse to load.
+    serde_yaml_ng::from_str::<Config>(&yaml)
+        .map_err(|e| format!("Generated config failed to parse: {}", e))?;
+
+    std::fs::write(&path, &yaml)?;
     eprintln!("Created config at: {}", path.display());
+    if proxy_listen.is_some() || dns_listen.is_some() || dns_upstream.is_some() {
+        eprintln!("Applied overrides:");
+        if let Some(v) = proxy_listen {
+            eprintln!("  proxy.listen   = {}", v);
+        }
+        if let Some(v) = dns_listen {
+            eprintln!("  dns.listen     = {}", v);
+        }
+        if let Some(v) = dns_upstream {
+            eprintln!("  dns.upstreams  = [{}]", v);
+        }
+    }
     eprintln!("Edit it to match your environment, then run:");
     eprintln!("  bunker");
     Ok(())
@@ -421,9 +471,12 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -c, --config <path>     Load config from YAML file");
+    eprintln!("  --listen <addr>         Proxy listen address (same as positional arg)");
     eprintln!(
         "  --init                  Create default config at %USERPROFILE%\\.bunker\\config.yaml"
     );
+    eprintln!("                          Combine with --listen/--dns/--dns-upstream to bake");
+    eprintln!("                          those values into the generated file.");
     eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
     eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
     eprintln!("  --no-tray               Disable system tray (Windows only)");
@@ -456,6 +509,10 @@ fn print_usage(program: &str) {
     );
     eprintln!(
         "  {} --config config.yaml                       # Use config file",
+        program
+    );
+    eprintln!(
+        "  {} --init --listen [::]:8080 --dns 0.0.0.0:53 # Generate config with overrides",
         program
     );
     eprintln!();
