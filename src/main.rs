@@ -16,15 +16,19 @@ mod tokio_io;
 
 use config::{
     customize_default_config, default_dns_listen, default_dns_upstream, load_config,
-    user_config_path, Config, DnsCacheConfig, DnsConfig, DnsFailoverConfig, DnsSecurityConfig,
+    user_config_path, AllowlistOverride, Config, DnsCacheConfig, DnsConfig, DnsFailoverConfig,
+    DnsSecurityConfig,
 };
 use dns::run_dns_server;
 use helpers::create_tls_connector;
+use platform::net_discovery::{
+    assume_slash_24, discover_all_lan_interfaces, discover_lan_interface, interface_for_ipv4,
+};
 use proxy::{handle_client, SenderPool};
 use security::{is_source_ip_allowed, RateLimiter};
 
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -47,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut cli_dns_upstream: Option<String> = None;
     let mut use_tray = true;
     let mut do_init = false;
+    let mut init_mode = InitMode::Loopback;
 
     let mut i = 1;
     while i < args.len() {
@@ -80,6 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             "--init" => {
                 do_init = true;
+                // Optional positional mode: `loopback`, `lan`, or `custom`. If
+                // the next token isn't a recognized mode we leave it alone so
+                // it can match a later branch (e.g. positional listen addr).
+                if let Some(next) = args.get(i + 1) {
+                    if let Some(mode) = InitMode::parse(next) {
+                        init_mode = mode;
+                        i += 1;
+                    }
+                }
             }
             #[cfg(windows)]
             "--install" => {
@@ -103,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if do_init {
         return init_config(
+            init_mode,
             cli_listen_addr.as_deref(),
             cli_dns_addr.as_deref(),
             cli_dns_upstream.as_deref(),
@@ -403,9 +418,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 }
 
+/// Initialization preset chosen via `bunker --init [mode]`.
+#[derive(Clone, Copy, Debug)]
+enum InitMode {
+    /// Default: bind 127.0.0.1, shipped allowlist (`127.0.0.1`, `::1`).
+    Loopback,
+    /// Auto-discover a single RFC 1918 interface, bind to its IP, set the
+    /// allowlist to its subnet. Errors out on multi-NIC or no-NIC hosts.
+    Lan,
+    /// Require `--listen`/`--dns`/`--dns-upstream`. Derive the allowlist from
+    /// the `--listen` address: matching interface → that interface's CIDR;
+    /// wildcard → union of all detected LAN subnets; loopback → loopback
+    /// allowlist; unmatched non-local IP → assumed /24.
+    Custom,
+}
+
+impl InitMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "loopback" => Some(Self::Loopback),
+            "lan" => Some(Self::Lan),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Concrete decisions reached by interpreting the mode and CLI overrides.
+/// Drives both the YAML rewrite and the post-write summary.
+struct InitPlan {
+    proxy_listen: Option<String>,
+    dns_listen: Option<String>,
+    dns_upstream: Option<String>,
+    allowed_source_ips: Option<Vec<String>>,
+    allowlist_annotation: Option<String>,
+}
+
+impl InitPlan {
+    fn has_overrides(&self) -> bool {
+        self.proxy_listen.is_some()
+            || self.dns_listen.is_some()
+            || self.dns_upstream.is_some()
+            || self.allowed_source_ips.is_some()
+    }
+}
+
 /// Write the embedded default config.yaml to the per-user config dir
-/// (`%USERPROFILE%\.bunker\config.yaml` on Windows, `$HOME/.bunker/config.yaml` on Unix).
+/// (`%USERPROFILE%\.bunker\config.yaml` on Windows, `$HOME/.bunker/config.yaml` on Unix),
+/// customized according to `mode` and any explicit CLI overrides.
 fn init_config(
+    mode: InitMode,
     proxy_listen: Option<&str>,
     dns_listen: Option<&str>,
     dns_upstream: Option<&str>,
@@ -423,6 +493,8 @@ fn init_config(
         }
     }
 
+    let plan = build_init_plan(mode, proxy_listen, dns_listen, dns_upstream)?;
+
     let path = user_config_path()
         .ok_or("Could not determine home directory (USERPROFILE/HOME not set)")?;
     if path.exists() {
@@ -434,7 +506,20 @@ fn init_config(
         std::fs::create_dir_all(parent)?;
     }
 
-    let yaml = customize_default_config(proxy_listen, dns_listen, dns_upstream);
+    let allowlist_override = plan
+        .allowed_source_ips
+        .as_ref()
+        .map(|entries| AllowlistOverride {
+            entries: entries.as_slice(),
+            annotation: plan.allowlist_annotation.as_deref(),
+        });
+
+    let yaml = customize_default_config(
+        plan.proxy_listen.as_deref(),
+        plan.dns_listen.as_deref(),
+        plan.dns_upstream.as_deref(),
+        allowlist_override.as_ref(),
+    );
 
     // Round-trip through the strict deserializer so we never write a file the
     // proxy itself would refuse to load.
@@ -443,21 +528,140 @@ fn init_config(
 
     std::fs::write(&path, &yaml)?;
     eprintln!("Created config at: {}", path.display());
-    if proxy_listen.is_some() || dns_listen.is_some() || dns_upstream.is_some() {
+    eprintln!("Init mode: {}", mode.as_str());
+    if plan.has_overrides() {
         eprintln!("Applied overrides:");
-        if let Some(v) = proxy_listen {
-            eprintln!("  proxy.listen   = {}", v);
+        if let Some(v) = plan.proxy_listen.as_ref() {
+            eprintln!("  proxy.listen        = {}", v);
         }
-        if let Some(v) = dns_listen {
-            eprintln!("  dns.listen     = {}", v);
+        if let Some(v) = plan.dns_listen.as_ref() {
+            eprintln!("  dns.listen          = {}", v);
         }
-        if let Some(v) = dns_upstream {
-            eprintln!("  dns.upstreams  = [{}]", v);
+        if let Some(v) = plan.dns_upstream.as_ref() {
+            eprintln!("  dns.upstreams       = [{}]", v);
+        }
+        if let Some(entries) = plan.allowed_source_ips.as_ref() {
+            eprintln!("  allowed_source_ips  = {:?}", entries);
         }
     }
     eprintln!("Edit it to match your environment, then run:");
     eprintln!("  bunker");
     Ok(())
+}
+
+fn build_init_plan(
+    mode: InitMode,
+    cli_proxy_listen: Option<&str>,
+    cli_dns_listen: Option<&str>,
+    cli_dns_upstream: Option<&str>,
+) -> Result<InitPlan, Box<dyn std::error::Error + Send + Sync>> {
+    match mode {
+        InitMode::Loopback => Ok(InitPlan {
+            proxy_listen: cli_proxy_listen.map(String::from),
+            dns_listen: cli_dns_listen.map(String::from),
+            dns_upstream: cli_dns_upstream.map(String::from),
+            allowed_source_ips: None,
+            allowlist_annotation: None,
+        }),
+        InitMode::Lan => {
+            let iface = discover_lan_interface().map_err(|e| -> Box<
+                dyn std::error::Error + Send + Sync,
+            > { format!("{}", e).into() })?;
+            let bind_proxy = format!("{}:8080", iface.ip);
+            let bind_dns = format!("{}:53", iface.ip);
+            let annotation = format!(
+                "Set by `bunker --init lan` from interface {} ({}).",
+                iface.name, iface.ip
+            );
+            Ok(InitPlan {
+                proxy_listen: Some(cli_proxy_listen.map(String::from).unwrap_or(bind_proxy)),
+                dns_listen: Some(cli_dns_listen.map(String::from).unwrap_or(bind_dns)),
+                dns_upstream: cli_dns_upstream.map(String::from),
+                allowed_source_ips: Some(vec![iface.cidr]),
+                allowlist_annotation: Some(annotation),
+            })
+        }
+        InitMode::Custom => {
+            let listen = cli_proxy_listen.ok_or(
+                "custom mode requires --listen <addr> (e.g. --listen 192.168.5.42:8080)",
+            )?;
+            let dns = cli_dns_listen
+                .ok_or("custom mode requires --dns <addr> (e.g. --dns 192.168.5.42:53)")?;
+            let upstream = cli_dns_upstream
+                .ok_or("custom mode requires --dns-upstream <addr> (e.g. --dns-upstream 9.9.9.9:53)")?;
+            let listen_sa: SocketAddr = listen.parse().expect("validated upstream");
+            let (entries, annotation) = derive_custom_allowlist(listen_sa);
+            Ok(InitPlan {
+                proxy_listen: Some(listen.to_string()),
+                dns_listen: Some(dns.to_string()),
+                dns_upstream: Some(upstream.to_string()),
+                allowed_source_ips: Some(entries),
+                allowlist_annotation: Some(annotation),
+            })
+        }
+    }
+}
+
+/// Pick an allowlist for `--init custom` based on the listen address. Never
+/// errors — every input shape produces some sensible config (per spec: edge
+/// cases should not block init).
+fn derive_custom_allowlist(listen: SocketAddr) -> (Vec<String>, String) {
+    let ip = listen.ip();
+
+    // Wildcard bind: union of all detected LAN subnets, or loopback fallback.
+    if ip.is_unspecified() {
+        let candidates = discover_all_lan_interfaces();
+        if candidates.is_empty() {
+            return (
+                vec!["127.0.0.1".to_string(), "::1".to_string()],
+                "Set by `bunker --init custom` (wildcard bind, no LAN interface detected — \
+                 only loopback can reach this listener)."
+                    .to_string(),
+            );
+        }
+        let cidrs: Vec<String> = candidates.into_iter().map(|c| c.cidr).collect();
+        return (
+            cidrs,
+            "Set by `bunker --init custom` from wildcard bind (all detected LAN subnets)."
+                .to_string(),
+        );
+    }
+
+    // Loopback bind: mirror the loopback preset.
+    if ip.is_loopback() {
+        return (
+            vec!["127.0.0.1".to_string(), "::1".to_string()],
+            "Set by `bunker --init custom` (loopback bind).".to_string(),
+        );
+    }
+
+    // IPv4: prefer a matching local interface; otherwise assume /24.
+    if let IpAddr::V4(v4) = ip {
+        if let Some(iface) = interface_for_ipv4(v4) {
+            let annotation = format!(
+                "Set by `bunker --init custom` from interface {} ({}).",
+                iface.name, iface.ip
+            );
+            return (vec![iface.cidr], annotation);
+        }
+        if let Some(cidr) = assume_slash_24(ip) {
+            let annotation = format!(
+                "Set by `bunker --init custom` (assumed /24 around {} — narrow or widen \
+                 to match your actual network).",
+                v4
+            );
+            return (vec![cidr], annotation);
+        }
+    }
+
+    // IPv6 non-loopback with no derivation hook: fall back to loopback so the
+    // file is at least safe. The user can widen it manually.
+    (
+        vec!["127.0.0.1".to_string(), "::1".to_string()],
+        "Set by `bunker --init custom` (no automatic derivation for this listen address — \
+         edit the file to match your network)."
+            .to_string(),
+    )
 }
 
 fn print_usage(program: &str) {
@@ -473,10 +677,16 @@ fn print_usage(program: &str) {
     eprintln!("  -c, --config <path>     Load config from YAML file");
     eprintln!("  --listen <addr>         Proxy listen address (same as positional arg)");
     eprintln!(
-        "  --init                  Create default config at %USERPROFILE%\\.bunker\\config.yaml"
+        "  --init [mode]           Create default config at %USERPROFILE%\\.bunker\\config.yaml"
     );
-    eprintln!("                          Combine with --listen/--dns/--dns-upstream to bake");
-    eprintln!("                          those values into the generated file.");
+    eprintln!("                          Modes (default: loopback):");
+    eprintln!("                            loopback  bind 127.0.0.1; loopback allowlist");
+    eprintln!("                            lan       auto-discover LAN interface; bind to its");
+    eprintln!("                                      IP; allowlist = that interface's subnet");
+    eprintln!("                            custom    requires --listen/--dns/--dns-upstream;");
+    eprintln!("                                      allowlist derived from --listen address");
+    eprintln!("                          --listen/--dns/--dns-upstream override the bind");
+    eprintln!("                          addresses in loopback and lan modes.");
     eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
     eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
     eprintln!("  --no-tray               Disable system tray (Windows only)");
@@ -513,6 +723,14 @@ fn print_usage(program: &str) {
     );
     eprintln!(
         "  {} --init --listen [::]:8080 --dns 0.0.0.0:53 # Generate config with overrides",
+        program
+    );
+    eprintln!(
+        "  {} --init lan                                # Auto-discover LAN interface",
+        program
+    );
+    eprintln!(
+        "  {} --init custom --listen 192.168.1.5:8080 --dns 192.168.1.5:53 --dns-upstream 9.9.9.9:53",
         program
     );
     eprintln!();
