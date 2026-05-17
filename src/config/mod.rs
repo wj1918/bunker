@@ -1627,11 +1627,15 @@ app:
     #[test]
     fn test_customize_default_config_no_overrides_is_passthrough() {
         let out = customize_default_config(None, None, None, None);
-        // Allow a trailing newline difference (we always write `\n` per line).
-        assert_eq!(
-            out.trim_end_matches('\n'),
-            DEFAULT_CONFIG_YAML.trim_end_matches('\n')
-        );
+        // The rewriter always emits `\n` line separators, but the embedded
+        // template (via `include_str!`) preserves whatever line endings the
+        // file had on disk at compile time — which is `\r\n` when the repo
+        // is checked out on Windows with git's default autocrlf. Normalize
+        // both sides so the test cares about content, not encoding.
+        fn normalize(s: &str) -> String {
+            s.replace("\r\n", "\n").trim_end_matches('\n').to_string()
+        }
+        assert_eq!(normalize(&out), normalize(DEFAULT_CONFIG_YAML));
     }
 
     #[test]
@@ -1688,12 +1692,8 @@ app:
     fn test_customize_default_config_preserves_comments() {
         // Pick a recognizable comment fragment from each top-level section and
         // confirm overrides don't accidentally strip it.
-        let out = customize_default_config(
-            Some("[::]:8080"),
-            Some("[::]:53"),
-            Some("9.9.9.9:53"),
-            None,
-        );
+        let out =
+            customize_default_config(Some("[::]:8080"), Some("[::]:53"), Some("9.9.9.9:53"), None);
         assert!(out.contains("# ---- access control & SSRF protection ----"));
         assert!(out.contains("# Bind address."));
         assert!(out.contains("# Single upstream (kept for backward compatibility"));
@@ -1709,7 +1709,10 @@ app:
         };
         let out = customize_default_config(None, None, None, Some(&override_));
         let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
-        assert_eq!(cfg.proxy.security.allowed_source_ips, vec!["192.168.5.0/24"]);
+        assert_eq!(
+            cfg.proxy.security.allowed_source_ips,
+            vec!["192.168.5.0/24"]
+        );
         // Original loopback entries are gone.
         assert!(!out.contains("- \"127.0.0.1\""));
         assert!(!out.contains("- \"::1\""));
@@ -1754,7 +1757,10 @@ app:
         );
         let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
         assert_eq!(cfg.proxy.listen, "192.168.5.42:8080");
-        assert_eq!(cfg.proxy.security.allowed_source_ips, vec!["192.168.5.0/24"]);
+        assert_eq!(
+            cfg.proxy.security.allowed_source_ips,
+            vec!["192.168.5.0/24"]
+        );
         let dns = cfg.dns.expect("dns section preserved");
         assert_eq!(dns.listen, "192.168.5.42:53");
         assert_eq!(dns.upstreams, vec!["9.9.9.9:53".to_string()]);

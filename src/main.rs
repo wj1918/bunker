@@ -14,9 +14,7 @@ mod proxy;
 mod security;
 mod tokio_io;
 
-use config::{
-    customize_default_config, load_config, user_config_path, AllowlistOverride, Config,
-};
+use config::{customize_default_config, load_config, user_config_path, AllowlistOverride, Config};
 use dns::run_dns_server;
 use helpers::create_tls_connector;
 use platform::net_discovery::{
@@ -581,9 +579,9 @@ fn build_init_plan(
             allowlist_annotation: None,
         }),
         InitMode::Lan => {
-            let iface = discover_lan_interface().map_err(|e| -> Box<
-                dyn std::error::Error + Send + Sync,
-            > { format!("{}", e).into() })?;
+            let iface = discover_lan_interface().map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() },
+            )?;
             let bind_proxy = format!("{}:8080", iface.ip);
             let bind_dns = format!("{}:53", iface.ip);
             let annotation = format!(
@@ -599,13 +597,13 @@ fn build_init_plan(
             })
         }
         InitMode::Custom => {
-            let listen = cli_proxy_listen.ok_or(
-                "custom mode requires --listen <addr> (e.g. --listen 192.168.5.42:8080)",
-            )?;
+            let listen = cli_proxy_listen
+                .ok_or("custom mode requires --listen <addr> (e.g. --listen 192.168.5.42:8080)")?;
             let dns = cli_dns_listen
                 .ok_or("custom mode requires --dns <addr> (e.g. --dns 192.168.5.42:53)")?;
-            let upstream = cli_dns_upstream
-                .ok_or("custom mode requires --dns-upstream <addr> (e.g. --dns-upstream 9.9.9.9:53)")?;
+            let upstream = cli_dns_upstream.ok_or(
+                "custom mode requires --dns-upstream <addr> (e.g. --dns-upstream 9.9.9.9:53)",
+            )?;
             let listen_sa: SocketAddr = listen.parse().expect("validated upstream");
             let (entries, annotation) = derive_custom_allowlist(listen_sa);
             Ok(InitPlan {
