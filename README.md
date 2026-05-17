@@ -24,10 +24,11 @@ The config in `%USERPROFILE%\.bunker\` lives outside any package-managed directo
 
 ```powershell
 bunker -c C:\path\to\config.yaml
-bunker 192.168.1.1:8080 --dns 192.168.1.1:53
 ```
 
-`bunker` searches for config in this order: `--config <path>` → `./config.yaml` → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml` → built-in defaults.
+At runtime, all configuration comes from the YAML file — there are no CLI overrides. To change the bind address, allowlist, or DNS settings, edit the file (or regenerate it with `bunker --init [mode] ...`) and restart.
+
+`bunker` searches for config in this order: `--config <path>` → `./config.yaml` → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml`. If none is found, bunker prints an error and exits — run `bunker --init` to create one.
 
 ---
 
@@ -189,14 +190,15 @@ To use a different config explicitly:
 bunker -c C:\path\to\config.yaml
 ```
 
-Search order: `--config <path>` → `./config.yaml` (CWD) → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml` → built-in defaults.
+Search order: `--config <path>` → `./config.yaml` (CWD) → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml`. If none is found, bunker errors out — run `bunker --init` to create one.
+
+To run headless on Windows, set `app.tray_enabled: false` in your config file. There is no `--no-tray` runtime flag; runtime behavior is sourced from the YAML file only.
 
 Other options:
 
 ```powershell
 bunker --install     # Auto-start at Windows login
 bunker --uninstall   # Remove auto-start
-bunker --no-tray     # Run without system tray (headless)
 ```
 
 ### Step 5: Verify

@@ -7,6 +7,163 @@ use std::path::PathBuf;
 /// Default config.yaml embedded at compile time
 pub const DEFAULT_CONFIG_YAML: &str = include_str!("../../config.yaml");
 
+/// Override applied to `proxy.security.allowed_source_ips` by
+/// `customize_default_config`. The shipped template's example lines below the
+/// list are discarded when an override is in effect.
+pub struct AllowlistOverride<'a> {
+    /// The CIDR / IP strings written into the list, in order.
+    pub entries: &'a [String],
+    /// Optional comment line emitted as the first child of the list (without
+    /// the leading `# `). Useful for explaining *why* the values were chosen.
+    pub annotation: Option<&'a str>,
+}
+
+/// Produce a customized copy of `DEFAULT_CONFIG_YAML` with any of the listed
+/// values substituted in-place. Comments and unrelated formatting in the
+/// embedded template are preserved.
+///
+/// * `proxy_listen` — replaces `proxy.listen`.
+/// * `dns_listen` — replaces `dns.listen`.
+/// * `dns_upstream` — replaces the entire `dns.upstreams` list with a single
+///   entry. Commented-out backup entries inside the block are discarded; the
+///   singular `# upstream:` line outside the block is left alone.
+/// * `allowed_source_ips` — replaces the entire
+///   `proxy.security.allowed_source_ips` list. Example comment lines that
+///   ship inside the block are discarded; surrounding comments are preserved.
+///
+/// The output is not parsed here — callers that care about validity should
+/// run it through `serde_yaml_ng::from_str::<Config>`.
+pub fn customize_default_config(
+    proxy_listen: Option<&str>,
+    dns_listen: Option<&str>,
+    dns_upstream: Option<&str>,
+    allowed_source_ips: Option<&AllowlistOverride>,
+) -> String {
+    let mut out = String::with_capacity(DEFAULT_CONFIG_YAML.len() + 64);
+    let mut current_section: Option<&str> = None;
+    let mut suppressing_upstreams = false;
+    let mut suppressing_allowed_source_ips = false;
+
+    for line in DEFAULT_CONFIG_YAML.lines() {
+        // Track which top-level section we're in. A top-level key is a line
+        // that starts at column 0 with `name:` (lowercase + underscore).
+        if let Some(name) = top_level_section_name(line) {
+            current_section = Some(name);
+            suppressing_upstreams = false;
+            suppressing_allowed_source_ips = false;
+        }
+
+        // If we just replaced an `upstreams:` block, swallow its continuation
+        // lines (indented list items or commented-out items at indent >= 4).
+        if suppressing_upstreams {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if indent >= 4 && (trimmed.starts_with('-') || trimmed.starts_with('#')) {
+                continue;
+            }
+            suppressing_upstreams = false;
+        }
+
+        // Same idea for the `allowed_source_ips:` block. Items are at
+        // indent 6 (`      - "..."`) but the shipped example comments are at
+        // indent 4 (`    # Example LAN deployment...`), so we accept both.
+        // The blank line after the example block ends suppression naturally.
+        if suppressing_allowed_source_ips {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            if indent >= 4 && (trimmed.starts_with('-') || trimmed.starts_with('#')) {
+                continue;
+            }
+            suppressing_allowed_source_ips = false;
+        }
+
+        let section = current_section;
+
+        if section == Some("proxy") {
+            if let Some(new_value) = proxy_listen {
+                if let Some(replaced) = replace_listen_line(line, new_value) {
+                    out.push_str(&replaced);
+                    out.push('\n');
+                    continue;
+                }
+            }
+            if let Some(override_) = allowed_source_ips {
+                let trimmed = line.trim_start();
+                let indent = line.len() - trimmed.len();
+                if indent == 4 && trimmed.starts_with("allowed_source_ips:") {
+                    out.push_str("    allowed_source_ips:\n");
+                    if let Some(comment) = override_.annotation {
+                        out.push_str("      # ");
+                        out.push_str(comment);
+                        out.push('\n');
+                    }
+                    for entry in override_.entries {
+                        out.push_str("      - \"");
+                        out.push_str(entry);
+                        out.push_str("\"\n");
+                    }
+                    suppressing_allowed_source_ips = true;
+                    continue;
+                }
+            }
+        }
+
+        if section == Some("dns") {
+            if let Some(new_value) = dns_listen {
+                if let Some(replaced) = replace_listen_line(line, new_value) {
+                    out.push_str(&replaced);
+                    out.push('\n');
+                    continue;
+                }
+            }
+            if let Some(new_value) = dns_upstream {
+                let trimmed = line.trim_start();
+                let indent = line.len() - trimmed.len();
+                if indent == 2 && trimmed.starts_with("upstreams:") {
+                    out.push_str("  upstreams:\n");
+                    out.push_str("    - \"");
+                    out.push_str(new_value);
+                    out.push_str("\"\n");
+                    suppressing_upstreams = true;
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
+fn top_level_section_name(line: &str) -> Option<&str> {
+    if line.is_empty() || line.starts_with(|c: char| c.is_whitespace() || c == '#') {
+        return None;
+    }
+    let colon = line.find(':')?;
+    let name = &line[..colon];
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn replace_listen_line(line: &str, new_value: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    if indent != 2 || !trimmed.starts_with("listen:") {
+        return None;
+    }
+    // Avoid matching e.g. `listening:` or `listen_addr:`.
+    let after_key = trimmed["listen:".len()..].chars().next();
+    if !matches!(after_key, Some(' ') | Some('\t') | None) {
+        return None;
+    }
+    Some(format!("  listen: \"{}\"", new_value))
+}
+
 /// Main configuration struct.
 ///
 /// Top level groups settings by responsibility:
@@ -23,6 +180,9 @@ pub struct Config {
     pub dns: Option<DnsConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
+    // Read on Windows for the tray setup path; parsed everywhere else so
+    // shared YAML files round-trip cleanly, but otherwise unused.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[serde(default)]
     pub app: AppConfig,
 }
@@ -69,6 +229,9 @@ impl Default for ProxyConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    // Read on Windows by the tray setup path; on other platforms it's parsed
+    // (so the field is still recognized in shared config files) but unused.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
 }
@@ -624,18 +787,26 @@ pub fn user_config_path() -> Option<PathBuf> {
     home.map(|h| PathBuf::from(h).join(".bunker").join("config.yaml"))
 }
 
-/// Load configuration from file
-pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // Try to find config file
+/// Load configuration from file.
+///
+/// Returns `Ok(Some(config))` when a YAML file was found and parsed,
+/// `Ok(None)` when no file was found at any of the searched locations. The
+/// caller decides whether a missing file is acceptable — `--install` on
+/// Windows treats it as "skip log-dir prep", while the runtime entrypoint
+/// rejects it and tells the user to run `--init`.
+///
+/// Search order when `path` is `None`: `./config.yaml`, the per-user
+/// config (`~/.bunker/config.yaml`), then `<exe-dir>/config.yaml`.
+pub fn load_config(
+    path: Option<&str>,
+) -> Result<Option<Config>, Box<dyn std::error::Error + Send + Sync>> {
     let config_paths = if let Some(p) = path {
         vec![PathBuf::from(p)]
     } else {
         let mut paths = vec![PathBuf::from("config.yaml")];
-        // Per-user config (survives package upgrades)
         if let Some(p) = user_config_path() {
             paths.push(p);
         }
-        // Look next to the executable (handles portable setups that bundle a config)
         if let Some(dir) = exe_dir() {
             paths.push(dir.join("config.yaml"));
         }
@@ -647,11 +818,11 @@ pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Err
             println!("Loading config from: {}", config_path.display());
             let content = fs::read_to_string(&config_path)?;
             let config: Config = serde_yaml_ng::from_str(&content)?;
-            return Ok(config);
+            return Ok(Some(config));
         }
     }
 
-    Ok(Config::default())
+    Ok(None)
 }
 
 // ============== Unit Tests ==============
@@ -760,8 +931,9 @@ dns:
     fn test_load_config_nonexistent_file() {
         let result = load_config(Some("/nonexistent/path/config.yaml"));
         assert!(result.is_ok());
-        let config = result.unwrap();
-        assert_eq!(config.proxy.listen, "127.0.0.1:8080");
+        // Missing file is now reported as `None` rather than silently
+        // returning defaults — the caller decides what to do about it.
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
@@ -942,7 +1114,10 @@ dns:
 
     #[test]
     fn test_load_config_default() {
-        // Load with None should use defaults if no config file exists
+        // With None, load_config searches the standard locations. We only
+        // assert it doesn't error — the result can be Some or None depending
+        // on whether the test runner happens to be sitting next to a
+        // `config.yaml` (the project root does ship one).
         let result = load_config(None);
         assert!(result.is_ok());
     }
@@ -1447,5 +1622,141 @@ app:
         // round-trip through the strict deserializer.
         let _: Config = serde_yaml_ng::from_str(DEFAULT_CONFIG_YAML)
             .expect("embedded default config.yaml must parse");
+    }
+
+    #[test]
+    fn test_customize_default_config_no_overrides_is_passthrough() {
+        let out = customize_default_config(None, None, None, None);
+        // Allow a trailing newline difference (we always write `\n` per line).
+        assert_eq!(
+            out.trim_end_matches('\n'),
+            DEFAULT_CONFIG_YAML.trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn test_customize_default_config_proxy_listen() {
+        let out = customize_default_config(Some("[::]:8080"), None, None, None);
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        assert_eq!(cfg.proxy.listen, "[::]:8080");
+        // The DNS section should be untouched.
+        let dns = cfg.dns.expect("dns section preserved");
+        assert_eq!(dns.listen, "127.0.0.1:53");
+    }
+
+    #[test]
+    fn test_customize_default_config_dns_listen() {
+        let out = customize_default_config(None, Some("0.0.0.0:53"), None, None);
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        // The proxy section should not have been touched.
+        assert_eq!(cfg.proxy.listen, "127.0.0.1:8080");
+        let dns = cfg.dns.expect("dns section preserved");
+        assert_eq!(dns.listen, "0.0.0.0:53");
+    }
+
+    #[test]
+    fn test_customize_default_config_dns_upstream_replaces_block() {
+        let out = customize_default_config(None, None, Some("9.9.9.9:53"), None);
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        let dns = cfg.dns.expect("dns section preserved");
+        assert_eq!(dns.upstreams, vec!["9.9.9.9:53".to_string()]);
+        // The default template ships with two upstreams; ensure they were
+        // replaced rather than appended. (The string `8.8.8.8:53` still
+        // appears inside the commented-out singular `# upstream:` line below
+        // the block, which is fine.)
+        assert!(!out.contains("- \"8.8.8.8:53\""));
+        assert!(!out.contains("- \"1.1.1.1:53\""));
+        assert!(out.contains("- \"9.9.9.9:53\""));
+    }
+
+    #[test]
+    fn test_customize_default_config_all_overrides() {
+        let out = customize_default_config(
+            Some("[::]:8443"),
+            Some("[::]:5353"),
+            Some("[2001:4860:4860::8888]:53"),
+            None,
+        );
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        assert_eq!(cfg.proxy.listen, "[::]:8443");
+        let dns = cfg.dns.expect("dns section preserved");
+        assert_eq!(dns.listen, "[::]:5353");
+        assert_eq!(dns.upstreams, vec!["[2001:4860:4860::8888]:53".to_string()]);
+    }
+
+    #[test]
+    fn test_customize_default_config_preserves_comments() {
+        // Pick a recognizable comment fragment from each top-level section and
+        // confirm overrides don't accidentally strip it.
+        let out = customize_default_config(
+            Some("[::]:8080"),
+            Some("[::]:53"),
+            Some("9.9.9.9:53"),
+            None,
+        );
+        assert!(out.contains("# ---- access control & SSRF protection ----"));
+        assert!(out.contains("# Bind address."));
+        assert!(out.contains("# Single upstream (kept for backward compatibility"));
+        assert!(out.contains("# Logging (cross-cutting"));
+    }
+
+    #[test]
+    fn test_customize_default_config_allowlist_replaces_block() {
+        let entries = vec!["192.168.5.0/24".to_string()];
+        let override_ = AllowlistOverride {
+            entries: &entries,
+            annotation: Some("Set by `bunker --init lan` from interface eth0."),
+        };
+        let out = customize_default_config(None, None, None, Some(&override_));
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        assert_eq!(cfg.proxy.security.allowed_source_ips, vec!["192.168.5.0/24"]);
+        // Original loopback entries are gone.
+        assert!(!out.contains("- \"127.0.0.1\""));
+        assert!(!out.contains("- \"::1\""));
+        // The example comment block below the list is gone too.
+        assert!(!out.contains("# Example LAN deployment"));
+        assert!(!out.contains("#  - \"192.168.1.0/24\""));
+        // But the explanatory comments above the block are preserved.
+        assert!(out.contains("# Only allow connections from these source IPs"));
+        // And our annotation is rendered.
+        assert!(out.contains("# Set by `bunker --init lan` from interface eth0."));
+        // And sections below the allowlist are intact.
+        assert!(out.contains("blocked_hosts:"));
+    }
+
+    #[test]
+    fn test_customize_default_config_allowlist_multiple_entries() {
+        let entries = vec!["192.168.1.0/24".to_string(), "10.0.0.0/8".to_string()];
+        let override_ = AllowlistOverride {
+            entries: &entries,
+            annotation: None,
+        };
+        let out = customize_default_config(None, None, None, Some(&override_));
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        assert_eq!(
+            cfg.proxy.security.allowed_source_ips,
+            vec!["192.168.1.0/24", "10.0.0.0/8"]
+        );
+    }
+
+    #[test]
+    fn test_customize_default_config_allowlist_with_other_overrides() {
+        let entries = vec!["192.168.5.0/24".to_string()];
+        let override_ = AllowlistOverride {
+            entries: &entries,
+            annotation: None,
+        };
+        let out = customize_default_config(
+            Some("192.168.5.42:8080"),
+            Some("192.168.5.42:53"),
+            Some("9.9.9.9:53"),
+            Some(&override_),
+        );
+        let cfg: Config = serde_yaml_ng::from_str(&out).expect("customized config must parse");
+        assert_eq!(cfg.proxy.listen, "192.168.5.42:8080");
+        assert_eq!(cfg.proxy.security.allowed_source_ips, vec!["192.168.5.0/24"]);
+        let dns = cfg.dns.expect("dns section preserved");
+        assert_eq!(dns.listen, "192.168.5.42:53");
+        assert_eq!(dns.upstreams, vec!["9.9.9.9:53".to_string()]);
     }
 }
