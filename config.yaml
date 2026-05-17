@@ -1,139 +1,127 @@
-# Bunker Proxy Server Configuration
+# Bunker — HTTP/HTTPS forward proxy with optional DNS server.
+#
+# Sections:
+#   proxy:    Proxy server settings  (listen, security, pool, keepalive)
+#   dns:      DNS server settings    (optional — comment out the block to disable)
+#   logging:  Cross-cutting logging  (used by both proxy and DNS)
+#   app:      Cross-cutting UI/system settings
 
-# Address to listen for HTTP/HTTPS proxy requests
-listen_addr: "192.168.1.1:8080"
+# ============================================================
+# Proxy server (HTTP/HTTPS via CONNECT)
+# ============================================================
+proxy:
+  enabled: true
 
-# Enable system tray icon (Windows only)
-tray_enabled: true
+  # Bind address. Use 127.0.0.1 for loopback-only (safer default), 0.0.0.0
+  # to accept from any interface, or a specific LAN IP to bind one NIC.
+  listen: "127.0.0.1:8080"
 
-# DNS server configuration (optional - comment out to disable)
-dns:
-  # Address to listen for DNS queries
-  listen: "192.168.1.1:53"
-
-  # Single upstream DNS server (for backward compatibility)
-  upstream: "8.8.8.8:53"
-
-  # Multiple upstream DNS servers for failover (tried in order)
-  # upstreams:
-  #   - "8.8.8.8:53"
-  #   - "1.1.1.1:53"
-  #   - "[2001:4860:4860::8888]:53"  # Google IPv6 DNS
-
-  # DNS security settings
+  # ---- access control & SSRF protection ----
   security:
-    # Rate limiting (queries per second per IP)
+    # Block CONNECT to private/internal IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x)
+    block_private_ips: true
+
+    # Only allow connections from these source IPs (empty = allow all).
+    # Supports individual IPs and CIDR notation (IPv4 and IPv6).
+    allowed_source_ips:
+      - "127.0.0.1"
+      - "::1"
+    # Example LAN deployment (uncomment and adapt):
+    #  - "192.168.1.0/24"
+    #  - "10.0.0.0/8"
+    #  - "2001:db8::/32"
+
+    # Additional hosts to block (supports wildcards). Empty = no extra blocks.
+    blocked_hosts: []
+    #  - "*.internal"
+    #  - "secret-server.local"
+    #  - "metadata.*"
+
+    # If set, only allow CONNECT to these ports (empty = allow all).
+    allowed_ports: []
+    #  - 80
+    #  - 443
+    #  - 8443
+
+    # ---- per-connection limits ----
+    max_connections: 1000             # Concurrent connections (0 = unlimited)
+    max_request_body_bytes: 10485760  # Request body cap (10 MB; 0 = unlimited)
+    max_requests_per_connection: 1000 # Per keep-alive socket (0 = unlimited)
+
+    # ---- timeouts ----
+    header_read_timeout_seconds: 30   # Slowloris protection (0 = disabled)
+
+    # ---- rate limiting per source IP ----
+    rate_limit:
+      enabled: true
+      max_requests: 1000              # Requests per window
+      window_seconds: 60              # Window length
+      max_tracked_ips: 100000         # Memory cap
+      ipv6_subnet_rate_limit: true    # Aggregate IPv6 at /64 (prevents rotation bypass)
+
+  # ---- upstream connection pool (HTTP/1.1 keep-alive) ----
+  connection_pool:
+    enabled: true
+    max_connections_per_host: 10
+    max_total_connections: 1000       # Global cap across all hosts
+    idle_timeout_seconds: 60          # Close idle pooled connections after this
+    max_lifetime_seconds: 300         # Close regardless of activity after this
+    connect_timeout_seconds: 10       # Establishing new connections
+
+  # ---- OS-level TCP keep-alive (long-lived connections) ----
+  tcp_keepalive:
+    enabled: true
+    time_seconds: 60                  # Start probes after this many seconds of idle
+    interval_seconds: 10              # Probe interval
+    # retries: 3                      # Linux/macOS only: failed probes before close
+
+# ============================================================
+# DNS server (optional — comment out the entire block to disable)
+# ============================================================
+dns:
+  # Bind address. Use 0.0.0.0:53 to serve LAN clients (requires
+  # CAP_NET_BIND_SERVICE on Linux, Administrator on Windows).
+  listen: "127.0.0.1:53"
+
+  # Upstreams (tried in order). The `upstream` field below (singular) is
+  # prepended to this list for backward compatibility.
+  upstreams:
+    - "8.8.8.8:53"
+    - "1.1.1.1:53"
+    # - "[2001:4860:4860::8888]:53"   # Google IPv6 DNS
+
+  # Single upstream (kept for backward compatibility — prefer `upstreams`).
+  # If both are set, this one is tried first.
+  # upstream: "8.8.8.8:53"
+
+  security:
     rate_limit_enabled: true
-    max_qps: 20
-    # Block ANY queries (amplification attack risk)
-    block_any_queries: true
-    # Block zone transfer queries (AXFR/IXFR)
-    block_zone_transfers: true
-    # Verify response comes from expected upstream (anti-spoofing)
-    verify_upstream_source: true
-    # Maximum number of IPs to track for rate limiting
+    max_qps: 20                       # Per source IP
+    block_any_queries: true           # ANY queries (amplification attack risk)
+    block_zone_transfers: true        # AXFR/IXFR
+    verify_upstream_source: true      # Anti-spoofing: check reply src matches upstream
     max_tracked_ips: 50000
-    # Use /64 subnet for IPv6 rate limiting (prevents bypass via address rotation)
     ipv6_subnet_rate_limit: true
 
-  # DNS caching settings
   cache:
     enabled: true
     max_entries: 10000
-    min_ttl_seconds: 60      # Minimum TTL (even if DNS says 0)
-    max_ttl_seconds: 86400   # Maximum TTL (24 hours)
+    min_ttl_seconds: 60               # Floor TTL even if DNS says 0
+    max_ttl_seconds: 86400            # Ceiling TTL (24h)
 
-  # DNS failover settings (for multiple upstreams)
   failover:
-    timeout_ms: 2000         # Timeout per upstream (2 seconds)
-    max_retries: 1           # Retry entire chain once
-    serve_stale: true        # Return expired cache entries on total failure
+    timeout_ms: 2000                  # Per upstream
+    max_retries: 1                    # Retry entire chain once
+    serve_stale: true                 # Return expired cache on total failure
 
-# Security configuration (SSRF prevention, rate limiting)
-security:
-  # Block CONNECT to private/internal IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x)
-  block_private_ips: true
-
-  # Additional hosts to block (supports wildcards)
-  blocked_hosts: []
-  #  - "*.internal"
-  #  - "secret-server.local"
-  #  - "metadata.*"
-
-  # If set, only allow CONNECT to these ports (empty = allow all)
-  allowed_ports: []
-  #  - 80
-  #  - 443
-  #  - 8443
-  #  - 22
-
-  # Only allow connections from these source IPs (empty = allow all)
-  # Supports individual IPs and CIDR notation (IPv4 and IPv6)
-  allowed_source_ips:
-    - "127.0.0.1"
-    - "192.168.1.0/24"
-  #  - "192.168.1.3"
-  #  - "192.168.1.4"
-  #  - "192.168.1.10"
-  #  - "::1"
-  #  - "2001:db8::/32"
-
-  # Maximum concurrent connections (0 = unlimited)
-  max_connections: 1000
-
-  # Maximum request body size in bytes (0 = unlimited)
-  max_request_body_bytes: 10485760  # 10MB
-
-  # Header read timeout in seconds (slowloris protection, 0 = disabled)
-  header_read_timeout_seconds: 30
-
-  # Maximum requests per keep-alive connection (0 = unlimited)
-  max_requests_per_connection: 1000
-
-  # Rate limiting per source IP
-  rate_limit:
-    enabled: true
-    max_requests: 1000       # Requests per window
-    window_seconds: 60       # Time window in seconds
-    max_tracked_ips: 100000  # Maximum IPs to track (memory protection)
-    ipv6_subnet_rate_limit: true  # Use /64 subnet for IPv6
-
-# Connection pool configuration (HTTP/1.1 keep-alive)
-connection_pool:
-  # Enable connection pooling for upstream connections
-  enabled: true
-  # Maximum pooled connections per target host
-  max_connections_per_host: 10
-  # Maximum total connections across all hosts (memory protection)
-  max_total_connections: 1000
-  # Close idle connections after this many seconds
-  idle_timeout_seconds: 60
-  # Close connections after this many seconds regardless of activity
-  max_lifetime_seconds: 300
-  # Timeout for establishing new connections
-  connect_timeout_seconds: 10
-
-# TCP keep-alive configuration (for long-lived connections)
-tcp_keepalive:
-  # Enable OS-level TCP keep-alive
-  enabled: true
-  # Start probes after this many seconds of idle
-  time_seconds: 60
-  # Send probes at this interval
-  interval_seconds: 10
-  # Number of failed probes before closing (Linux/macOS only)
-  # retries: 3
-
-# Logging configuration
+# ============================================================
+# Logging (cross-cutting — used by both proxy and DNS)
+# ============================================================
 logging:
-  # Enable request logging
   log_requests: true
-  # Log format: "text" or "json"
-  format: text
-  # Redact sensitive headers in logs
+  format: text                        # "text" or "json"
   redact_sensitive_headers: true
-  # Headers to redact (case-insensitive)
-  sensitive_headers:
+  sensitive_headers:                  # Case-insensitive
     - "authorization"
     - "proxy-authorization"
     - "cookie"
@@ -141,11 +129,16 @@ logging:
     - "x-api-key"
     - "x-auth-token"
 
-  # File logging ( Uncomment the following lines to enable file logging)
-  # 
+  # File logging (uncomment to enable — by default, logs go to stdout/stderr).
   # file:
   #   log_dir: "logs"
   #   file_prefix: "proxy.log"
-  #   rotation: daily          # "daily", "hourly", or "never"
-  #   max_age_days: 7          # Days to keep old logs (0 = keep forever)
-  #   compress: true           # Compress rotated logs with gzip (.gz)
+  #   rotation: daily                 # "daily", "hourly", or "never"
+  #   max_age_days: 7                 # 0 = keep forever
+  #   compress: true                  # gzip rotated logs
+
+# ============================================================
+# App (cross-cutting UI / system)
+# ============================================================
+app:
+  tray_enabled: true                  # Windows only — ignored on other platforms

@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // CLI arguments override config file
     if let Some(addr) = cli_listen_addr {
-        config.listen_addr = addr;
+        config.proxy.listen = addr;
     }
     if let Some(dns_addr) = cli_dns_addr {
         let dns = config.dns.get_or_insert(DnsConfig {
@@ -121,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     if !use_tray {
-        config.tray_enabled = false;
+        config.app.tray_enabled = false;
     }
 
     // Initialize logging system
@@ -134,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Setup tray on Windows
     #[cfg(windows)]
-    let tray_rx = if config.tray_enabled {
+    let tray_rx = if config.app.tray_enabled {
         let (tx, rx) = mpsc::channel::<TrayMessage>();
         if let Err(e) = setup_tray(tx) {
             eprintln!("Warning: Failed to setup system tray: {}", e);
@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dns_cache_config = dns_config.cache.clone();
         let dns_failover_config = dns_config.failover.clone();
         let dns_logging = config.logging.clone();
-        let dns_allowed_ips = config.security.allowed_source_ips.clone();
+        let dns_allowed_ips = config.proxy.security.allowed_source_ips.clone();
         let upstreams_display = upstreams.clone();
 
         tokio::spawn(async move {
@@ -199,26 +199,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let listen_addr: SocketAddr = config.listen_addr.parse()?;
+    // If the proxy is disabled, run in DNS-only mode (requires DNS enabled).
+    if !config.proxy.enabled {
+        if config.dns.is_none() {
+            eprintln!("Error: proxy.enabled = false and dns is not configured — nothing to do.");
+            std::process::exit(1);
+        }
+        println!("Proxy disabled — running in DNS-only mode. Press Ctrl-C to stop.");
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    let listen_addr: SocketAddr = config.proxy.listen.parse()?;
     let listener = TcpListener::bind(listen_addr).await?;
     println!("Forward proxy listening on http://{}", listen_addr);
 
     // Share configs across tasks
-    let security_config = Arc::new(config.security.clone());
+    let security_config = Arc::new(config.proxy.security.clone());
     let logging_config = Arc::new(config.logging.clone());
-    let tcp_keepalive_config = Arc::new(config.tcp_keepalive.clone());
+    let tcp_keepalive_config = Arc::new(config.proxy.tcp_keepalive.clone());
 
     // Log TCP keep-alive settings
-    if config.tcp_keepalive.enabled {
+    if config.proxy.tcp_keepalive.enabled {
         println!(
             "TCP keep-alive: enabled (time={}s, interval={}s)",
-            config.tcp_keepalive.time_seconds, config.tcp_keepalive.interval_seconds
+            config.proxy.tcp_keepalive.time_seconds, config.proxy.tcp_keepalive.interval_seconds
         );
     }
 
     // Create rate limiter
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(
-        config.security.rate_limit.clone(),
+        config.proxy.security.rate_limit.clone(),
     )));
 
     // Spawn cleanup task for rate limiter
@@ -231,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     // Create sender pool for HTTP keep-alive
-    let pool_config = config.connection_pool.clone();
+    let pool_config = config.proxy.connection_pool.clone();
     let sender_pool = Arc::new(Mutex::new(SenderPool::new(pool_config.clone())));
     if pool_config.enabled {
         println!(
@@ -254,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     // Create connection semaphore (0 = unlimited)
-    let max_connections = config.security.max_connections;
+    let max_connections = config.proxy.security.max_connections;
     let connection_semaphore = if max_connections > 0 {
         println!(
             "Connection limit: {} max concurrent connections",
@@ -290,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Pre-compute allowed source IPs for fast lookup
-    let allowed_source_ips = config.security.allowed_source_ips.clone();
+    let allowed_source_ips = config.proxy.security.allowed_source_ips.clone();
     let has_ip_allowlist = !allowed_source_ips.is_empty();
     if has_ip_allowlist {
         println!("Source IP allowlist: {:?}", allowed_source_ips);
@@ -422,11 +433,13 @@ fn print_usage(program: &str) {
     eprintln!("  -V, --version           Print version and exit");
     eprintln!();
     eprintln!("Config file (config.yaml):");
-    eprintln!("  listen_addr: \"0.0.0.0:8080\"    # or \"[::]:8080\" for IPv6");
-    eprintln!("  tray_enabled: true");
+    eprintln!("  proxy:");
+    eprintln!("    listen: \"127.0.0.1:8080\"    # or \"[::]:8080\" for IPv6");
     eprintln!("  dns:");
     eprintln!("    listen: \"0.0.0.0:53\"");
-    eprintln!("    upstream: \"8.8.8.8:53\"       # or \"[2001:4860:4860::8888]:53\" for IPv6");
+    eprintln!("    upstream: \"8.8.8.8:53\"      # or \"[2001:4860:4860::8888]:53\" for IPv6");
+    eprintln!("  app:");
+    eprintln!("    tray_enabled: true");
     eprintln!();
     eprintln!("Examples:");
     eprintln!(
