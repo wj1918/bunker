@@ -16,23 +16,12 @@ struct TestProxy {
 
 #[allow(dead_code)]
 impl TestProxy {
-    fn start() -> Self {
-        let child = Command::new("cargo")
-            .args(["run", "--", PROXY_ADDR, "--dns", DNS_ADDR, "--no-tray"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to start proxy");
-
-        // Wait for proxy to start
-        thread::sleep(Duration::from_secs(2));
-
-        TestProxy { child }
-    }
-
     fn start_with_config(config_path: &str) -> Self {
+        // Runtime now takes its configuration entirely from the YAML file
+        // (no CLI overrides), so spawning a test proxy requires writing a
+        // config first and pointing `-c` at it.
         let child = Command::new("cargo")
-            .args(["run", "--", "--config", config_path, "--no-tray"])
+            .args(["run", "--", "--config", config_path])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1111,40 +1100,36 @@ mod websocket_tests {
 #[cfg(test)]
 mod cli_tests {
     #[test]
-    fn test_arg_parsing_logic() {
+    fn test_init_mode_arg_parsing() {
+        // After dropping runtime CLI overrides, the only positional-style
+        // value the parser accepts is the optional init mode immediately
+        // after `--init`. The mode is a strict 3-way match — anything else
+        // is left for later branches to handle (and now hits Unknown arg).
         let args = [
-            "proxy".to_string(),
-            "192.168.1.1:8080".to_string(),
-            "--dns".to_string(),
-            "192.168.1.1:53".to_string(),
-            "--no-tray".to_string(),
+            "bunker".to_string(),
+            "--init".to_string(),
+            "lan".to_string(),
         ];
 
-        let mut listen_addr: Option<String> = None;
-        let mut dns_addr: Option<String> = None;
-        let mut use_tray = true;
+        let mut do_init = false;
+        let mut mode: Option<String> = None;
 
         let mut i = 1;
         while i < args.len() {
-            match args[i].as_str() {
-                "--dns" => {
-                    i += 1;
-                    dns_addr = args.get(i).cloned();
+            if args[i] == "--init" {
+                do_init = true;
+                if let Some(next) = args.get(i + 1) {
+                    if matches!(next.as_str(), "loopback" | "lan" | "custom") {
+                        mode = Some(next.clone());
+                        i += 1;
+                    }
                 }
-                "--no-tray" => {
-                    use_tray = false;
-                }
-                arg if !arg.starts_with('-') && listen_addr.is_none() => {
-                    listen_addr = Some(arg.to_string());
-                }
-                _ => {}
             }
             i += 1;
         }
 
-        assert_eq!(listen_addr, Some("192.168.1.1:8080".to_string()));
-        assert_eq!(dns_addr, Some("192.168.1.1:53".to_string()));
-        assert!(!use_tray);
+        assert!(do_init);
+        assert_eq!(mode.as_deref(), Some("lan"));
     }
 
     #[test]

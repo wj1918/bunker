@@ -15,9 +15,7 @@ mod security;
 mod tokio_io;
 
 use config::{
-    customize_default_config, default_dns_listen, default_dns_upstream, load_config,
-    user_config_path, AllowlistOverride, Config, DnsCacheConfig, DnsConfig, DnsFailoverConfig,
-    DnsSecurityConfig,
+    customize_default_config, load_config, user_config_path, AllowlistOverride, Config,
 };
 use dns::run_dns_server;
 use helpers::create_tls_connector;
@@ -44,12 +42,17 @@ use platform::windows_tray::{hide_window, setup_tray, show_window, TrayMessage};
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
 
-    // Parse command line arguments
+    // Parse command line arguments.
+    //
+    // Runtime CLI surface is intentionally minimal: only `-c <path>`, `--help`,
+    // `--version`, and (on Windows) `--install` / `--uninstall`. Everything
+    // else (bind address, allowlist, DNS, tray) is configured via the YAML
+    // file. `--listen` / `--dns` / `--dns-upstream` are only valid in
+    // combination with `--init`, where they shape the generated file.
     let mut config_path: Option<&str> = None;
     let mut cli_listen_addr: Option<String> = None;
     let mut cli_dns_addr: Option<String> = None;
     let mut cli_dns_upstream: Option<String> = None;
-    let mut use_tray = true;
     let mut do_init = false;
     let mut init_mode = InitMode::Loopback;
 
@@ -72,9 +75,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 i += 1;
                 cli_dns_upstream = args.get(i).cloned();
             }
-            "--no-tray" => {
-                use_tray = false;
-            }
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 return Ok(());
@@ -85,9 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             "--init" => {
                 do_init = true;
-                // Optional positional mode: `loopback`, `lan`, or `custom`. If
-                // the next token isn't a recognized mode we leave it alone so
-                // it can match a later branch (e.g. positional listen addr).
+                // Optional next-token mode: `loopback`, `lan`, or `custom`.
+                // If the next token isn't one of those exact words we leave
+                // it alone — the parser has no other positional slot now,
+                // so a bad value will fall through to `Unknown argument`.
                 if let Some(next) = args.get(i + 1) {
                     if let Some(mode) = InitMode::parse(next) {
                         init_mode = mode;
@@ -102,9 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             #[cfg(windows)]
             "--uninstall" => {
                 return uninstall_startup();
-            }
-            arg if !arg.starts_with('-') && cli_listen_addr.is_none() => {
-                cli_listen_addr = Some(arg.to_string());
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
@@ -124,33 +122,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    // Load config from file
-    let mut config = load_config(config_path)?;
+    // Reject `--listen` / `--dns` / `--dns-upstream` outside of `--init`.
+    // Runtime configuration is sourced exclusively from the YAML file; CLI
+    // overrides at runtime would mask config values and resurrect the
+    // "bind widened but allowlist still loopback" trap.
+    let mut init_only_flags = Vec::new();
+    if cli_listen_addr.is_some() {
+        init_only_flags.push("--listen");
+    }
+    if cli_dns_addr.is_some() {
+        init_only_flags.push("--dns");
+    }
+    if cli_dns_upstream.is_some() {
+        init_only_flags.push("--dns-upstream");
+    }
+    if !init_only_flags.is_empty() {
+        eprintln!(
+            "Error: {} only valid with --init.",
+            init_only_flags.join(", ")
+        );
+        eprintln!("Runtime configuration comes from the YAML file. To change these values:");
+        eprintln!("  - Edit ~/.bunker/config.yaml (or the file you pass to `-c`) and restart, or");
+        eprintln!("  - Regenerate the file: bunker --init [mode] [those flags]");
+        std::process::exit(1);
+    }
 
-    // CLI arguments override config file
-    if let Some(addr) = cli_listen_addr {
-        config.proxy.listen = addr;
-    }
-    if let Some(dns_addr) = cli_dns_addr {
-        let dns = config.dns.get_or_insert(DnsConfig {
-            listen: default_dns_listen(),
-            upstream: None,
-            upstreams: vec![default_dns_upstream()],
-            security: DnsSecurityConfig::default(),
-            cache: DnsCacheConfig::default(),
-            failover: DnsFailoverConfig::default(),
-        });
-        dns.listen = dns_addr;
-    }
-    if let Some(upstream) = cli_dns_upstream {
-        if let Some(dns) = config.dns.as_mut() {
-            dns.upstream = None;
-            dns.upstreams = vec![upstream];
+    // Load config from file. With no overrides at runtime, the YAML file is
+    // the sole source of truth — so we refuse to start without one, rather
+    // than silently using built-in defaults that might surprise the user.
+    let config = match load_config(config_path)? {
+        Some(c) => c,
+        None => {
+            eprintln!("Error: no config file found.");
+            eprintln!("Searched (in order):");
+            if let Some(p) = config_path {
+                eprintln!("  {}", p);
+            } else {
+                eprintln!("  ./config.yaml");
+                if let Some(p) = user_config_path() {
+                    eprintln!("  {}", p.display());
+                }
+                eprintln!("  <exe-dir>/config.yaml");
+            }
+            eprintln!("Run 'bunker --init' to create one.");
+            std::process::exit(1);
         }
-    }
-    if !use_tray {
-        config.app.tray_enabled = false;
-    }
+    };
 
     // Initialize logging system
     let _log_guard = logging::init_logging(&config.logging);
@@ -665,70 +682,48 @@ fn derive_custom_allowlist(listen: SocketAddr) -> (Vec<String>, String) {
 }
 
 fn print_usage(program: &str) {
-    eprintln!("Usage: {} [listen_addr] [options]", program);
+    eprintln!("Usage: {} [options]", program);
     eprintln!();
     eprintln!("Generic HTTP/HTTPS forward proxy with optional DNS server.");
     eprintln!("Supports both IPv4 and IPv6.");
     eprintln!();
-    eprintln!("Arguments:");
-    eprintln!("  listen_addr             Address to listen on (e.g., 0.0.0.0:8080 or [::]:8080)");
+    eprintln!("Runtime: configuration is loaded from a YAML file. There are no CLI");
+    eprintln!("overrides at runtime — edit the file (or pass `-c <path>`) to change");
+    eprintln!("settings, then restart.");
     eprintln!();
-    eprintln!("Options:");
+    eprintln!("Runtime options:");
     eprintln!("  -c, --config <path>     Load config from YAML file");
-    eprintln!("  --listen <addr>         Proxy listen address (same as positional arg)");
-    eprintln!(
-        "  --init [mode]           Create default config at %USERPROFILE%\\.bunker\\config.yaml"
-    );
-    eprintln!("                          Modes (default: loopback):");
-    eprintln!("                            loopback  bind 127.0.0.1; loopback allowlist");
-    eprintln!("                            lan       auto-discover LAN interface; bind to its");
-    eprintln!("                                      IP; allowlist = that interface's subnet");
-    eprintln!("                            custom    requires --listen/--dns/--dns-upstream;");
-    eprintln!("                                      allowlist derived from --listen address");
-    eprintln!("                          --listen/--dns/--dns-upstream override the bind");
-    eprintln!("                          addresses in loopback and lan modes.");
-    eprintln!("  --dns <addr>            Enable DNS server (e.g., 0.0.0.0:53 or [::]:53)");
-    eprintln!("  --dns-upstream <addr>   Upstream DNS server (default: 8.8.8.8:53)");
-    eprintln!("  --no-tray               Disable system tray (Windows only)");
-    eprintln!("  --install               Add to Windows startup (Windows only)");
-    eprintln!("  --uninstall             Remove from Windows startup (Windows only)");
+    eprintln!("                          (default search order: ./config.yaml,");
+    eprintln!("                          ~/.bunker/config.yaml, <exe-dir>/config.yaml)");
     eprintln!("  -h, --help              Show this help message");
     eprintln!("  -V, --version           Print version and exit");
+    #[cfg(windows)]
+    {
+        eprintln!("  --install               Add to Windows startup");
+        eprintln!("  --uninstall             Remove from Windows startup");
+    }
     eprintln!();
-    eprintln!("Config file (config.yaml):");
-    eprintln!("  proxy:");
-    eprintln!("    listen: \"127.0.0.1:8080\"    # or \"[::]:8080\" for IPv6");
-    eprintln!("  dns:");
-    eprintln!("    listen: \"0.0.0.0:53\"");
-    eprintln!("    upstream: \"8.8.8.8:53\"      # or \"[2001:4860:4860::8888]:53\" for IPv6");
-    eprintln!("  app:");
-    eprintln!("    tray_enabled: true");
+    eprintln!("Init: write a config file (refuses to overwrite an existing one).");
+    eprintln!();
+    eprintln!("Init options:");
+    eprintln!(
+        "  --init [mode]           Create config at ~/.bunker/config.yaml. Modes:"
+    );
+    eprintln!("                            loopback  (default) bind 127.0.0.1; loopback allowlist");
+    eprintln!("                            lan                 auto-discover LAN interface; bind");
+    eprintln!("                                                to its IP; allowlist = its subnet");
+    eprintln!("                            custom              requires --listen/--dns/");
+    eprintln!("                                                --dns-upstream; allowlist derived");
+    eprintln!("                                                from --listen address");
+    eprintln!("  --listen <addr>         Proxy listen address (with --init only)");
+    eprintln!("  --dns <addr>            DNS server listen address (with --init only)");
+    eprintln!("  --dns-upstream <addr>   Upstream DNS server (with --init only)");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!(
-        "  {} 0.0.0.0:8080                              # IPv4 only",
-        program
-    );
-    eprintln!(
-        "  {} [::]:8080                                 # IPv6 (also accepts IPv4)",
-        program
-    );
-    eprintln!(
-        "  {} 0.0.0.0:8080 --dns 0.0.0.0:53             # With DNS server",
-        program
-    );
-    eprintln!(
-        "  {} --config config.yaml                       # Use config file",
-        program
-    );
-    eprintln!(
-        "  {} --init --listen [::]:8080 --dns 0.0.0.0:53 # Generate config with overrides",
-        program
-    );
-    eprintln!(
-        "  {} --init lan                                # Auto-discover LAN interface",
-        program
-    );
+    eprintln!("  {}                                           # run with config file", program);
+    eprintln!("  {} -c /path/to/config.yaml                   # run with explicit config", program);
+    eprintln!("  {} --init                                    # write loopback default config", program);
+    eprintln!("  {} --init lan                                # auto-discover LAN interface", program);
     eprintln!(
         "  {} --init custom --listen 192.168.1.5:8080 --dns 192.168.1.5:53 --dns-upstream 9.9.9.9:53",
         program
@@ -740,17 +735,17 @@ fn print_usage(program: &str) {
     #[cfg(windows)]
     {
         eprintln!();
-        eprintln!("Windows startup:");
+        eprintln!("Windows startup examples:");
         eprintln!(
-            "  {} --install                                  # Add to Windows startup",
+            "  {} --install                                 # add to Windows startup",
             program
         );
         eprintln!(
-            "  {} --install -c config.yaml                   # Add with config file",
+            "  {} --install -c config.yaml                  # add with explicit config",
             program
         );
         eprintln!(
-            "  {} --uninstall                                # Remove from Windows startup",
+            "  {} --uninstall                               # remove from Windows startup",
             program
         );
     }
@@ -856,23 +851,26 @@ fn install_startup(
         (exe_dir.to_path_buf(), None)
     };
 
-    // Load and verify config file if specified
+    // Load and verify config file if specified. A missing file is reported
+    // as `None` from `load_config`; here we just skip the log-dir pre-create
+    // step in that case rather than erroring — the runtime entrypoint will
+    // surface the missing-file error on the next launch.
     if let Some(cfg_path) = config_path {
-        let config = load_config(Some(cfg_path))?;
+        if let Some(config) = load_config(Some(cfg_path))? {
+            // Create log directory if specified in config
+            if let Some(file_config) = &config.logging.file {
+                let log_dir_path = std::path::Path::new(&file_config.log_dir);
+                let log_dir = if log_dir_path.is_absolute() {
+                    log_dir_path.to_path_buf()
+                } else {
+                    // Relative path: resolve from config file's directory
+                    work_dir.join(log_dir_path)
+                };
 
-        // Create log directory if specified in config
-        if let Some(file_config) = &config.logging.file {
-            let log_dir_path = std::path::Path::new(&file_config.log_dir);
-            let log_dir = if log_dir_path.is_absolute() {
-                log_dir_path.to_path_buf()
-            } else {
-                // Relative path: resolve from config file's directory
-                work_dir.join(log_dir_path)
-            };
-
-            if !log_dir.exists() {
-                std::fs::create_dir_all(&log_dir)?;
-                eprintln!("Created logs directory: {}", log_dir.display());
+                if !log_dir.exists() {
+                    std::fs::create_dir_all(&log_dir)?;
+                    eprintln!("Created logs directory: {}", log_dir.display());
+                }
             }
         }
     }

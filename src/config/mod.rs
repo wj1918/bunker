@@ -180,6 +180,9 @@ pub struct Config {
     pub dns: Option<DnsConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
+    // Read on Windows for the tray setup path; parsed everywhere else so
+    // shared YAML files round-trip cleanly, but otherwise unused.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[serde(default)]
     pub app: AppConfig,
 }
@@ -226,6 +229,9 @@ impl Default for ProxyConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    // Read on Windows by the tray setup path; on other platforms it's parsed
+    // (so the field is still recognized in shared config files) but unused.
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
 }
@@ -781,18 +787,26 @@ pub fn user_config_path() -> Option<PathBuf> {
     home.map(|h| PathBuf::from(h).join(".bunker").join("config.yaml"))
 }
 
-/// Load configuration from file
-pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // Try to find config file
+/// Load configuration from file.
+///
+/// Returns `Ok(Some(config))` when a YAML file was found and parsed,
+/// `Ok(None)` when no file was found at any of the searched locations. The
+/// caller decides whether a missing file is acceptable — `--install` on
+/// Windows treats it as "skip log-dir prep", while the runtime entrypoint
+/// rejects it and tells the user to run `--init`.
+///
+/// Search order when `path` is `None`: `./config.yaml`, the per-user
+/// config (`~/.bunker/config.yaml`), then `<exe-dir>/config.yaml`.
+pub fn load_config(
+    path: Option<&str>,
+) -> Result<Option<Config>, Box<dyn std::error::Error + Send + Sync>> {
     let config_paths = if let Some(p) = path {
         vec![PathBuf::from(p)]
     } else {
         let mut paths = vec![PathBuf::from("config.yaml")];
-        // Per-user config (survives package upgrades)
         if let Some(p) = user_config_path() {
             paths.push(p);
         }
-        // Look next to the executable (handles portable setups that bundle a config)
         if let Some(dir) = exe_dir() {
             paths.push(dir.join("config.yaml"));
         }
@@ -804,11 +818,11 @@ pub fn load_config(path: Option<&str>) -> Result<Config, Box<dyn std::error::Err
             println!("Loading config from: {}", config_path.display());
             let content = fs::read_to_string(&config_path)?;
             let config: Config = serde_yaml_ng::from_str(&content)?;
-            return Ok(config);
+            return Ok(Some(config));
         }
     }
 
-    Ok(Config::default())
+    Ok(None)
 }
 
 // ============== Unit Tests ==============
@@ -917,8 +931,9 @@ dns:
     fn test_load_config_nonexistent_file() {
         let result = load_config(Some("/nonexistent/path/config.yaml"));
         assert!(result.is_ok());
-        let config = result.unwrap();
-        assert_eq!(config.proxy.listen, "127.0.0.1:8080");
+        // Missing file is now reported as `None` rather than silently
+        // returning defaults — the caller decides what to do about it.
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
@@ -1099,7 +1114,10 @@ dns:
 
     #[test]
     fn test_load_config_default() {
-        // Load with None should use defaults if no config file exists
+        // With None, load_config searches the standard locations. We only
+        // assert it doesn't error — the result can be Some or None depending
+        // on whether the test runner happens to be sitting next to a
+        // `config.yaml` (the project root does ship one).
         let result = load_config(None);
         assert!(result.is_ok());
     }
