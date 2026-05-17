@@ -108,16 +108,18 @@ mod config_tests {
     #[test]
     fn test_valid_config_parsing() {
         let yaml = r#"
-listen_addr: "0.0.0.0:8080"
-tray_enabled: false
+proxy:
+  listen: "0.0.0.0:8080"
+app:
+  tray_enabled: false
 dns:
   listen: "0.0.0.0:53"
   upstream: "1.1.1.1:53"
 "#;
         let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
 
-        assert_eq!(config["listen_addr"].as_str().unwrap(), "0.0.0.0:8080");
-        assert!(!config["tray_enabled"].as_bool().unwrap());
+        assert_eq!(config["proxy"]["listen"].as_str().unwrap(), "0.0.0.0:8080");
+        assert!(!config["app"]["tray_enabled"].as_bool().unwrap());
         assert_eq!(config["dns"]["listen"].as_str().unwrap(), "0.0.0.0:53");
         assert_eq!(config["dns"]["upstream"].as_str().unwrap(), "1.1.1.1:53");
     }
@@ -125,11 +127,15 @@ dns:
     #[test]
     fn test_partial_config_parsing() {
         let yaml = r#"
-listen_addr: "192.168.1.1:8080"
+proxy:
+  listen: "192.168.1.1:8080"
 "#;
         let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
 
-        assert_eq!(config["listen_addr"].as_str().unwrap(), "192.168.1.1:8080");
+        assert_eq!(
+            config["proxy"]["listen"].as_str().unwrap(),
+            "192.168.1.1:8080"
+        );
         assert!(config["dns"].is_null());
     }
 
@@ -155,15 +161,20 @@ dns:
     fn test_config_file_creation() {
         let test_config = "test_config_temp.yaml";
         let yaml = r#"
-listen_addr: "127.0.0.1:9999"
-tray_enabled: false
+proxy:
+  listen: "127.0.0.1:9999"
+app:
+  tray_enabled: false
 "#;
         fs::write(test_config, yaml).unwrap();
 
         let content = fs::read_to_string(test_config).unwrap();
         let config: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).unwrap();
 
-        assert_eq!(config["listen_addr"].as_str().unwrap(), "127.0.0.1:9999");
+        assert_eq!(
+            config["proxy"]["listen"].as_str().unwrap(),
+            "127.0.0.1:9999"
+        );
 
         fs::remove_file(test_config).unwrap();
     }

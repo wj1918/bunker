@@ -98,13 +98,35 @@ copy target\release\bunker.exe C:\Bunker\
 Run `bunker --init` once to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template, then edit it:
 
 ```yaml
-# Server listen address (use your Windows machine's LAN IP)
-listen_addr: "192.168.1.1:8080"
+# Proxy server
+proxy:
+  enabled: true
+  # Use your Windows machine's LAN IP to serve other clients,
+  # or 127.0.0.1 for loopback-only.
+  listen: "192.168.1.1:8080"
 
-# Enable system tray icon
-tray_enabled: true
+  security:
+    block_private_ips: true
+    # Restrict access to your LAN clients only
+    allowed_source_ips:
+      - "192.168.1.0/24"
+    rate_limit:
+      enabled: true
+      max_requests: 1000
+      window_seconds: 60
+    max_connections: 1000
+    header_read_timeout_seconds: 30
 
-# DNS server (optional)
+  connection_pool:
+    enabled: true
+    idle_timeout_seconds: 60
+    max_connections_per_host: 10
+
+  tcp_keepalive:
+    enabled: true
+    time_seconds: 60
+
+# DNS server (optional — comment out the block to disable)
 dns:
   listen: "192.168.1.1:53"
   upstreams:
@@ -117,34 +139,7 @@ dns:
     timeout_ms: 2000
     serve_stale: true
 
-# Security settings
-security:
-  block_private_ips: true
-
-  # Restrict access to your LAN clients only
-  allowed_source_ips:
-    - "192.168.1.0/24"
-
-  rate_limit:
-    enabled: true
-    max_requests: 100
-    window_seconds: 60
-
-  max_connections: 1000
-  header_read_timeout_seconds: 30
-
-# Connection pooling
-connection_pool:
-  enabled: true
-  idle_timeout_seconds: 60
-  max_connections_per_host: 10
-
-# TCP keep-alive
-tcp_keepalive:
-  enabled: true
-  time_seconds: 60
-
-# Logging
+# Logging (cross-cutting)
 logging:
   log_requests: true
   format: text
@@ -154,6 +149,10 @@ logging:
     rotation: daily
     max_age_days: 7
     compress: true
+
+# App (cross-cutting UI / system)
+app:
+  tray_enabled: true
 ```
 
 ### Step 3: Windows Firewall

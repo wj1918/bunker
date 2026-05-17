@@ -7,35 +7,76 @@ use std::path::PathBuf;
 /// Default config.yaml embedded at compile time
 pub const DEFAULT_CONFIG_YAML: &str = include_str!("../../config.yaml");
 
-/// Main configuration struct for the proxy
-#[derive(Debug, Deserialize, Clone)]
+/// Main configuration struct.
+///
+/// Top level groups settings by responsibility:
+///   * `proxy`   — proxy server (listen, security, pool, keepalive)
+///   * `dns`     — DNS server (optional)
+///   * `logging` — cross-cutting logging
+///   * `app`     — cross-cutting UI / system
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_listen_addr")]
-    pub listen_addr: String,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     #[serde(default)]
     pub dns: Option<DnsConfig>,
-    #[serde(default = "default_tray_enabled")]
-    pub tray_enabled: bool,
-    #[serde(default)]
-    pub security: SecurityConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub app: AppConfig,
+}
+
+// ============== Proxy Config ==============
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    #[serde(default = "default_proxy_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_proxy_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub security: SecurityConfig,
     #[serde(default)]
     pub connection_pool: ConnectionPoolConfig,
     #[serde(default)]
     pub tcp_keepalive: TcpKeepaliveConfig,
 }
 
-impl Default for Config {
+fn default_proxy_enabled() -> bool {
+    true
+}
+
+pub fn default_proxy_listen() -> String {
+    "127.0.0.1:8080".to_string()
+}
+
+impl Default for ProxyConfig {
     fn default() -> Self {
-        Config {
-            listen_addr: default_listen_addr(),
-            dns: None,
-            tray_enabled: true,
+        ProxyConfig {
+            enabled: default_proxy_enabled(),
+            listen: default_proxy_listen(),
             security: SecurityConfig::default(),
-            logging: LoggingConfig::default(),
             connection_pool: ConnectionPoolConfig::default(),
             tcp_keepalive: TcpKeepaliveConfig::default(),
+        }
+    }
+}
+
+// ============== App Config ==============
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AppConfig {
+    #[serde(default = "default_tray_enabled")]
+    pub tray_enabled: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            tray_enabled: default_tray_enabled(),
         }
     }
 }
@@ -43,6 +84,7 @@ impl Default for Config {
 // ============== Connection Pool Config ==============
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionPoolConfig {
     #[serde(default = "default_pool_enabled")]
     pub enabled: bool,
@@ -99,6 +141,7 @@ impl Default for ConnectionPoolConfig {
 // ============== TCP Keepalive Config ==============
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TcpKeepaliveConfig {
     #[serde(default = "default_tcp_keepalive_enabled")]
     pub enabled: bool,
@@ -143,6 +186,7 @@ impl Default for TcpKeepaliveConfig {
 // ============== DNS Config ==============
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     #[serde(default = "default_dns_listen")]
     pub listen: String,
@@ -183,6 +227,7 @@ impl DnsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DnsFailoverConfig {
     #[serde(default = "default_dns_timeout_ms")]
     pub timeout_ms: u64,
@@ -215,6 +260,7 @@ impl Default for DnsFailoverConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DnsCacheConfig {
     #[serde(default = "default_dns_cache_enabled")]
     pub enabled: bool,
@@ -256,6 +302,7 @@ impl Default for DnsCacheConfig {
 // ============== Security Config ==============
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default = "default_block_private_ips")]
     pub block_private_ips: bool,
@@ -319,6 +366,7 @@ impl Default for SecurityConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
@@ -339,7 +387,7 @@ fn default_rate_limit_enabled() -> bool {
 }
 
 fn default_max_requests() -> u32 {
-    100
+    1000
 }
 
 fn default_window_seconds() -> u64 {
@@ -358,7 +406,7 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         RateLimitConfig {
             enabled: true,
-            max_requests: 100,
+            max_requests: default_max_requests(),
             window_seconds: 60,
             max_tracked_ips: default_max_tracked_ips(),
             ipv6_subnet_rate_limit: default_ipv6_subnet_rate_limit(),
@@ -367,6 +415,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DnsSecurityConfig {
     #[serde(default = "default_dns_rate_limit_enabled")]
     pub rate_limit_enabled: bool,
@@ -450,6 +499,7 @@ pub enum LogRotation {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_requests")]
     pub log_requests: bool,
@@ -465,6 +515,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FileLoggingConfig {
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
@@ -541,10 +592,6 @@ impl Default for LoggingConfig {
 
 // ============== Default Values ==============
 
-pub fn default_listen_addr() -> String {
-    "0.0.0.0:8080".to_string()
-}
-
 pub fn default_dns_listen() -> String {
     "0.0.0.0:53".to_string()
 }
@@ -614,8 +661,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_listen_addr() {
-        assert_eq!(default_listen_addr(), "0.0.0.0:8080");
+    fn test_default_proxy_listen() {
+        assert_eq!(default_proxy_listen(), "127.0.0.1:8080");
     }
 
     #[test]
@@ -636,23 +683,26 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.listen_addr, "0.0.0.0:8080");
+        assert!(config.proxy.enabled);
+        assert_eq!(config.proxy.listen, "127.0.0.1:8080");
         assert!(config.dns.is_none());
-        assert!(config.tray_enabled);
+        assert!(config.app.tray_enabled);
     }
 
     #[test]
     fn test_config_deserialization_full() {
         let yaml = r#"
-listen_addr: "192.168.1.1:8080"
-tray_enabled: false
+proxy:
+  listen: "192.168.1.1:8080"
+app:
+  tray_enabled: false
 dns:
   listen: "192.168.1.1:53"
   upstream: "1.1.1.1:53"
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.listen_addr, "192.168.1.1:8080");
-        assert!(!config.tray_enabled);
+        assert_eq!(config.proxy.listen, "192.168.1.1:8080");
+        assert!(!config.app.tray_enabled);
         assert!(config.dns.is_some());
         let dns = config.dns.unwrap();
         assert_eq!(dns.listen, "192.168.1.1:53");
@@ -662,11 +712,12 @@ dns:
     #[test]
     fn test_config_deserialization_partial() {
         let yaml = r#"
-listen_addr: "127.0.0.1:3128"
+proxy:
+  listen: "127.0.0.1:3128"
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.listen_addr, "127.0.0.1:3128");
-        assert!(config.tray_enabled); // default
+        assert_eq!(config.proxy.listen, "127.0.0.1:3128");
+        assert!(config.app.tray_enabled); // default
         assert!(config.dns.is_none());
     }
 
@@ -674,7 +725,22 @@ listen_addr: "127.0.0.1:3128"
     fn test_config_deserialization_empty() {
         let yaml = "";
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.listen_addr, "0.0.0.0:8080"); // default
+        assert_eq!(config.proxy.listen, "127.0.0.1:8080"); // default
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_root_field() {
+        let yaml = "unknown_field: 42\n";
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(result.is_err(), "unknown top-level fields must be rejected");
+    }
+
+    #[test]
+    fn test_config_rejects_legacy_flat_layout() {
+        // Old shape (listen_addr at root) is no longer accepted.
+        let yaml = "listen_addr: \"0.0.0.0:8080\"\n";
+        let result: Result<Config, _> = serde_yaml_ng::from_str(yaml);
+        assert!(result.is_err(), "legacy flat layout must be rejected");
     }
 
     #[test]
@@ -695,7 +761,7 @@ dns:
         let result = load_config(Some("/nonexistent/path/config.yaml"));
         assert!(result.is_ok());
         let config = result.unwrap();
-        assert_eq!(config.listen_addr, "0.0.0.0:8080");
+        assert_eq!(config.proxy.listen, "127.0.0.1:8080");
     }
 
     #[test]
@@ -720,7 +786,7 @@ dns:
     fn test_rate_limit_config_defaults() {
         let config = RateLimitConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.max_requests, 100);
+        assert_eq!(config.max_requests, 1000);
         assert_eq!(config.window_seconds, 60);
     }
 
@@ -738,79 +804,89 @@ dns:
     #[test]
     fn test_security_config_deserialize() {
         let yaml = r#"
-security:
-  block_private_ips: false
-  blocked_hosts:
-    - "*.internal"
-    - "evil.com"
-  allowed_ports:
-    - 80
-    - 443
+proxy:
+  security:
+    block_private_ips: false
+    blocked_hosts:
+      - "*.internal"
+      - "evil.com"
+    allowed_ports:
+      - 80
+      - 443
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(!config.security.block_private_ips);
-        assert_eq!(config.security.blocked_hosts.len(), 2);
-        assert_eq!(config.security.allowed_ports, vec![80, 443]);
+        assert!(!config.proxy.security.block_private_ips);
+        assert_eq!(config.proxy.security.blocked_hosts.len(), 2);
+        assert_eq!(config.proxy.security.allowed_ports, vec![80, 443]);
     }
 
     #[test]
     fn test_security_config_max_body_bytes() {
         let yaml = r#"
-security:
-  max_request_body_bytes: 5242880
+proxy:
+  security:
+    max_request_body_bytes: 5242880
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.max_request_body_bytes, 5 * 1024 * 1024); // 5MB
+        assert_eq!(
+            config.proxy.security.max_request_body_bytes,
+            5 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_security_config_unlimited_body() {
         let yaml = r#"
-security:
-  max_request_body_bytes: 0
+proxy:
+  security:
+    max_request_body_bytes: 0
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.max_request_body_bytes, 0); // Unlimited
+        assert_eq!(config.proxy.security.max_request_body_bytes, 0);
     }
 
     #[test]
     fn test_security_config_header_timeout() {
         let yaml = r#"
-security:
-  header_read_timeout_seconds: 60
+proxy:
+  security:
+    header_read_timeout_seconds: 60
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.header_read_timeout_seconds, 60);
+        assert_eq!(config.proxy.security.header_read_timeout_seconds, 60);
     }
 
     #[test]
     fn test_security_config_header_timeout_disabled() {
         let yaml = r#"
-security:
-  header_read_timeout_seconds: 0
+proxy:
+  security:
+    header_read_timeout_seconds: 0
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.header_read_timeout_seconds, 0); // Disabled
+        assert_eq!(config.proxy.security.header_read_timeout_seconds, 0);
     }
 
     #[test]
     fn test_security_config_max_requests_per_connection() {
         let yaml = r#"
-security:
-  max_requests_per_connection: 500
+proxy:
+  security:
+    max_requests_per_connection: 500
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.max_requests_per_connection, 500);
+        assert_eq!(config.proxy.security.max_requests_per_connection, 500);
     }
 
     #[test]
     fn test_security_config_max_requests_per_connection_unlimited() {
         let yaml = r#"
-security:
-  max_requests_per_connection: 0
+proxy:
+  security:
+    max_requests_per_connection: 0
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.max_requests_per_connection, 0); // Unlimited
+        assert_eq!(config.proxy.security.max_requests_per_connection, 0);
     }
 
     #[test]
@@ -923,29 +999,31 @@ logging:
     #[test]
     fn test_connection_pool_deserialize() {
         let yaml = r#"
-connection_pool:
-  enabled: false
-  max_connections_per_host: 5
-  idle_timeout_seconds: 30
+proxy:
+  connection_pool:
+    enabled: false
+    max_connections_per_host: 5
+    idle_timeout_seconds: 30
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(!config.connection_pool.enabled);
-        assert_eq!(config.connection_pool.max_connections_per_host, 5);
-        assert_eq!(config.connection_pool.idle_timeout_seconds, 30);
+        assert!(!config.proxy.connection_pool.enabled);
+        assert_eq!(config.proxy.connection_pool.max_connections_per_host, 5);
+        assert_eq!(config.proxy.connection_pool.idle_timeout_seconds, 30);
     }
 
     #[test]
     fn test_tcp_keepalive_deserialize() {
         let yaml = r#"
-tcp_keepalive:
-  enabled: false
-  time_seconds: 120
-  interval_seconds: 20
+proxy:
+  tcp_keepalive:
+    enabled: false
+    time_seconds: 120
+    interval_seconds: 20
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(!config.tcp_keepalive.enabled);
-        assert_eq!(config.tcp_keepalive.time_seconds, 120);
-        assert_eq!(config.tcp_keepalive.interval_seconds, 20);
+        assert!(!config.proxy.tcp_keepalive.enabled);
+        assert_eq!(config.proxy.tcp_keepalive.time_seconds, 120);
+        assert_eq!(config.proxy.tcp_keepalive.interval_seconds, 20);
     }
 
     #[test]
@@ -987,25 +1065,30 @@ dns:
         assert_eq!(config.max_connections, 1000); // default
 
         let yaml = r#"
-security:
-  max_connections: 500
+proxy:
+  security:
+    max_connections: 500
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.max_connections, 500);
+        assert_eq!(config.proxy.security.max_connections, 500);
     }
 
     #[test]
     fn test_security_config_allowed_source_ips() {
         let yaml = r#"
-security:
-  allowed_source_ips:
-    - "192.168.1.0/24"
-    - "10.0.0.1"
+proxy:
+  security:
+    allowed_source_ips:
+      - "192.168.1.0/24"
+      - "10.0.0.1"
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.allowed_source_ips.len(), 2);
-        assert_eq!(config.security.allowed_source_ips[0], "192.168.1.0/24");
-        assert_eq!(config.security.allowed_source_ips[1], "10.0.0.1");
+        assert_eq!(config.proxy.security.allowed_source_ips.len(), 2);
+        assert_eq!(
+            config.proxy.security.allowed_source_ips[0],
+            "192.168.1.0/24"
+        );
+        assert_eq!(config.proxy.security.allowed_source_ips[1], "10.0.0.1");
     }
 
     #[test]
@@ -1014,12 +1097,13 @@ security:
         assert_eq!(config.max_tracked_ips, 100000); // default
 
         let yaml = r#"
-security:
-  rate_limit:
-    max_tracked_ips: 50000
+proxy:
+  security:
+    rate_limit:
+      max_tracked_ips: 50000
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.security.rate_limit.max_tracked_ips, 50000);
+        assert_eq!(config.proxy.security.rate_limit.max_tracked_ips, 50000);
     }
 
     #[test]
@@ -1028,31 +1112,33 @@ security:
         assert!(config.ipv6_subnet_rate_limit); // default true
 
         let yaml = r#"
-security:
-  rate_limit:
-    ipv6_subnet_rate_limit: false
+proxy:
+  security:
+    rate_limit:
+      ipv6_subnet_rate_limit: false
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(!config.security.rate_limit.ipv6_subnet_rate_limit);
+        assert!(!config.proxy.security.rate_limit.ipv6_subnet_rate_limit);
     }
 
     #[test]
     fn test_rate_limit_full_deserialize() {
         let yaml = r#"
-security:
-  rate_limit:
-    enabled: true
-    max_requests: 200
-    window_seconds: 120
-    max_tracked_ips: 10000
-    ipv6_subnet_rate_limit: false
+proxy:
+  security:
+    rate_limit:
+      enabled: true
+      max_requests: 200
+      window_seconds: 120
+      max_tracked_ips: 10000
+      ipv6_subnet_rate_limit: false
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(config.security.rate_limit.enabled);
-        assert_eq!(config.security.rate_limit.max_requests, 200);
-        assert_eq!(config.security.rate_limit.window_seconds, 120);
-        assert_eq!(config.security.rate_limit.max_tracked_ips, 10000);
-        assert!(!config.security.rate_limit.ipv6_subnet_rate_limit);
+        assert!(config.proxy.security.rate_limit.enabled);
+        assert_eq!(config.proxy.security.rate_limit.max_requests, 200);
+        assert_eq!(config.proxy.security.rate_limit.window_seconds, 120);
+        assert_eq!(config.proxy.security.rate_limit.max_tracked_ips, 10000);
+        assert!(!config.proxy.security.rate_limit.ipv6_subnet_rate_limit);
     }
 
     #[test]
@@ -1061,31 +1147,33 @@ security:
         assert_eq!(config.max_total_connections, 1000); // default
 
         let yaml = r#"
-connection_pool:
-  max_total_connections: 500
+proxy:
+  connection_pool:
+    max_total_connections: 500
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.connection_pool.max_total_connections, 500);
+        assert_eq!(config.proxy.connection_pool.max_total_connections, 500);
     }
 
     #[test]
     fn test_connection_pool_full_deserialize() {
         let yaml = r#"
-connection_pool:
-  enabled: true
-  max_connections_per_host: 20
-  max_total_connections: 2000
-  idle_timeout_seconds: 120
-  max_lifetime_seconds: 600
-  connect_timeout_seconds: 30
+proxy:
+  connection_pool:
+    enabled: true
+    max_connections_per_host: 20
+    max_total_connections: 2000
+    idle_timeout_seconds: 120
+    max_lifetime_seconds: 600
+    connect_timeout_seconds: 30
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert!(config.connection_pool.enabled);
-        assert_eq!(config.connection_pool.max_connections_per_host, 20);
-        assert_eq!(config.connection_pool.max_total_connections, 2000);
-        assert_eq!(config.connection_pool.idle_timeout_seconds, 120);
-        assert_eq!(config.connection_pool.max_lifetime_seconds, 600);
-        assert_eq!(config.connection_pool.connect_timeout_seconds, 30);
+        assert!(config.proxy.connection_pool.enabled);
+        assert_eq!(config.proxy.connection_pool.max_connections_per_host, 20);
+        assert_eq!(config.proxy.connection_pool.max_total_connections, 2000);
+        assert_eq!(config.proxy.connection_pool.idle_timeout_seconds, 120);
+        assert_eq!(config.proxy.connection_pool.max_lifetime_seconds, 600);
+        assert_eq!(config.proxy.connection_pool.connect_timeout_seconds, 30);
     }
 
     #[test]
@@ -1095,11 +1183,12 @@ connection_pool:
         assert_eq!(config.retries, 3); // default
 
         let yaml = r#"
-tcp_keepalive:
-  retries: 5
+proxy:
+  tcp_keepalive:
+    retries: 5
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(config.tcp_keepalive.retries, 5);
+        assert_eq!(config.proxy.tcp_keepalive.retries, 5);
     }
 
     #[test]
@@ -1249,8 +1338,38 @@ logging:
     #[test]
     fn test_full_config_all_sections() {
         let yaml = r#"
-listen_addr: "0.0.0.0:3128"
-tray_enabled: false
+proxy:
+  enabled: true
+  listen: "0.0.0.0:3128"
+  security:
+    block_private_ips: true
+    blocked_hosts:
+      - "*.evil.com"
+    allowed_ports:
+      - 80
+      - 443
+      - 8443
+    allowed_source_ips:
+      - "10.0.0.0/8"
+    rate_limit:
+      enabled: true
+      max_requests: 500
+      window_seconds: 300
+    max_connections: 2000
+    max_request_body_bytes: 52428800
+    header_read_timeout_seconds: 60
+    max_requests_per_connection: 500
+  connection_pool:
+    enabled: true
+    max_connections_per_host: 20
+    max_total_connections: 5000
+    idle_timeout_seconds: 120
+    max_lifetime_seconds: 600
+    connect_timeout_seconds: 15
+  tcp_keepalive:
+    enabled: true
+    time_seconds: 30
+    interval_seconds: 5
 dns:
   listen: "0.0.0.0:5353"
   upstream: "1.1.1.1:53"
@@ -1266,35 +1385,6 @@ dns:
     timeout_ms: 3000
     max_retries: 2
     serve_stale: true
-security:
-  block_private_ips: true
-  blocked_hosts:
-    - "*.evil.com"
-  allowed_ports:
-    - 80
-    - 443
-    - 8443
-  allowed_source_ips:
-    - "10.0.0.0/8"
-  rate_limit:
-    enabled: true
-    max_requests: 500
-    window_seconds: 300
-  max_connections: 2000
-  max_request_body_bytes: 52428800
-  header_read_timeout_seconds: 60
-  max_requests_per_connection: 500
-connection_pool:
-  enabled: true
-  max_connections_per_host: 20
-  max_total_connections: 5000
-  idle_timeout_seconds: 120
-  max_lifetime_seconds: 600
-  connect_timeout_seconds: 15
-tcp_keepalive:
-  enabled: true
-  time_seconds: 30
-  interval_seconds: 5
 logging:
   log_requests: true
   format: json
@@ -1307,12 +1397,30 @@ logging:
     rotation: daily
     max_age_days: 14
     compress: true
+app:
+  tray_enabled: false
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
 
-        // Root
-        assert_eq!(config.listen_addr, "0.0.0.0:3128");
-        assert!(!config.tray_enabled);
+        // Proxy
+        assert!(config.proxy.enabled);
+        assert_eq!(config.proxy.listen, "0.0.0.0:3128");
+        assert!(config.proxy.security.block_private_ips);
+        assert_eq!(config.proxy.security.blocked_hosts.len(), 1);
+        assert_eq!(config.proxy.security.allowed_ports, vec![80, 443, 8443]);
+        assert_eq!(config.proxy.security.allowed_source_ips.len(), 1);
+        assert_eq!(config.proxy.security.rate_limit.max_requests, 500);
+        assert_eq!(config.proxy.security.max_connections, 2000);
+        assert_eq!(config.proxy.security.max_request_body_bytes, 52428800);
+        assert_eq!(config.proxy.security.header_read_timeout_seconds, 60);
+        assert_eq!(config.proxy.security.max_requests_per_connection, 500);
+        assert!(config.proxy.connection_pool.enabled);
+        assert_eq!(config.proxy.connection_pool.max_connections_per_host, 20);
+        assert_eq!(config.proxy.connection_pool.max_total_connections, 5000);
+        assert_eq!(config.proxy.connection_pool.idle_timeout_seconds, 120);
+        assert!(config.proxy.tcp_keepalive.enabled);
+        assert_eq!(config.proxy.tcp_keepalive.time_seconds, 30);
+        assert_eq!(config.proxy.tcp_keepalive.interval_seconds, 5);
 
         // DNS
         let dns = config.dns.unwrap();
@@ -1322,33 +1430,22 @@ logging:
         assert_eq!(dns.cache.max_entries, 20000);
         assert_eq!(dns.failover.timeout_ms, 3000);
 
-        // Security
-        assert!(config.security.block_private_ips);
-        assert_eq!(config.security.blocked_hosts.len(), 1);
-        assert_eq!(config.security.allowed_ports, vec![80, 443, 8443]);
-        assert_eq!(config.security.allowed_source_ips.len(), 1);
-        assert_eq!(config.security.rate_limit.max_requests, 500);
-        assert_eq!(config.security.max_connections, 2000);
-        assert_eq!(config.security.max_request_body_bytes, 52428800);
-        assert_eq!(config.security.header_read_timeout_seconds, 60);
-        assert_eq!(config.security.max_requests_per_connection, 500);
-
-        // Connection Pool
-        assert!(config.connection_pool.enabled);
-        assert_eq!(config.connection_pool.max_connections_per_host, 20);
-        assert_eq!(config.connection_pool.max_total_connections, 5000);
-        assert_eq!(config.connection_pool.idle_timeout_seconds, 120);
-
-        // TCP Keep-Alive
-        assert!(config.tcp_keepalive.enabled);
-        assert_eq!(config.tcp_keepalive.time_seconds, 30);
-        assert_eq!(config.tcp_keepalive.interval_seconds, 5);
-
         // Logging
         assert!(config.logging.log_requests);
         assert_eq!(config.logging.format, LogFormat::Json);
         assert!(config.logging.file.is_some());
         let file = config.logging.file.unwrap();
         assert_eq!(file.max_age_days, 14);
+
+        // App
+        assert!(!config.app.tray_enabled);
+    }
+
+    #[test]
+    fn test_embedded_default_yaml_parses() {
+        // The shipped `config.yaml` (embedded as DEFAULT_CONFIG_YAML) must
+        // round-trip through the strict deserializer.
+        let _: Config = serde_yaml_ng::from_str(DEFAULT_CONFIG_YAML)
+            .expect("embedded default config.yaml must parse");
     }
 }
