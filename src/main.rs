@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cli_dns_upstream = args.get(i).cloned();
             }
             "-h" | "--help" => {
-                print_usage(&args[0]);
+                print_usage();
                 return Ok(());
             }
             "-V" | "--version" => {
@@ -106,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                print_usage(&args[0]);
+                eprintln!("Try `bunker --help` for usage.");
                 std::process::exit(1);
             }
         }
@@ -681,73 +681,67 @@ fn derive_custom_allowlist(listen: SocketAddr) -> (Vec<String>, String) {
     )
 }
 
-fn print_usage(program: &str) {
-    eprintln!("Usage: {} [options]", program);
-    eprintln!();
-    eprintln!("Generic HTTP/HTTPS forward proxy with optional DNS server.");
-    eprintln!("Supports both IPv4 and IPv6.");
-    eprintln!();
-    eprintln!("Runtime: configuration is loaded from a YAML file. There are no CLI");
-    eprintln!("overrides at runtime — edit the file (or pass `-c <path>`) to change");
-    eprintln!("settings, then restart.");
-    eprintln!();
-    eprintln!("Runtime options:");
-    eprintln!("  -c, --config <path>     Load config from YAML file");
-    eprintln!("                          (default search order: ./config.yaml,");
-    eprintln!("                          ~/.bunker/config.yaml, <exe-dir>/config.yaml)");
-    eprintln!("  -h, --help              Show this help message");
-    eprintln!("  -V, --version           Print version and exit");
+fn print_usage() {
+    // Help text is the user's requested output, so it goes to stdout
+    // (matches --version, and works with `bunker --help | grep ...`).
+    // The program name is hard-coded as "bunker" — example lines are
+    // documentation, not a literal transcript of the invocation, and
+    // using argv[0] would render `./target/release/bunker` when run from
+    // a build tree.
+    println!("Usage: bunker [options]");
+    println!();
+    println!("Generic HTTP/HTTPS forward proxy with optional DNS server.");
+    println!("Supports both IPv4 and IPv6.");
+    println!();
+    println!("Runtime: configuration is loaded from a YAML file. There are no CLI");
+    println!("overrides at runtime — edit the file (or pass `-c <path>`) to change");
+    println!("settings, then restart.");
+    println!();
+    println!("Runtime options:");
+    println!("  -c, --config <path>     Load config from YAML file");
+    println!("                          (default search order: ./config.yaml,");
+    println!("                          ~/.bunker/config.yaml, <exe-dir>/config.yaml)");
+    println!("  -h, --help              Show this help message");
+    println!("  -V, --version           Print version and exit");
     #[cfg(windows)]
     {
-        eprintln!("  --install               Add to Windows startup");
-        eprintln!("  --uninstall             Remove from Windows startup");
+        println!("  --install               Add to Windows startup");
+        println!("  --uninstall             Remove from Windows startup");
     }
-    eprintln!();
-    eprintln!("Init: write a config file (refuses to overwrite an existing one).");
-    eprintln!();
-    eprintln!("Init options:");
-    eprintln!(
-        "  --init [mode]           Create config at ~/.bunker/config.yaml. Modes:"
+    println!();
+    println!("Init: write a config file (refuses to overwrite an existing one).");
+    println!();
+    println!("Init options:");
+    println!("  --init [mode]           Create config at ~/.bunker/config.yaml. Modes:");
+    println!("                            loopback  (default) bind 127.0.0.1; loopback allowlist");
+    println!("                            lan                 auto-discover LAN interface; bind");
+    println!("                                                to its IP; allowlist = its subnet");
+    println!("                            custom              requires --listen/--dns/");
+    println!("                                                --dns-upstream; allowlist derived");
+    println!("                                                from --listen address");
+    println!("  --listen <addr>         Proxy listen address (with --init only)");
+    println!("  --dns <addr>            DNS server listen address (with --init only)");
+    println!("  --dns-upstream <addr>   Upstream DNS server (with --init only)");
+    println!();
+    println!("Examples:");
+    println!("  bunker                                       # run with config file");
+    println!("  bunker -c /path/to/config.yaml               # run with explicit config");
+    println!("  bunker --init                                # write loopback default config");
+    println!("  bunker --init lan                            # auto-discover LAN interface");
+    println!(
+        "  bunker --init custom --listen 192.168.1.5:8080 --dns 192.168.1.5:53 --dns-upstream 9.9.9.9:53"
     );
-    eprintln!("                            loopback  (default) bind 127.0.0.1; loopback allowlist");
-    eprintln!("                            lan                 auto-discover LAN interface; bind");
-    eprintln!("                                                to its IP; allowlist = its subnet");
-    eprintln!("                            custom              requires --listen/--dns/");
-    eprintln!("                                                --dns-upstream; allowlist derived");
-    eprintln!("                                                from --listen address");
-    eprintln!("  --listen <addr>         Proxy listen address (with --init only)");
-    eprintln!("  --dns <addr>            DNS server listen address (with --init only)");
-    eprintln!("  --dns-upstream <addr>   Upstream DNS server (with --init only)");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  {}                                           # run with config file", program);
-    eprintln!("  {} -c /path/to/config.yaml                   # run with explicit config", program);
-    eprintln!("  {} --init                                    # write loopback default config", program);
-    eprintln!("  {} --init lan                                # auto-discover LAN interface", program);
-    eprintln!(
-        "  {} --init custom --listen 192.168.1.5:8080 --dns 192.168.1.5:53 --dns-upstream 9.9.9.9:53",
-        program
-    );
-    eprintln!();
-    eprintln!("Client usage:");
-    eprintln!("  curl -x http://proxy:8080 http://example.com");
-    eprintln!("  curl -x http://proxy:8080 https://example.com");
+    println!();
+    println!("Client usage:");
+    println!("  curl -x http://proxy:8080 http://example.com");
+    println!("  curl -x http://proxy:8080 https://example.com");
     #[cfg(windows)]
     {
-        eprintln!();
-        eprintln!("Windows startup examples:");
-        eprintln!(
-            "  {} --install                                 # add to Windows startup",
-            program
-        );
-        eprintln!(
-            "  {} --install -c config.yaml                  # add with explicit config",
-            program
-        );
-        eprintln!(
-            "  {} --uninstall                               # remove from Windows startup",
-            program
-        );
+        println!();
+        println!("Windows startup examples:");
+        println!("  bunker --install                             # add to Windows startup");
+        println!("  bunker --install -c config.yaml              # add with explicit config");
+        println!("  bunker --uninstall                           # remove from Windows startup");
     }
 }
 
