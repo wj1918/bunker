@@ -28,7 +28,7 @@ bunker -c C:\path\to\config.yaml
 
 At runtime, all configuration comes from the YAML file — there are no CLI overrides. To change the bind address, allowlist, or DNS settings, edit the file (or regenerate it with `bunker --init [mode] ...`) and restart.
 
-`bunker` searches for config in this order: `--config <path>` → `./config.yaml` → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml`. If none is found, bunker prints an error and exits — run `bunker --init` to create one.
+`bunker` loads config from `--config <path>` if given, otherwise from `%USERPROFILE%\.bunker\config.yaml`. If neither is present, bunker prints an error and exits — run `bunker --init` to create one.
 
 ---
 
@@ -190,7 +190,7 @@ To use a different config explicitly:
 bunker -c C:\path\to\config.yaml
 ```
 
-Search order: `--config <path>` → `./config.yaml` (CWD) → `%USERPROFILE%\.bunker\config.yaml` → `<exe-dir>\config.yaml`. If none is found, bunker errors out — run `bunker --init` to create one.
+Lookup: `--config <path>` if given, otherwise `%USERPROFILE%\.bunker\config.yaml`. If neither is present, bunker errors out — run `bunker --init` to create one.
 
 To run headless on Windows, set `app.tray_enabled: false` in your config file. There is no `--no-tray` runtime flag; runtime behavior is sourced from the YAML file only.
 
