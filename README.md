@@ -7,7 +7,7 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 - **HTTP Forward Proxy** - Proxy HTTP requests with connection pooling
 - **HTTPS Tunneling** - Transparent CONNECT tunneling for HTTPS/SSH/TLS traffic
 - **DNS Server** - Optional DNS forwarding with caching and failover
-- **Lightweight** - Single binary (~4.8 MB), minimal resource usage
+- **Lightweight** - Single binary, minimal resource usage
 - **Secure** - SSRF protection, rate limiting, IP allowlists
 - **Windows Optimized** - System tray icon, auto-start support
 
