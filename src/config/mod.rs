@@ -769,13 +769,6 @@ pub fn default_tray_enabled() -> bool {
 
 // ============== Config Loading ==============
 
-/// Get the directory containing the executable
-fn exe_dir() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-}
-
 /// Path to the per-user config: `<home>/.bunker/config.yaml`.
 /// Windows uses `%USERPROFILE%`, Unix uses `$HOME`.
 pub fn user_config_path() -> Option<PathBuf> {
@@ -795,22 +788,15 @@ pub fn user_config_path() -> Option<PathBuf> {
 /// Windows treats it as "skip log-dir prep", while the runtime entrypoint
 /// rejects it and tells the user to run `--init`.
 ///
-/// Search order when `path` is `None`: `./config.yaml`, the per-user
-/// config (`~/.bunker/config.yaml`), then `<exe-dir>/config.yaml`.
+/// Search order when `path` is `None`: just the per-user config
+/// (`~/.bunker/config.yaml`). With `-c <path>`, only that path is tried.
 pub fn load_config(
     path: Option<&str>,
 ) -> Result<Option<Config>, Box<dyn std::error::Error + Send + Sync>> {
-    let config_paths = if let Some(p) = path {
+    let config_paths: Vec<PathBuf> = if let Some(p) = path {
         vec![PathBuf::from(p)]
     } else {
-        let mut paths = vec![PathBuf::from("config.yaml")];
-        if let Some(p) = user_config_path() {
-            paths.push(p);
-        }
-        if let Some(dir) = exe_dir() {
-            paths.push(dir.join("config.yaml"));
-        }
-        paths
+        user_config_path().into_iter().collect()
     };
 
     for config_path in config_paths {
@@ -1106,18 +1092,10 @@ dns:
     }
 
     #[test]
-    fn test_exe_dir() {
-        let dir = exe_dir();
-        // Should return Some when running from a binary
-        assert!(dir.is_some());
-    }
-
-    #[test]
     fn test_load_config_default() {
-        // With None, load_config searches the standard locations. We only
-        // assert it doesn't error — the result can be Some or None depending
-        // on whether the test runner happens to be sitting next to a
-        // `config.yaml` (the project root does ship one).
+        // With None, load_config only checks ~/.bunker/config.yaml. We assert
+        // it doesn't error — the result can be Some or None depending on
+        // whether the test runner happens to have that file.
         let result = load_config(None);
         assert!(result.is_ok());
     }

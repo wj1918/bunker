@@ -152,15 +152,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(c) => c,
         None => {
             eprintln!("Error: no config file found.");
-            eprintln!("Searched (in order):");
+            eprintln!("Searched:");
             if let Some(p) = config_path {
                 eprintln!("  {}", p);
+            } else if let Some(p) = user_config_path() {
+                eprintln!("  {}", p.display());
             } else {
-                eprintln!("  ./config.yaml");
-                if let Some(p) = user_config_path() {
-                    eprintln!("  {}", p.display());
-                }
-                eprintln!("  <exe-dir>/config.yaml");
+                eprintln!("  ~/.bunker/config.yaml (HOME/USERPROFILE not set)");
             }
             eprintln!("Run 'bunker --init' to create one.");
             std::process::exit(1);
@@ -697,8 +695,7 @@ fn print_usage() {
     println!();
     println!("Runtime options:");
     println!("  -c, --config <path>     Load config from YAML file");
-    println!("                          (default search order: ./config.yaml,");
-    println!("                          ~/.bunker/config.yaml, <exe-dir>/config.yaml)");
+    println!("                          (default: ~/.bunker/config.yaml)");
     println!("  -h, --help              Show this help message");
     println!("  -V, --version           Print version and exit");
     #[cfg(windows)]
