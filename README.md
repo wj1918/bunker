@@ -96,7 +96,28 @@ copy target\release\bunker.exe C:\Bunker\
 
 ### Step 2: Configure `config.yaml`
 
-Run `bunker --init` once to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template, then edit it:
+Run `bunker --init [mode]` once to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template, choosing the mode that matches how you'll reach the proxy:
+
+| Mode | Command | `listen` written | `allowed_source_ips` written |
+| --- | --- | --- | --- |
+| `loopback` (default) | `bunker --init` | `127.0.0.1:8080` | `127.0.0.1`, `::1` |
+| `lan` | `bunker --init lan` | auto-discovered LAN IP | that interface's `/24` (or actual mask) |
+| `custom` | `bunker --init custom --listen <ip>:8080 --dns <ip>:53 --dns-upstream <ip>:53` | from `--listen` | derived from `--listen` (see below) |
+
+**When to pick each:**
+- **`loopback`** — only this machine connects to the proxy (CLI tools, local dev). Safest default.
+- **`lan`** — other LAN clients connect. Requires exactly one RFC 1918 Ethernet interface; errors out on multi-NIC or Wi-Fi-only hosts. Use `custom` instead.
+- **`custom`** — any non-trivial deployment: Wi-Fi-only host, multiple NICs, Tailscale/VPN clients, or wildcard bind (`0.0.0.0`). All three flags are required.
+
+**Allowlist derivation for `--init custom`** (from `src/main.rs:618`):
+- `--listen 0.0.0.0:8080` → union of every detected LAN subnet (loopback excluded).
+- `--listen 127.0.0.1:8080` → loopback-only allowlist.
+- `--listen <ip>` matches an interface → that interface's CIDR.
+- `--listen <ip>` doesn't match → assumed `/24` around that IP; **narrow or widen by hand** before serving traffic.
+
+**`--init` refuses to overwrite an existing file.** Delete or move `~/.bunker/config.yaml` first if you want to re-run it.
+
+After `--init`, open the file and review/edit. A typical LAN deployment ends up looking like:
 
 ```yaml
 # Proxy server
@@ -108,7 +129,9 @@ proxy:
 
   security:
     block_private_ips: true
-    # Restrict access to your LAN clients only
+    # Restrict access to your LAN clients only.
+    # Add other CIDRs (e.g. "100.64.0.0/10" for Tailscale)
+    # if clients connect from outside the LAN subnet.
     allowed_source_ips:
       - "192.168.1.0/24"
     rate_limit:
@@ -116,6 +139,8 @@ proxy:
       max_requests: 1000
       window_seconds: 60
     max_connections: 1000
+    # Raise above 30 if you tunnel over high-latency links
+    # and see slowloris-style timeouts on legitimate POSTs.
     header_read_timeout_seconds: 30
 
   connection_pool:
@@ -145,6 +170,7 @@ logging:
   log_requests: true
   format: text
   redact_sensitive_headers: true
+  # Create the log_dir before first run: New-Item -ItemType Directory C:\Bunker\logs -Force
   file:
     log_dir: "C:\\Bunker\\logs"
     rotation: daily
