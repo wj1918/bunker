@@ -1,4 +1,6 @@
-# Bunker
+<h1 align="center">
+  <img src="docs/avatar-128.png" alt="" height="40" valign="middle"> Bunker
+</h1>
 
 A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust.
 
@@ -13,9 +15,8 @@ A lightweight HTTP/HTTPS forward proxy with built-in DNS server, written in Rust
 
 ## Quick Start
 
-After installing, create a default config and run:
-
 ```powershell
+winget install bunker
 bunker --init     # writes %USERPROFILE%\.bunker\config.yaml
 bunker            # auto-loads %USERPROFILE%\.bunker\config.yaml
 ```
