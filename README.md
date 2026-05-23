@@ -435,9 +435,9 @@ ssh -vvv -o ProxyCommand="nc -X connect -x 192.168.1.1:8080 %h %p" git@github.co
 ```
 Linux Clients                     Windows Server (Bunker)
 ─────────────                     ───────────────────────
-                                  ┌─────────────────────────────────┐
-┌─────────┐                       │         Bunker Proxy            │
-│ Browser │──HTTP/HTTPS──────────►│                                 │
+                                  ┌────────────────────────────────┐
+┌─────────┐                       │         Bunker Proxy           │
+│ Browser │──HTTP/HTTPS──────────►│                                │
 │  curl   │                       │  ┌──────────┐   ┌───────────┐  │
 │  wget   │                       │  │ Security │──►│   HTTP    │──┼──► Internet
 └─────────┘                       │  │  Layer   │   │  Handler  │  │
@@ -452,7 +452,7 @@ Linux Clients                     Windows Server (Bunker)
 │(resolv) │                       │  │  Cache   │◄─►│    DNS    │──┼──► Upstream
 └─────────┘                       │  │  (TTL)   │   │  Server   │  │     DNS
                                   │  └──────────┘   └───────────┘  │
-                                  └─────────────────────────────────┘
+                                  └────────────────────────────────┘
 ```
 
 ---
