@@ -475,6 +475,100 @@ cargo check              # Syntax check only
 
 ---
 
+## Typical Usage
+
+Two deployment patterns make the most of Bunker. Both treat the proxy as the **only** path out of an isolated network: clients have no default gateway, so any non-proxied traffic simply has nowhere to go. This gives you a hard egress boundary at L3 without writing firewall rules.
+
+### 1. Back-to-back network
+
+A *back-to-back* topology is two hosts wired directly to each other — one cable, no switch, no router in between. Historically this needed a crossover cable; modern NICs auto-negotiate (Auto-MDIX), so any straight patch cable works. The Bunker host has two NICs: one facing the client, the other facing your normal LAN / internet uplink.
+
+The client gets a static IP in the back-to-back subnet, points its proxy and DNS at Bunker, and **omits the default gateway**. The only way off the client is through the proxy.
+
+```
+┌──────────────┐                       ┌────────────────────────────┐                       ┌──────────────┐
+│              │  eth0  (direct link)  │   Windows Host (Bunker)    │   eth1    (LAN)       │              │
+│   Client     │ ◄────────────────────►│                            │ ◄────────────────────►│ LAN Router / │
+│              │    192.168.50.0/24    │   eth0: 192.168.50.1       │    192.168.1.0/24     │   Internet   │
+│ 192.168.50.2 │                       │   eth1: 192.168.1.50       │                       │              │
+│              │                       │                            │                       │              │
+│ gateway:     │                       │   proxy: 192.168.50.1:8080 │                       │              │
+│   (none)     │                       │   dns:   192.168.50.1:53   │                       │              │
+│ dns:         │                       │                            │                       │              │
+│ 192.168.50.1 │                       │   IP forwarding: OFF       │                       │              │
+└──────────────┘                       └────────────────────────────┘                       └──────────────┘
+```
+
+**Why no default gateway:** if the client had a `0.0.0.0/0` route via Bunker, traffic could leak out by IP without ever touching the proxy. With no gateway, the only reachable host is `192.168.50.1` itself, and the only useful ports on it are `8080` (HTTP/HTTPS/CONNECT) and `53` (DNS).
+
+**Bunker `~/.bunker/config.yaml` (excerpt):**
+
+```yaml
+proxy:
+  listen: "192.168.50.1:8080"
+  security:
+    allowed_source_ips:
+      - "192.168.50.0/24"
+dns:
+  listen: "192.168.50.1:53"
+  upstreams:
+    - "8.8.8.8:53"
+    - "1.1.1.1:53"
+```
+
+**Do not enable Windows IP forwarding** on the Bunker host — `Get-NetIPInterface | Where-Object Forwarding -eq Enabled` should return nothing. If you turn it on, the client could route to the upstream LAN directly and bypass the proxy entirely.
+
+### 2. Home lab or small office (isolated zone)
+
+Same idea, but the isolated side is a whole subnet behind an L2 switch — multiple PCs, Raspberry Pis, IoT devices, build agents — instead of a single back-to-back cable. The Bunker host sits between the isolated VLAN/switch and your main LAN.
+
+```
+┌─────────────────────────────────────────┐                      ┌────────────────────────────┐                       ┌──────────────┐
+│      Isolated Zone (no gateway)         │                      │   Windows Host (Bunker)    │                       │              │
+│      192.168.50.0/24                    │                      │                            │   eth1 (uplink)       │  LAN Router  │
+│                                         │   eth0  (lab NIC)    │   eth0: 192.168.50.1       │ ◄────────────────────►│      /       │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  │ ◄────── L2 switch ──►│   eth1: 192.168.1.50       │    192.168.1.0/24     │   Internet   │
+│  │ Lab PC  │  │ Lab Pi  │  │  IoT /  │  │                      │                            │                       │              │
+│  │ .50.10  │  │ .50.20  │  │  .50.30 │  │                      │   proxy: 192.168.50.1:8080 │                       │              │
+│  └─────────┘  └─────────┘  └─────────┘  │                      │   dns:   192.168.50.1:53   │                       │              │
+│                                         │                      │                            │                       │              │
+│  every client:                          │                      │   IP forwarding: OFF       │                       │              │
+│    gateway = (none)                     │                      │                            │                       │              │
+│    dns     = 192.168.50.1               │                      │                            │                       │              │
+│    proxy   = 192.168.50.1:8080          │                      │                            │                       │              │
+└─────────────────────────────────────────┘                      └────────────────────────────┘                       └──────────────┘
+```
+
+The isolated zone is a separate broadcast domain: a dedicated unmanaged switch, or one VLAN on a managed switch. Either run no DHCP server on that segment (static addressing) or hand out leases with DHCP option 3 (router) omitted — the *absence* of a default gateway is what does the work.
+
+**Why this layout:**
+- **Lab / IoT containment** — noisy or untrusted devices can still reach package mirrors, Git, container registries, and DNS, but only via Bunker, which logs every request and enforces the allowlist plus rate limit.
+- **No accidental WAN exposure** — devices without a default route can't be reached by, and can't reach, anything off the isolated subnet directly. The only listener that talks to both sides is Bunker.
+- **Auditable egress** — with `logging.log_requests: true`, every CONNECT and HTTP request from the zone lands in `C:\Bunker\logs\`.
+
+**Bunker `~/.bunker/config.yaml` (excerpt):**
+
+```yaml
+proxy:
+  listen: "192.168.50.1:8080"
+  security:
+    allowed_source_ips:
+      - "192.168.50.0/24"
+    rate_limit:
+      enabled: true
+      max_requests: 1000
+      window_seconds: 60
+dns:
+  listen: "192.168.50.1:53"
+  upstreams:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+```
+
+Same warning as above: **do not enable Windows IP forwarding** on the Bunker host. Bunker is the bridge; the IP stack is not.
+
+---
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
