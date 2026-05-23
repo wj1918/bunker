@@ -457,24 +457,6 @@ Linux Clients                     Windows Server (Bunker)
 
 ---
 
-## Building
-
-### Requirements
-
-- Rust 1.70+
-- Windows: MSVC toolchain
-
-### Commands
-
-```powershell
-cargo build --release    # Release build
-cargo build              # Debug build
-cargo test               # Run tests
-cargo check              # Syntax check only
-```
-
----
-
 ## Typical Usage
 
 Two deployment patterns make the most of Bunker. Both treat the proxy as the **only** path out of an isolated network: clients have no default gateway, so any non-proxied traffic simply has nowhere to go. This gives you a hard egress boundary at L3 without writing firewall rules.
@@ -487,10 +469,10 @@ The client gets a static IP in the back-to-back subnet, points its proxy and DNS
 
 ```
 ┌──────────────┐                       ┌────────────────────────────┐                       ┌──────────────┐
-│              │  eth0  (direct link)  │   Windows Host (Bunker)    │   eth1    (LAN)       │              │
+│              │  eth0  (direct link)  │   Windows Host (Bunker)    │  uplink (LAN/Wi-Fi)   │              │
 │   Client     │ ◄────────────────────►│                            │ ◄────────────────────►│ LAN Router / │
-│              │    192.168.50.0/24    │   eth0: 192.168.50.1       │    192.168.1.0/24     │   Internet   │
-│ 192.168.50.2 │                       │   eth1: 192.168.1.50       │                       │              │
+│              │    192.168.50.0/24    │   eth0:    192.168.50.1    │    192.168.1.0/24     │   Internet   │
+│ 192.168.50.2 │                       │   uplink:  192.168.1.50    │                       │              │
 │              │                       │                            │                       │              │
 │ gateway:     │                       │   proxy: 192.168.50.1:8080 │                       │              │
 │   (none)     │                       │   dns:   192.168.50.1:53   │                       │              │
@@ -525,9 +507,9 @@ Same idea, but the isolated side is a whole subnet behind an L2 switch — multi
 ```
 ┌─────────────────────────────────────────┐                      ┌────────────────────────────┐                       ┌──────────────┐
 │      Isolated Zone (no gateway)         │                      │   Windows Host (Bunker)    │                       │              │
-│      192.168.50.0/24                    │                      │                            │   eth1 (uplink)       │  LAN Router  │
-│                                         │   eth0  (lab NIC)    │   eth0: 192.168.50.1       │ ◄────────────────────►│      /       │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  │ ◄────── L2 switch ──►│   eth1: 192.168.1.50       │    192.168.1.0/24     │   Internet   │
+│      192.168.50.0/24                    │                      │                            │  uplink (LAN/Wi-Fi)   │  LAN Router  │
+│                                         │   eth0  (lab NIC)    │   eth0:    192.168.50.1    │ ◄────────────────────►│      /       │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  │ ◄────── L2 switch ──►│   uplink:  192.168.1.50    │    192.168.1.0/24     │   Internet   │
 │  │ Lab PC  │  │ Lab Pi  │  │  IoT /  │  │                      │                            │                       │              │
 │  │ .50.10  │  │ .50.20  │  │  .50.30 │  │                      │   proxy: 192.168.50.1:8080 │                       │              │
 │  └─────────┘  └─────────┘  └─────────┘  │                      │   dns:   192.168.50.1:53   │                       │              │
@@ -566,6 +548,24 @@ dns:
 ```
 
 Same warning as above: **do not enable Windows IP forwarding** on the Bunker host. Bunker is the bridge; the IP stack is not.
+
+---
+
+## Building
+
+### Requirements
+
+- Rust 1.70+
+- Windows: MSVC toolchain
+
+### Commands
+
+```powershell
+cargo build --release    # Release build
+cargo build              # Debug build
+cargo test               # Run tests
+cargo check              # Syntax check only
+```
 
 ---
 
