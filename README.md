@@ -26,7 +26,7 @@ bunker            # auto-loads %USERPROFILE%\.bunker\config.yaml
 The config in `%USERPROFILE%\.bunker\` lives outside any package-managed directory, so it survives `winget upgrade` and `scoop update`. You can also point at any other config file:
 
 ```powershell
-bunker -c C:\path\to\config.yaml
+bunker --config C:\path\to\config.yaml
 ```
 
 At runtime, all configuration comes from the YAML file — there are no CLI overrides. To change the bind address, allowlist, or DNS settings, edit the file (or regenerate it with `bunker --init [mode] ...`) and restart.
@@ -216,7 +216,7 @@ bunker
 To use a different config explicitly:
 
 ```powershell
-bunker -c C:\path\to\config.yaml
+bunker --config C:\path\to\config.yaml
 ```
 
 Lookup: `--config <path>` if given, otherwise `%USERPROFILE%\.bunker\config.yaml`. If neither is present, bunker errors out — run `bunker --init` to create one.
