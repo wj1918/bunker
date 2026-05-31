@@ -1,0 +1,424 @@
+# Verify Bunker install paths: Scoop, winget, GitHub Releases zip, Scoop-Extras submission dry-run
+# Run: powershell -ExecutionPolicy Bypass -File scripts\test-install.ps1
+
+$ErrorActionPreference = "Continue"
+$failed = 0
+$passed = 0
+
+function Test-Step {
+    param([string]$Name, [scriptblock]$Block)
+    Write-Host "`n--- $Name ---" -ForegroundColor Cyan
+    try {
+        & $Block
+        Write-Host "PASS: $Name" -ForegroundColor Green
+        $script:passed++
+    } catch {
+        Write-Host "FAIL: $Name - $_" -ForegroundColor Red
+        $script:failed++
+    }
+}
+
+# Capture both stdout and stderr as plain text
+function Invoke-Cmd {
+    param([string]$Cmd)
+    $output = cmd /c "$Cmd 2>&1"
+    return ($output | Out-String)
+}
+
+# Backup any existing %USERPROFILE%\.bunker\config.yaml around tests that touch --init,
+# so we never clobber a real user config.
+function Backup-UserConfig {
+    param([scriptblock]$Block)
+    $cfg = "$env:USERPROFILE\.bunker\config.yaml"
+    $backup = "$cfg.test-backup"
+    $hadBackup = $false
+    if (Test-Path $cfg) {
+        Move-Item $cfg $backup -Force
+        $hadBackup = $true
+    }
+    try {
+        & $Block
+    } finally {
+        if (Test-Path $cfg) { Remove-Item $cfg -Force }
+        if ($hadBackup -and (Test-Path $backup)) { Move-Item $backup $cfg -Force }
+    }
+}
+
+# Ensure scoop is in PATH
+$env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+
+# Update Windows Defender definitions to latest
+Write-Host "Updating Windows Defender definitions..." -ForegroundColor Yellow
+& "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate -MMPC 2>$null
+$status = Get-MpComputerStatus
+$sigAge = ((Get-Date) - $status.AntivirusSignatureLastUpdated).TotalHours
+Write-Host "Defender version: $($status.AntivirusSignatureVersion) (updated $([math]::Round($sigAge, 1))h ago)" -ForegroundColor Cyan
+if ($sigAge -gt 24) {
+    Write-Host "WARNING: Defender definitions are over 24h old!" -ForegroundColor Red
+}
+
+# Clean up any previous install
+Write-Host "Cleaning up previous install..." -ForegroundColor Yellow
+scoop uninstall bunker 2>$null
+scoop bucket rm bunker 2>$null
+scoop cache rm bunker 2>$null
+winget uninstall bunker --silent 2>$null | Out-Null
+
+Test-Step "Add bucket" {
+    $output = Invoke-Cmd "scoop bucket add bunker https://github.com/wj1918/bunker"
+    if ($output -notmatch "added successfully") { throw "Unexpected: $output" }
+}
+
+Test-Step "Install from local manifest" {
+    $manifest = (Resolve-Path "$PSScriptRoot\..\bucket\bunker.json").Path
+    $output = Invoke-Cmd "scoop install `"$manifest`""
+    if ($output -notmatch "installed successfully") { throw "Install failed: $output" }
+    if ($output -notmatch "ok\.") { throw "Hash check not confirmed: $output" }
+}
+
+Test-Step "Files present" {
+    $prefix = (scoop prefix bunker).Trim()
+    $expected = @("bunker.exe", "README.md")
+    foreach ($file in $expected) {
+        if (-not (Test-Path "$prefix\$file")) { throw "$file missing from $prefix" }
+    }
+}
+
+Test-Step "Shim exists" {
+    $shim = "$env:USERPROFILE\scoop\shims\bunker.exe"
+    if (-not (Test-Path $shim)) { throw "Shim not found at $shim" }
+}
+
+Test-Step "bunker --help" {
+    $output = Invoke-Cmd "bunker --help"
+    if ($output -notmatch "--config") { throw "Missing --config in help" }
+    if ($output -notmatch "--init") { throw "Missing --init in help" }
+}
+
+Test-Step "bunker --init writes to user dir" {
+    Backup-UserConfig {
+        $cfg = "$env:USERPROFILE\.bunker\config.yaml"
+        $output = Invoke-Cmd "bunker --init"
+        if ($output -notmatch [regex]::Escape($cfg)) {
+            throw "--init output did not reference $cfg. Output: $output"
+        }
+        if (-not (Test-Path $cfg)) { throw "Config file not created at $cfg" }
+        $content = Get-Content $cfg -Raw
+        if ($content -notmatch "block_private_ips") { throw "Invalid config content (missing block_private_ips - v0.1.2 shape)" }
+    }
+}
+
+Test-Step "Config auto-detection from user dir" {
+    Backup-UserConfig {
+        # Seed user-dir config via --init
+        Invoke-Cmd "bunker --init" | Out-Null
+        $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
+        New-Item -ItemType Directory -Path $testDir | Out-Null
+        Push-Location $testDir
+        try {
+            # Start bunker with no flags from a CWD that has no config.yaml;
+            # it should pick up %USERPROFILE%\.bunker\config.yaml.
+            $outFile = Join-Path $env:TEMP "bunker-test-output-$(Get-Random).txt"
+            $proc = Start-Process -FilePath "bunker" -RedirectStandardError $outFile -WindowStyle Hidden -PassThru
+            Start-Sleep -Seconds 3
+            if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force 2>$null }
+            $output = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
+            Remove-Item $outFile -Force 2>$null
+            if ($output -notmatch "Loading config from:.*\.bunker\\config\.yaml") {
+                throw "Config not auto-detected from user dir. Output: $output"
+            }
+        } finally {
+            Pop-Location
+            Remove-Item -Recurse -Force $testDir 2>$null
+        }
+    }
+}
+
+Test-Step "bunker --install from temp dir" {
+    $testDir = Join-Path $env:TEMP "bunker-test-$(Get-Random)"
+    New-Item -ItemType Directory -Path $testDir | Out-Null
+    Push-Location $testDir
+    try {
+        $output = Invoke-Cmd "bunker --install"
+        if ($output -notmatch "added to Windows startup") { throw "Install failed: $output" }
+        $reg = Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
+        $val = $reg.Bunker
+        $prefix = (scoop prefix bunker).Trim()
+        if ($val -notmatch [regex]::Escape($prefix)) {
+            throw "Registry should use app dir ($prefix), got: $val"
+        }
+    } finally {
+        Pop-Location
+        Remove-Item -Recurse -Force $testDir 2>$null
+    }
+}
+
+Test-Step "bunker --uninstall" {
+    $output = Invoke-Cmd "bunker --uninstall"
+    if ($output -notmatch "removed from Windows startup") { throw "Uninstall failed: $output" }
+    try {
+        Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "Bunker" -ErrorAction Stop
+        throw "Registry entry still exists after uninstall"
+    } catch [System.Management.Automation.PSArgumentException] {
+        # Expected - key doesn't exist
+    }
+}
+
+Test-Step "Version matches release" {
+    $info = Invoke-Cmd "scoop info bunker"
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $version = $release -replace '^v', ''
+    if ($info -notmatch [regex]::Escape($version)) {
+        throw "Version $version not found in scoop info"
+    }
+}
+
+Test-Step "Code signature valid" {
+    $prefix = (scoop prefix bunker).Trim()
+    $sig = Get-AuthenticodeSignature "$prefix\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    $subject = $sig.SignerCertificate.Subject
+    if ($subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $subject" }
+    $issuer = $sig.SignerCertificate.Issuer
+    if ($issuer -notmatch "Microsoft") { throw "Unexpected issuer: $issuer" }
+}
+
+Test-Step "SmartScreen trusted" {
+    $prefix = (scoop prefix bunker).Trim()
+    $sig = Get-AuthenticodeSignature "$prefix\bunker.exe"
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") {
+        throw "Not Microsoft-issued cert - SmartScreen may warn. Issuer: $($sig.SignerCertificate.Issuer)"
+    }
+    if ($sig.TimeStamperCertificate -eq $null) {
+        throw "No timestamp - signature will expire with cert"
+    }
+}
+
+Test-Step "Windows Defender scan" {
+    $prefix = (scoop prefix bunker).Trim()
+    $exe = "$prefix\bunker.exe"
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File $exe 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
+}
+
+Test-Step "SHA256 matches release" {
+    $prefix = (scoop prefix bunker).Trim()
+    $manifest = Get-Content "$prefix\manifest.json" | ConvertFrom-Json
+    $manifestHash = $manifest.architecture.'64bit'.hash
+    $version = $manifest.version
+
+    $sums = (gh release download "v$version" --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $releaseHash = ($sums.Trim() -split '\s+')[0]
+
+    if ($manifestHash -ne $releaseHash) {
+        throw "Hash mismatch: manifest=$manifestHash release=$releaseHash (v$version)"
+    }
+}
+
+Test-Step "Checkver detects version" {
+    $scoopDir = (scoop prefix scoop).Trim()
+    $output = Invoke-Cmd "powershell -ExecutionPolicy Bypass -File `"$scoopDir\bin\checkver.ps1`" bunker -Dir `"$PSScriptRoot\..\bucket`""
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim() -replace '^v', ''
+    if ($output -notmatch [regex]::Escape($release)) {
+        throw "checkver did not detect version $release. Output: $output"
+    }
+}
+
+Test-Step "Autoupdate computes hash" {
+    $scoopDir = (scoop prefix scoop).Trim()
+    $output = Invoke-Cmd "powershell -ExecutionPolicy Bypass -File `"$scoopDir\bin\checkver.ps1`" bunker -Dir `"$PSScriptRoot\..\bucket`" -ForceUpdate"
+    if ($output -notmatch "Autoupdating bunker") { throw "Autoupdate did not trigger. Output: $output" }
+    if ($output -notmatch "Found:.*using") { throw "Hash not computed. Output: $output" }
+    # Verify the hash in updated manifest matches release
+    $manifest = Get-Content "$PSScriptRoot\..\bucket\bunker.json" | ConvertFrom-Json
+    $manifestHash = $manifest.architecture.'64bit'.hash
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $sums = (gh release download $release --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $releaseHash = ($sums.Trim() -split '\s+')[0]
+    if ($manifestHash -ne $releaseHash) {
+        throw "Autoupdate hash mismatch: manifest=$manifestHash release=$releaseHash"
+    }
+}
+
+Test-Step "Scoop uninstall" {
+    $output = Invoke-Cmd "scoop uninstall bunker"
+    if ($output -notmatch "was uninstalled") { throw "Uninstall failed: $output" }
+    if (Test-Path "$env:USERPROFILE\scoop\apps\bunker\current") { throw "App dir still exists" }
+}
+
+# --- Option B: winget install ---
+Write-Host "`n=== Option B: winget ===" -ForegroundColor Yellow
+$wingetManifestDir = "$PSScriptRoot\..\winget\manifests"
+
+Test-Step "Winget validate manifest" {
+    if (-not (Test-Path $wingetManifestDir)) { throw "Manifest dir not found: $wingetManifestDir" }
+    $output = winget validate $wingetManifestDir 2>&1 | Out-String
+    if ($output -notmatch "succeeded") { throw "Validation failed: $output" }
+}
+
+# Install via the public moniker (same path real users take). The local-manifest
+# install path was dropped because winget's IAttachmentExecute MOTW step hangs
+# on some hosts; `winget validate` above already covers manifest schema.
+Test-Step "Winget install via moniker" {
+    $output = winget install bunker --accept-source-agreements 2>&1 | Out-String
+    if ($output -notmatch "Successfully installed") { throw "Install failed: $output" }
+}
+
+$wingetPkgDir = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+$wingetBunkerDir = Get-ChildItem $wingetPkgDir -Directory -Filter "Bunker*" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+Test-Step "Winget files present" {
+    if (-not $wingetBunkerDir) { throw "Bunker package dir not found in $wingetPkgDir" }
+    $expected = @("bunker.exe", "README.md")
+    foreach ($file in $expected) {
+        if (-not (Test-Path "$($wingetBunkerDir.FullName)\$file")) { throw "$file missing from $($wingetBunkerDir.FullName)" }
+    }
+}
+
+Test-Step "Winget bunker --help" {
+    $output = cmd /c "$($wingetBunkerDir.FullName)\bunker.exe --help 2>&1" | Out-String
+    if ($output -notmatch "--config") { throw "Missing --config in help" }
+}
+
+Test-Step "Winget bunker --init writes to user dir" {
+    Backup-UserConfig {
+        $cfg = "$env:USERPROFILE\.bunker\config.yaml"
+        $output = cmd /c "$($wingetBunkerDir.FullName)\bunker.exe --init 2>&1" | Out-String
+        if ($output -notmatch [regex]::Escape($cfg)) {
+            throw "--init output did not reference $cfg. Output: $output"
+        }
+        if (-not (Test-Path $cfg)) { throw "Config file not created at $cfg" }
+    }
+}
+
+Test-Step "Winget code signature valid" {
+    $sig = Get-AuthenticodeSignature "$($wingetBunkerDir.FullName)\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    if ($sig.SignerCertificate.Subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $($sig.SignerCertificate.Subject)" }
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") { throw "Unexpected issuer: $($sig.SignerCertificate.Issuer)" }
+}
+
+Test-Step "Winget Defender scan" {
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$($wingetBunkerDir.FullName)\bunker.exe" 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
+}
+
+Test-Step "Winget uninstall" {
+    $output = winget uninstall bunker 2>&1 | Out-String
+    if ($output -notmatch "Successfully uninstalled") { throw "Uninstall failed: $output" }
+}
+
+# --- Option C: GitHub Releases download ---
+Write-Host "`n=== Option C: GitHub Releases ===" -ForegroundColor Yellow
+$bunkerDir = "C:\Bunker"
+if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
+
+Test-Step "Download release zip" {
+    New-Item -ItemType Directory -Path $bunkerDir | Out-Null
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $url = "https://github.com/wj1918/bunker/releases/download/$release/bunker-$release-x86_64-pc-windows-msvc.zip"
+    Invoke-WebRequest -Uri $url -OutFile "$bunkerDir\bunker.zip"
+    if (-not (Test-Path "$bunkerDir\bunker.zip")) { throw "Download failed" }
+}
+
+Test-Step "Release SHA256 matches" {
+    $hash = (Get-FileHash "$bunkerDir\bunker.zip" -Algorithm SHA256).Hash
+    $release = (gh release view --json tagName --jq '.tagName' 2>$null).Trim()
+    $sums = (gh release download $release --pattern "SHA256SUMS.txt" --output - 2>$null) | Out-String
+    $releaseHash = ($sums.Trim() -split '\s+')[0]
+    if ($hash -ne $releaseHash) { throw "Hash mismatch: download=$hash release=$releaseHash" }
+}
+
+Test-Step "Extract zip" {
+    Expand-Archive "$bunkerDir\bunker.zip" -DestinationPath $bunkerDir
+    Remove-Item "$bunkerDir\bunker.zip"
+    $expected = @("bunker.exe", "README.md")
+    foreach ($file in $expected) {
+        if (-not (Test-Path "$bunkerDir\$file")) { throw "$file missing from $bunkerDir" }
+    }
+}
+
+Test-Step "Release code signature valid" {
+    $sig = Get-AuthenticodeSignature "$bunkerDir\bunker.exe"
+    if ($sig.Status -ne "Valid") { throw "Signature status: $($sig.Status) - $($sig.StatusMessage)" }
+    if ($sig.SignerCertificate.Subject -notmatch "O=Jun Wang") { throw "Unexpected signer: $($sig.SignerCertificate.Subject)" }
+}
+
+Test-Step "Release SmartScreen trusted" {
+    $sig = Get-AuthenticodeSignature "$bunkerDir\bunker.exe"
+    if ($sig.SignerCertificate.Issuer -notmatch "Microsoft") {
+        throw "Not Microsoft-issued cert. Issuer: $($sig.SignerCertificate.Issuer)"
+    }
+    if ($sig.TimeStamperCertificate -eq $null) {
+        throw "No timestamp - signature will expire with cert"
+    }
+}
+
+Test-Step "Release bunker --help" {
+    $output = cmd /c "$bunkerDir\bunker.exe --help 2>&1" | Out-String
+    if ($output -notmatch "--config") { throw "Missing --config in help" }
+}
+
+Test-Step "Release Defender scan" {
+    $output = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$bunkerDir\bunker.exe" 2>&1 | Out-String
+    if ($output -notmatch "found no threats") { throw "Defender flagged bunker.exe: $output" }
+}
+
+# Clean up Option C
+if (Test-Path $bunkerDir) { Remove-Item -Recurse -Force $bunkerDir }
+
+# --- Option D: Scoop Extras workflow dry run ---
+Write-Host "`n=== Option D: Scoop Extras dry run ===" -ForegroundColor Yellow
+
+Test-Step "Sync fork with upstream" {
+    $output = Invoke-Cmd "gh repo sync wj1918/Extras --source ScoopInstaller/Extras --force"
+    if ($LASTEXITCODE -ne 0) { throw "Fork sync failed: $output" }
+}
+
+Test-Step "Clone fork" {
+    $script:extrasDir = Join-Path $env:TEMP "extras-dryrun-$(Get-Random)"
+    $output = Invoke-Cmd "git clone --depth 1 https://github.com/wj1918/Extras.git `"$script:extrasDir`""
+    if (-not (Test-Path "$script:extrasDir\bucket")) { throw "Clone failed: $output" }
+}
+
+Test-Step "Copy manifest to Extras" {
+    Copy-Item "$PSScriptRoot\..\bucket\bunker.json" "$script:extrasDir\bucket\bunker.json"
+    if (-not (Test-Path "$script:extrasDir\bucket\bunker.json")) { throw "Copy failed" }
+}
+
+Test-Step "No name conflict in Extras" {
+    $existing = Invoke-Cmd "git -C `"$script:extrasDir`" log --oneline --all -- bucket/bunker.json"
+    if ($existing.Trim()) { throw "bunker.json already exists in Extras history: $existing" }
+}
+
+Test-Step "Manifest valid JSON" {
+    $manifest = Get-Content "$script:extrasDir\bucket\bunker.json" -Raw | ConvertFrom-Json
+    if (-not $manifest.version) { throw "Missing version" }
+    if (-not $manifest.description) { throw "Missing description" }
+    if (-not $manifest.homepage) { throw "Missing homepage" }
+    if (-not $manifest.license) { throw "Missing license" }
+    if (-not $manifest.architecture) { throw "Missing architecture" }
+    if (-not $manifest.checkver) { throw "Missing checkver" }
+    if (-not $manifest.autoupdate) { throw "Missing autoupdate" }
+}
+
+Test-Step "Branch and commit (dry run)" {
+    Push-Location $script:extrasDir
+    git config user.name "test" 2>$null
+    git config user.email "test@test.com" 2>$null
+    git checkout -b "bunker-test" 2>$null
+    git add bucket/bunker.json 2>$null
+    $output = Invoke-Cmd "git commit --dry-run -m `"bunker: Add version test`""
+    if ($output -notmatch "bucket/bunker.json") { throw "Dry run commit failed: $output" }
+    Pop-Location
+}
+
+# Clean up dry run
+if ($script:extrasDir -and (Test-Path $script:extrasDir)) { Remove-Item -Recurse -Force $script:extrasDir }
+
+# Summary
+Write-Host "`n=============================" -ForegroundColor White
+Write-Host "Results: $passed passed, $failed failed" -ForegroundColor $(if ($failed -eq 0) { "Green" } else { "Red" })
+Write-Host "=============================" -ForegroundColor White
+
+exit $failed

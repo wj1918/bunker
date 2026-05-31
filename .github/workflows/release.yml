@@ -1,0 +1,318 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to submit (e.g. 0.1.0)'
+        required: true
+      dry_run:
+        description: 'Dry run winget submission (skip PR creation)'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Windows
+    if: ${{ github.event_name == 'push' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Sign with Azure Trusted Signing
+        uses: azure/trusted-signing-action@v0.5.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: target/x86_64-pc-windows-msvc/release
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Update README version
+        shell: pwsh
+        run: |
+          (Get-Content README.md) -replace '\$VERSION = "v[^"]*"', "`$VERSION = `"${{ github.ref_name }}`"" | Set-Content README.md
+
+      - name: Prepare artifact
+        run: |
+          mkdir dist
+          copy target\x86_64-pc-windows-msvc\release\bunker.exe dist\
+          copy README.md dist\
+          cd dist
+          7z a bunker-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip bunker.exe README.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bunker-x86_64-pc-windows-msvc
+          path: dist/bunker-*
+
+  release:
+    name: Create Release
+    if: ${{ github.event_name == 'push' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts/bunker-x86_64-pc-windows-msvc
+          sha256sum * > ../SHA256SUMS.txt
+          echo "=== SHA256SUMS ==="
+          cat ../SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  scoop:
+    name: Update Scoop manifest
+    if: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bunker-x86_64-pc-windows-msvc
+          path: artifacts
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SHA256 of zip
+        id: hash
+        run: |
+          ZIP_FILE=$(ls artifacts/*.zip | head -1)
+          HASH=$(sha256sum "$ZIP_FILE" | awk '{print $1}')
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $HASH"
+
+      - name: Update Scoop manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
+          jq --arg ver "$VERSION" --arg url "$URL" --arg hash "$SHA256" \
+            '.version = $ver | .architecture."64bit".url = $url | .architecture."64bit".hash = $hash' \
+            bucket/bunker.json > bucket/bunker.json.tmp
+          mv bucket/bunker.json.tmp bucket/bunker.json
+          cat bucket/bunker.json
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bucket/bunker.json
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update Scoop manifest to v${GITHUB_REF_NAME#v}"
+          git push
+
+  winget:
+    name: Publish to winget
+    needs: release
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifact from workflow
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: bunker-x86_64-pc-windows-msvc
+          path: artifacts
+
+      - name: Download release asset
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p artifacts
+          gh release download "v${VERSION}" --pattern "*.zip" --dir artifacts
+
+      - name: Compute SHA256 of zip
+        id: hash
+        run: |
+          ZIP_FILE=$(ls artifacts/*.zip | head -1)
+          HASH=$(sha256sum "$ZIP_FILE" | awk '{print toupper($1)}')
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $HASH"
+
+      - name: Generate winget manifests
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          URL="https://github.com/wj1918/bunker/releases/download/v${VERSION}/bunker-v${VERSION}-x86_64-pc-windows-msvc.zip"
+          MANIFEST_DIR="winget-staging/manifests/b/Bunker/Bunker/${VERSION}"
+          mkdir -p "$MANIFEST_DIR"
+
+          cat > "$MANIFEST_DIR/Bunker.Bunker.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+          PackageIdentifier: Bunker.Bunker
+          PackageVersion: ${VERSION}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.12.0
+          YAML
+
+          cat > "$MANIFEST_DIR/Bunker.Bunker.locale.en-US.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+          PackageIdentifier: Bunker.Bunker
+          PackageVersion: ${VERSION}
+          PackageLocale: en-US
+          Publisher: Bunker Contributors
+          PublisherUrl: https://github.com/wj1918/bunker
+          PackageName: Bunker
+          PackageUrl: https://github.com/wj1918/bunker
+          License: Apache-2.0
+          LicenseUrl: https://github.com/wj1918/bunker/blob/master/LICENSE
+          ShortDescription: A lightweight HTTP/HTTPS and DNS proxy
+          Description: |-
+            Bunker is a lightweight HTTP/HTTPS and DNS proxy built with Rust.
+            Features include HTTP forward proxy with connection pooling, HTTPS
+            tunneling via CONNECT method, DNS server with caching and failover,
+            SSRF protection, and rate limiting.
+          Moniker: bunker
+          Tags:
+            - proxy
+            - http
+            - https
+            - dns
+            - networking
+            - rust
+          ManifestType: defaultLocale
+          ManifestVersion: 1.12.0
+          YAML
+
+          cat > "$MANIFEST_DIR/Bunker.Bunker.installer.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+          PackageIdentifier: Bunker.Bunker
+          PackageVersion: ${VERSION}
+          Platform:
+            - Windows.Desktop
+          MinimumOSVersion: 10.0.0.0
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+            - RelativeFilePath: bunker.exe
+              PortableCommandAlias: bunker
+          Commands:
+            - bunker
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${URL}
+              InstallerSha256: ${SHA256}
+          ManifestType: installer
+          ManifestVersion: 1.12.0
+          YAML
+
+          echo "=== Generated manifests ==="
+          for f in "$MANIFEST_DIR"/*.yaml; do
+            echo "--- $f ---"
+            cat "$f"
+          done
+
+      - name: Submit PR to winget-pkgs
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          MANIFEST_DIR="winget-staging/manifests/b/Bunker/Bunker/${VERSION}"
+
+          # Sync fork with upstream
+          gh repo sync wj1918/winget-pkgs --source microsoft/winget-pkgs --force
+
+          # Clone fork (shallow)
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/wj1918/winget-pkgs.git winget-pkgs-repo
+
+          # Copy manifests
+          TARGET_DIR="winget-pkgs-repo/manifests/b/Bunker/Bunker/${VERSION}"
+          mkdir -p "$TARGET_DIR"
+          cp "$MANIFEST_DIR"/*.yaml "$TARGET_DIR/"
+
+          # Create branch, commit, push
+          cd winget-pkgs-repo
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          BRANCH="bunker-${VERSION}"
+          git checkout -b "$BRANCH"
+          git add "manifests/b/Bunker/Bunker/${VERSION}/"
+          git commit -m "New version: Bunker.Bunker version ${VERSION}"
+          git push origin "$BRANCH" --force
+
+          # Create PR
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --head "wj1918:$BRANCH" \
+            --title "New version: Bunker.Bunker version ${VERSION}" \
+            --body "## New package version
+
+          - PackageIdentifier: Bunker.Bunker
+          - PackageVersion: ${VERSION}
+
+          Automated submission from [bunker](https://github.com/wj1918/bunker) CI/CD."
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == true }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          echo "::notice::DRY RUN - would submit Bunker.Bunker ${VERSION} to winget-pkgs"
+          echo "SHA256: ${SHA256}"
+          echo "Manifests generated but PR was not created."

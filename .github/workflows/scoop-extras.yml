@@ -1,0 +1,49 @@
+name: Submit to Scoop Extras
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to submit (e.g. 0.1.0)'
+        required: true
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Submit PR to Scoop Extras
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          # Sync fork with upstream
+          gh repo sync wj1918/Extras --source ScoopInstaller/Extras --force
+
+          # Clone fork (shallow)
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/wj1918/Extras.git extras-repo
+
+          # Copy manifest
+          cp bucket/bunker.json extras-repo/bucket/bunker.json
+
+          # Create branch, commit, push
+          cd extras-repo
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          BRANCH="bunker-${{ inputs.version }}"
+          git checkout -b "$BRANCH"
+          git add bucket/bunker.json
+          git commit -m "bunker: Add version ${{ inputs.version }}"
+          git push origin "$BRANCH" --force
+
+          # Create PR
+          gh pr create \
+            --repo ScoopInstaller/Extras \
+            --head "wj1918:$BRANCH" \
+            --title "bunker: Add version ${{ inputs.version }}" \
+            --body "- [x] Use conventional PR title: \`<manifest-name[@version]|chore>: <general summary of the pull request>\`
+          - [x] I have read the [Contributing Guide](https://github.com/ScoopInstaller/.github/blob/main/.github/CONTRIBUTING.md)
+
+          A lightweight HTTP/HTTPS and DNS proxy built with Rust.
+
+          - **Homepage:** https://github.com/wj1918/bunker
+          - **License:** Apache-2.0"

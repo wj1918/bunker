@@ -1,0 +1,27 @@
+{
+  "version": "0.1.2",
+  "description": "A lightweight HTTP/HTTPS and DNS proxy",
+  "homepage": "https://github.com/wj1918/bunker",
+  "license": "Apache-2.0",
+  "notes": [
+    "First-time setup: run 'bunker --init' to create %USERPROFILE%\\.bunker\\config.yaml, then edit it.",
+    "Run with 'bunker' (auto-loads %USERPROFILE%\\.bunker\\config.yaml).",
+    "To add Bunker to Windows startup, run: bunker --install",
+    "To remove from startup, run: bunker --uninstall"
+  ],
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/wj1918/bunker/releases/download/v0.1.2/bunker-v0.1.2-x86_64-pc-windows-msvc.zip",
+      "hash": "7e2267e27b113d39a031f960017187a387f27669783986de0280844a18cfbae8"
+    }
+  },
+  "bin": "bunker.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/wj1918/bunker/releases/download/v$version/bunker-v$version-x86_64-pc-windows-msvc.zip"
+      }
+    }
+  }
+}
