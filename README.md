@@ -66,7 +66,7 @@ mkdir C:\Bunker
 cd C:\Bunker
 
 # Download the latest release
-$VERSION = "v0.1.0"
+$VERSION = "v0.1.3"
 Invoke-WebRequest -Uri "https://github.com/wj1918/bunker/releases/download/$VERSION/bunker-$VERSION-x86_64-pc-windows-msvc.zip" -OutFile bunker.zip
 ```
 
