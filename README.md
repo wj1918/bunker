@@ -97,6 +97,13 @@ mkdir C:\Bunker
 copy target\release\bunker.exe C:\Bunker\
 ```
 
+On **Linux**, build with the `engine-uring` feature to use the `io_uring`
+backend (otherwise the build defaults to the portable tokio backend):
+
+```bash
+cargo build --release --features engine-uring
+```
+
 ### Step 2: Configure `config.yaml`
 
 Run `bunker --init [mode]` once to create `%USERPROFILE%\.bunker\config.yaml` from the embedded default template, choosing the mode that matches how you'll reach the proxy:

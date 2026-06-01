@@ -46,9 +46,11 @@ embed-resource = "2"
 monoio = { version = "0.2", optional = true }
 
 [features]
-# Experimental thread-per-core proxy engine (portable tokio backend). Off by
-# default: the shipped proxy still uses the hyper path. `engine` alone works on
-# all platforms incl. Windows.
+# `engine` is on by default — plain `cargo build` and the released binary use
+# the thread-per-core proxy engine on the portable tokio backend. The previous
+# hyper-based path is still in the tree as a fallback; build it with
+# `--no-default-features` if you need to compare or bisect against it.
+default = ["engine"]
 engine = []
 # Adds the Linux io_uring (monoio) backend on top of `engine`. Linux only — do
 # not enable on Windows/macOS (monoio has no backend there); use `engine` instead.
