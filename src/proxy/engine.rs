@@ -600,24 +600,27 @@ pub async fn proxy_forward<K: Connect>(
         // Round-trip, retrying once on a fresh connection if a reused one was dead.
         let resp = match try_roundtrip(&mut conn, &head, &body).await {
             Some(r) => r,
-            None if reused => match connect_fresh(&connector, &target, security, dns_client).await
-            {
-                Ok((mut fresh, fresh_ca)) => match try_roundtrip(&mut fresh, &head, &body).await {
-                    Some(r) => {
-                        conn = fresh;
-                        created_at = fresh_ca;
-                        r
+            None if reused => {
+                match connect_fresh(&connector, &target, security, dns_client).await {
+                    Ok((mut fresh, fresh_ca)) => {
+                        match try_roundtrip(&mut fresh, &head, &body).await {
+                            Some(r) => {
+                                conn = fresh;
+                                created_at = fresh_ca;
+                                r
+                            }
+                            None => {
+                                let _ = client.write_all(RESP_502).await;
+                                break;
+                            }
+                        }
                     }
-                    None => {
+                    Err(_) => {
                         let _ = client.write_all(RESP_502).await;
                         break;
                     }
-                },
-                Err(_) => {
-                    let _ = client.write_all(RESP_502).await;
-                    break;
                 }
-            },
+            }
             None => {
                 let _ = client.write_all(RESP_502).await;
                 break;
