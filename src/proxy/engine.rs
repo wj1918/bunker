@@ -515,7 +515,7 @@ pub async fn proxy_forward<K: Connect>(
                         let _ = client.write_all(RESP_400).await;
                         break;
                     };
-                    if is_blocked_target(&target.host, Some(target.port), &security).is_some() {
+                    if is_blocked_target(&target.host, Some(target.port), security).is_some() {
                         let _ = client.write_all(RESP_403).await;
                         break;
                     }
@@ -533,7 +533,7 @@ pub async fn proxy_forward<K: Connect>(
                     }
                     // Resolve + validate (rebinding) + connect to the tunnel target.
                     let mut upstream =
-                        match connect_fresh(&connector, &target, &security, dns_client).await {
+                        match connect_fresh(&connector, &target, security, dns_client).await {
                             Ok((c, _)) => c, // tunnel conn isn't pooled; created_at unused
                             Err(AcquireErr::Blocked) => {
                                 let _ = client.write_all(RESP_403).await;
@@ -561,7 +561,7 @@ pub async fn proxy_forward<K: Connect>(
                 }
             };
         // SSRF: blocklist / port allowlist / literal private-IP.
-        if is_blocked_target(&target.host, Some(target.port), &security).is_some() {
+        if is_blocked_target(&target.host, Some(target.port), security).is_some() {
             let _ = client.write_all(RESP_403).await;
             break;
         }
@@ -581,9 +581,9 @@ pub async fn proxy_forward<K: Connect>(
             Some((t, c, ca)) if t == target => Ok((c, ca, true)),
             Some((t, c, ca)) => {
                 pool.borrow_mut().checkin(t.host, t.port, c, ca); // park old target's conn
-                acquire(&connector, &pool, &target, &security, dns_client).await
+                acquire(&connector, &pool, &target, security, dns_client).await
             }
-            None => acquire(&connector, &pool, &target, &security, dns_client).await,
+            None => acquire(&connector, &pool, &target, security, dns_client).await,
         };
         let (mut conn, mut created_at, reused) = match acquired {
             Ok(triple) => triple,
@@ -600,7 +600,7 @@ pub async fn proxy_forward<K: Connect>(
         // Round-trip, retrying once on a fresh connection if a reused one was dead.
         let resp = match try_roundtrip(&mut conn, &head, &body).await {
             Some(r) => r,
-            None if reused => match connect_fresh(&connector, &target, &security, dns_client).await
+            None if reused => match connect_fresh(&connector, &target, security, dns_client).await
             {
                 Ok((mut fresh, fresh_ca)) => match try_roundtrip(&mut fresh, &head, &body).await {
                     Some(r) => {
