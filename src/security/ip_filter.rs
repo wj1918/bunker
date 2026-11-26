@@ -324,6 +324,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         }
     }
@@ -569,6 +570,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         };
 
@@ -589,6 +591,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         };
 
@@ -609,6 +612,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         };
 
@@ -806,6 +810,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         };
         // Should block subdomain patterns
@@ -826,6 +831,7 @@ mod tests {
             max_connections: 0,
             max_request_body_bytes: 0,
             header_read_timeout_seconds: 0,
+            upstream_read_timeout_seconds: 0,
             max_requests_per_connection: 0,
         };
         // Exact match

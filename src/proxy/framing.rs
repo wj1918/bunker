@@ -500,27 +500,39 @@ pub fn scan_message_with_metadata(
     (scan, metadata)
 }
 
-/// Result of scanning a buffer for one HTTP/1 *response*, framed per RFC 7230
-/// §3.3.3 — which, unlike request framing, depends on the request method and
-/// the status code, and allows a body delimited by connection close.
+/// How the body of a response is delimited (RFC 7230 §3.3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseScan {
-    /// A complete response occupies the first `total` bytes (`head` of them are
-    /// the status line + headers).
+pub enum ResponseBody {
+    /// No body: the response ends at its head.
+    None,
+    /// Exactly this many bytes follow the head.
+    Length(u64),
+    /// A chunked body follows (track its end with `ChunkedTracker`).
+    Chunked,
+    /// No declared length: the body runs until the upstream closes.
+    UntilClose,
+}
+
+/// Result of scanning a buffer for the head of one HTTP/1 *response*. Response
+/// framing, unlike request framing, depends on the request method and the
+/// status code, and allows a body delimited by connection close.
+///
+/// Only the head is examined, so a caller can start relaying the body as it
+/// arrives instead of buffering the whole response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseHead {
+    /// The head occupies the first `head` bytes.
     Complete {
         head: usize,
-        total: usize,
         /// A 1xx interim response (other than 101): NOT the answer to the
         /// request — the final response follows on the same connection.
         interim: bool,
         /// Whether the upstream connection may carry another request after
         /// this response (HTTP/1.1 without `Connection: close`, or HTTP/1.0
-        /// with `Connection: keep-alive`).
+        /// with `Connection: keep-alive`). Never true for `UntilClose`.
         keep_alive: bool,
+        body: ResponseBody,
     },
-    /// The head is complete and the body has no declared length: it runs until
-    /// the upstream closes the connection. `head` is the head length.
-    UntilClose { head: usize },
     /// Need more bytes.
     Incomplete,
     /// Malformed head or rejected framing.
@@ -536,33 +548,31 @@ fn connection_has_token(pairs: &[(&[u8], &[u8])], token: &[u8]) -> bool {
         .any(|t| eq_ignore_ascii_case_bytes(trim_ows(t), token))
 }
 
-/// Scan `buf` for exactly one HTTP/1 response. `head_request` says whether the
-/// request this answers was a HEAD (its response never has a body, whatever
-/// Content-Length / Transfer-Encoding claim).
+/// Scan `buf` for the head of one HTTP/1 response. `head_request` says whether
+/// the request this answers was a HEAD (its response never has a body,
+/// whatever Content-Length / Transfer-Encoding claim).
 ///
 /// Rules, in RFC 7230 §3.3.3 order:
 ///   1. HEAD responses, 1xx, 204 and 304 end at the head.
 ///   2. Transfer-Encoding with final coding `chunked` => chunked body.
 ///      (Content-Length together with Transfer-Encoding, or an unframeable
 ///      Transfer-Encoding, is rejected — same strictness as for requests.)
-///   3. Content-Length => fixed-length body.
-///   4. Neither => the body runs until the connection closes.
-///
-/// Pure and incremental, like `scan_message`.
-pub fn scan_response(buf: &[u8], head_request: bool) -> ResponseScan {
+///   3. Content-Length => that many bytes.
+///   4. Neither => the body runs until the upstream closes the connection.
+pub fn scan_response_head(buf: &[u8], head_request: bool) -> ResponseHead {
     let head_end = match find(buf, b"\r\n\r\n") {
         Some(i) => i + 4,
-        None => return ResponseScan::Incomplete,
+        None => return ResponseHead::Incomplete,
     };
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
     match resp.parse(buf) {
         Ok(httparse::Status::Complete(n)) => debug_assert_eq!(n, head_end),
-        Ok(httparse::Status::Partial) => return ResponseScan::Incomplete,
+        Ok(httparse::Status::Partial) => return ResponseHead::Incomplete,
         Err(httparse::Error::TooManyHeaders) => {
-            return ResponseScan::Error(MessageError::TooManyHeaders)
+            return ResponseHead::Error(MessageError::TooManyHeaders)
         }
-        Err(_) => return ResponseScan::Error(MessageError::BadHead),
+        Err(_) => return ResponseHead::Error(MessageError::BadHead),
     }
     let code = resp.code.unwrap_or(0);
     let http10 = resp.version == Some(0);
@@ -577,26 +587,22 @@ pub fn scan_response(buf: &[u8], head_request: bool) -> ResponseScan {
     } else {
         !connection_has_token(&pairs, b"close")
     };
+    let complete = |interim: bool, keep_alive: bool, body: ResponseBody| ResponseHead::Complete {
+        head: head_end,
+        interim,
+        keep_alive,
+        body,
+    };
 
     // (1) Responses that never carry a body.
     if (100..200).contains(&code) {
         // 101 Switching Protocols ends HTTP on this connection: it is final,
         // and the connection can't carry another request.
         let interim = code != 101;
-        return ResponseScan::Complete {
-            head: head_end,
-            total: head_end,
-            interim,
-            keep_alive: interim && keep_alive,
-        };
+        return complete(interim, interim && keep_alive, ResponseBody::None);
     }
     if head_request || code == 204 || code == 304 {
-        return ResponseScan::Complete {
-            head: head_end,
-            total: head_end,
-            interim: false,
-            keep_alive,
-        };
+        return complete(false, keep_alive, ResponseBody::None);
     }
 
     // (2)-(4) Framing from the headers.
@@ -605,33 +611,143 @@ pub fn scan_response(buf: &[u8], head_request: bool) -> ResponseScan {
             || eq_ignore_ascii_case_bytes(name, b"transfer-encoding")
     });
     if !has_length_header {
-        return ResponseScan::UntilClose { head: head_end };
+        return complete(false, false, ResponseBody::UntilClose);
     }
-    let body_len = match analyze_framing(&pairs) {
-        Err(e) => return ResponseScan::Error(MessageError::Framing(e)),
-        Ok(BodyFraming::None) => 0,
-        Ok(BodyFraming::ContentLength(n)) => match usize::try_from(n) {
-            Ok(n) => n,
-            Err(_) => return ResponseScan::Error(MessageError::BadHead),
-        },
-        Ok(BodyFraming::Chunked) => match scan_chunked(&buf[head_end..]) {
-            ChunkScan::Complete(len) => len,
-            ChunkScan::Incomplete => return ResponseScan::Incomplete,
-            ChunkScan::Malformed => return ResponseScan::Error(MessageError::BadChunked),
-        },
-    };
-    let total = match head_end.checked_add(body_len) {
-        Some(t) => t,
-        None => return ResponseScan::Error(MessageError::BadHead),
-    };
-    if buf.len() < total {
-        return ResponseScan::Incomplete;
+    match analyze_framing(&pairs) {
+        Err(e) => ResponseHead::Error(MessageError::Framing(e)),
+        Ok(BodyFraming::None) => complete(false, keep_alive, ResponseBody::None),
+        Ok(BodyFraming::ContentLength(0)) => complete(false, keep_alive, ResponseBody::None),
+        Ok(BodyFraming::ContentLength(n)) => complete(false, keep_alive, ResponseBody::Length(n)),
+        Ok(BodyFraming::Chunked) => complete(false, keep_alive, ResponseBody::Chunked),
     }
-    ResponseScan::Complete {
-        head: head_end,
-        total,
-        interim: false,
-        keep_alive,
+}
+
+/// Longest chunk-size line (size + extensions) or trailer line accepted while
+/// streaming, and the most trailer bytes in total. Without a bound, a peer
+/// that never sends the line terminator would make us buffer forever.
+const MAX_CHUNK_LINE: usize = 8 * 1024;
+const MAX_TRAILER_BYTES: usize = 32 * 1024;
+
+/// What `ChunkedTracker::advance` learned from the bytes it was shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkProgress {
+    /// The first N bytes belong to the body and can be passed on; the body
+    /// continues. Any bytes after N are an unfinished line: show them again,
+    /// with more data appended, on the next call.
+    More(usize),
+    /// The body ends after the first N bytes.
+    Done(usize),
+    /// Malformed framing — abandon the message.
+    Malformed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkState {
+    /// At the start of a chunk-size line.
+    SizeLine,
+    /// Inside chunk data, with this many bytes still to come.
+    Data(u64),
+    /// After chunk data, with this many bytes of its CRLF still to come.
+    DataEnd(u8),
+    /// After the last chunk, at the start of a trailer line or the final CRLF.
+    Trailers,
+    Done,
+}
+
+/// Finds the end of a chunked body that arrives in pieces, without decoding it
+/// and without looking at any byte twice. The streaming counterpart of
+/// `scan_chunked`, with the same framing rules.
+#[derive(Debug)]
+pub struct ChunkedTracker {
+    state: ChunkState,
+    trailer_bytes: usize,
+}
+
+impl Default for ChunkedTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkedTracker {
+    pub fn new() -> Self {
+        ChunkedTracker {
+            state: ChunkState::SizeLine,
+            trailer_bytes: 0,
+        }
+    }
+
+    /// Advance over `buf`, which must start where the previous call's consumed
+    /// bytes ended.
+    pub fn advance(&mut self, buf: &[u8]) -> ChunkProgress {
+        let mut pos = 0usize;
+        loop {
+            match self.state {
+                ChunkState::SizeLine => {
+                    let rest = &buf[pos..];
+                    let Some(line_len) = find(rest, b"\r\n") else {
+                        if rest.len() > MAX_CHUNK_LINE {
+                            return ChunkProgress::Malformed;
+                        }
+                        return ChunkProgress::More(pos);
+                    };
+                    let line = &rest[..line_len];
+                    let size_field = line.split(|&c| c == b';').next().unwrap_or(line);
+                    let Some(size) = parse_hex_strict(trim_ows(size_field)) else {
+                        return ChunkProgress::Malformed;
+                    };
+                    pos += line_len + 2;
+                    self.state = if size == 0 {
+                        ChunkState::Trailers
+                    } else {
+                        ChunkState::Data(size)
+                    };
+                }
+                ChunkState::Data(remaining) => {
+                    let available = (buf.len() - pos) as u64;
+                    if available < remaining {
+                        self.state = ChunkState::Data(remaining - available);
+                        return ChunkProgress::More(buf.len());
+                    }
+                    pos += remaining as usize;
+                    self.state = ChunkState::DataEnd(2);
+                }
+                ChunkState::DataEnd(left) => {
+                    let Some(&byte) = buf.get(pos) else {
+                        return ChunkProgress::More(pos);
+                    };
+                    let expected = if left == 2 { b'\r' } else { b'\n' };
+                    if byte != expected {
+                        return ChunkProgress::Malformed; // data not CRLF-terminated
+                    }
+                    pos += 1;
+                    self.state = if left == 2 {
+                        ChunkState::DataEnd(1)
+                    } else {
+                        ChunkState::SizeLine
+                    };
+                }
+                ChunkState::Trailers => {
+                    let rest = &buf[pos..];
+                    let Some(line_len) = find(rest, b"\r\n") else {
+                        if rest.len() > MAX_CHUNK_LINE {
+                            return ChunkProgress::Malformed;
+                        }
+                        return ChunkProgress::More(pos);
+                    };
+                    pos += line_len + 2;
+                    if line_len == 0 {
+                        self.state = ChunkState::Done;
+                        return ChunkProgress::Done(pos);
+                    }
+                    self.trailer_bytes += line_len + 2;
+                    if self.trailer_bytes > MAX_TRAILER_BYTES {
+                        return ChunkProgress::Malformed;
+                    }
+                }
+                ChunkState::Done => return ChunkProgress::Done(pos),
+            }
+        }
     }
 }
 
@@ -1186,6 +1302,71 @@ mod tests {
 
     // ---- scan_response: RFC 7230 §3.3.3 response rules ----
 
+    /// Whole-buffer view of a response, built from the two streaming pieces
+    /// (`scan_response_head` + the chunked scanner) the engine uses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ResponseScan {
+        Complete {
+            head: usize,
+            total: usize,
+            interim: bool,
+            keep_alive: bool,
+        },
+        UntilClose {
+            head: usize,
+        },
+        Incomplete,
+        Error(MessageError),
+    }
+
+    fn scan_response(buf: &[u8], head_request: bool) -> ResponseScan {
+        let (head, interim, keep_alive, body) = match scan_response_head(buf, head_request) {
+            ResponseHead::Incomplete => return ResponseScan::Incomplete,
+            ResponseHead::Error(e) => return ResponseScan::Error(e),
+            ResponseHead::Complete {
+                head,
+                interim,
+                keep_alive,
+                body,
+            } => (head, interim, keep_alive, body),
+        };
+        let body_len = match body {
+            ResponseBody::None => 0,
+            ResponseBody::Length(n) => n as usize,
+            ResponseBody::UntilClose => {
+                assert!(!keep_alive, "a close-delimited response can't keep alive");
+                return ResponseScan::UntilClose { head };
+            }
+            ResponseBody::Chunked => {
+                // The streaming tracker must agree with the one-shot scanner.
+                let one_shot = scan_chunked(&buf[head..]);
+                let streamed = ChunkedTracker::new().advance(&buf[head..]);
+                match (one_shot, streamed) {
+                    (ChunkScan::Complete(n), ChunkProgress::Done(m)) => {
+                        assert_eq!(n, m);
+                        n
+                    }
+                    (ChunkScan::Incomplete, ChunkProgress::More(_)) => {
+                        return ResponseScan::Incomplete
+                    }
+                    (ChunkScan::Malformed, ChunkProgress::Malformed) => {
+                        return ResponseScan::Error(MessageError::BadChunked)
+                    }
+                    other => panic!("chunk scanners disagree: {other:?}"),
+                }
+            }
+        };
+        if buf.len() < head + body_len {
+            return ResponseScan::Incomplete;
+        }
+        ResponseScan::Complete {
+            head,
+            total: head + body_len,
+            interim,
+            keep_alive,
+        }
+    }
+
     fn complete(head: usize, total: usize, keep_alive: bool) -> ResponseScan {
         ResponseScan::Complete {
             head,
@@ -1341,5 +1522,110 @@ mod tests {
                 let _ = scan_response(&r[..n], head_request);
             }
         }
+    }
+
+    // ---- ChunkedTracker: streaming chunked framing ----
+
+    /// Feed `body` to a tracker in pieces of `step` bytes, the way a relay
+    /// loop does (unconsumed bytes are shown again with more appended).
+    /// Returns the body length found, or `None` if it never completed.
+    fn track_in_steps(body: &[u8], step: usize) -> Result<Option<usize>, ()> {
+        let mut tracker = ChunkedTracker::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut passed = 0usize;
+        for piece in body.chunks(step) {
+            pending.extend_from_slice(piece);
+            match tracker.advance(&pending) {
+                ChunkProgress::More(n) => {
+                    passed += n;
+                    pending.drain(..n);
+                }
+                ChunkProgress::Done(n) => return Ok(Some(passed + n)),
+                ChunkProgress::Malformed => return Err(()),
+            }
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn chunked_tracker_agrees_with_one_shot_scan_at_every_split() {
+        let bodies: [&[u8]; 6] = [
+            b"0\r\n\r\n",
+            b"5\r\nhello\r\n0\r\n\r\n",
+            b"5;ext=1\r\nhello\r\nA\r\n0123456789\r\n0\r\n\r\n",
+            b"3\r\nabc\r\n0\r\nX-Trailer: 1\r\nY: 2\r\n\r\n",
+            // CRLF inside chunk data must not be read as framing.
+            b"6\r\n\r\n\r\n\r\n\r\n0\r\n\r\n",
+            b"1\r\nx\r\n1\r\ny\r\n1\r\nz\r\n0\r\n\r\n",
+        ];
+        for body in bodies {
+            assert_eq!(scan_chunked(body), ChunkScan::Complete(body.len()));
+            // Trailing bytes after the body are not part of it.
+            let mut with_extra = body.to_vec();
+            with_extra.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+            for step in 1..=with_extra.len() {
+                assert_eq!(
+                    track_in_steps(&with_extra, step),
+                    Ok(Some(body.len())),
+                    "step {step} over {:?}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+            // Every strict prefix is unfinished, never complete or malformed.
+            for cut in 0..body.len() {
+                assert_eq!(track_in_steps(&body[..cut], 3), Ok(None), "cut {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_tracker_rejects_what_the_one_shot_scan_rejects() {
+        let bad: [&[u8]; 5] = [
+            b"zz\r\nhello\r\n0\r\n\r\n",    // not hex
+            b"5\r\nhelloXX0\r\n\r\n",       // data not CRLF-terminated
+            b"5\r\nhello\rX0\r\n\r\n",      // CR without LF
+            b"\r\n5\r\nhello\r\n0\r\n\r\n", // empty size line
+            b"-1\r\n\r\n",                  // signed size
+        ];
+        for body in bad {
+            assert_eq!(scan_chunked(body), ChunkScan::Malformed);
+            for step in 1..=body.len() {
+                assert_eq!(track_in_steps(body, step), Err(()), "step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_tracker_passes_data_through_without_waiting_for_the_chunk_end() {
+        let mut tracker = ChunkedTracker::new();
+        // Size line plus the first 4 of 0x10000 data bytes: all of it is body.
+        assert_eq!(tracker.advance(b"10000\r\nabcd"), ChunkProgress::More(11));
+        // A partial size line is held back until its CRLF arrives.
+        let mut tracker = ChunkedTracker::new();
+        assert_eq!(tracker.advance(b"1\r\nx\r\n1"), ChunkProgress::More(6));
+        assert_eq!(tracker.advance(b"1"), ChunkProgress::More(0));
+        assert_eq!(tracker.advance(b"1\r\n"), ChunkProgress::More(3));
+    }
+
+    #[test]
+    fn chunked_tracker_bounds_unterminated_lines_and_trailers() {
+        // A size line that never ends.
+        let mut tracker = ChunkedTracker::new();
+        assert_eq!(
+            tracker.advance(&vec![b'1'; MAX_CHUNK_LINE + 1]),
+            ChunkProgress::Malformed
+        );
+        // Endless trailers.
+        let mut tracker = ChunkedTracker::new();
+        assert_eq!(tracker.advance(b"0\r\n"), ChunkProgress::More(3));
+        let line = b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        let mut outcome = ChunkProgress::More(0);
+        for _ in 0..=(MAX_TRAILER_BYTES / line.len()) {
+            outcome = tracker.advance(line);
+            if outcome == ChunkProgress::Malformed {
+                break;
+            }
+        }
+        assert_eq!(outcome, ChunkProgress::Malformed);
     }
 }

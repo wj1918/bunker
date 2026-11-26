@@ -518,6 +518,13 @@ pub struct SecurityConfig {
     /// Protects against slowloris attacks
     #[serde(default = "default_header_read_timeout_seconds")]
     pub header_read_timeout_seconds: u64,
+    /// Longest wait, in seconds, for the origin to send more of a response
+    /// (0 = unlimited, default 120s). Applies to each wait, not to the whole
+    /// response, so long downloads and event streams that keep sending are
+    /// unaffected; an origin that goes silent gets a 504 or a closed
+    /// connection instead of holding one forever. Engine path only.
+    #[serde(default = "default_upstream_read_timeout_seconds")]
+    pub upstream_read_timeout_seconds: u64,
     /// Maximum requests per connection (0 = unlimited, default 100).
     /// This caps how many keep-alive requests ride on a single TCP socket
     /// before bunker forces a reconnect — which is where the per-IP rate
@@ -536,6 +543,10 @@ fn default_max_request_body_bytes() -> u64 {
 
 fn default_header_read_timeout_seconds() -> u64 {
     30 // 30 seconds default
+}
+
+fn default_upstream_read_timeout_seconds() -> u64 {
+    120
 }
 
 fn default_max_requests_per_connection() -> u32 {
@@ -561,6 +572,7 @@ impl Default for SecurityConfig {
             max_connections: default_max_connections(),
             max_request_body_bytes: default_max_request_body_bytes(),
             header_read_timeout_seconds: default_header_read_timeout_seconds(),
+            upstream_read_timeout_seconds: default_upstream_read_timeout_seconds(),
             max_requests_per_connection: default_max_requests_per_connection(),
         }
     }

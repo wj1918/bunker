@@ -16,13 +16,13 @@ use crate::proxy::forward::{
     parse_connect_target, rewrite_forward_with_metadata, ForwardError, Target,
 };
 use crate::proxy::framing::{
-    scan_message_with_metadata, scan_response, MessageError, MessageMetadata, MessageScan,
-    ResponseScan,
+    scan_message_with_metadata, scan_response_head, ChunkProgress, ChunkedTracker, MessageError,
+    MessageMetadata, MessageScan, ResponseBody, ResponseHead,
 };
 use crate::security::{
     is_blocked_target, is_source_ip_allowed, resolved_addrs_blocked, RateLimiter,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -51,7 +51,11 @@ pub struct EngineConfig {
     pub connect_timeout: Duration,
     /// Time to receive a complete request head; zero = no limit (slowloris).
     pub header_read_timeout: Duration,
-    /// Max request body (Content-Length) in bytes; 0 = unlimited.
+    /// Longest wait for the upstream to send more of a response (head or
+    /// body); zero = no limit. An idle limit, not a total: a slow but steady
+    /// download is never cut off.
+    pub upstream_read_timeout: Duration,
+    /// Max request body in bytes; 0 = unlimited.
     pub max_request_body_bytes: u64,
     /// Max requests per client connection; 0 = unlimited.
     pub max_requests_per_conn: u32,
@@ -104,6 +108,10 @@ pub trait ProxyIo {
     }
 }
 
+/// Largest message head (request or response) accepted. A peer that never
+/// finishes its head would otherwise be buffered without bound.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+
 /// Why reading one message stopped without yielding it.
 #[derive(Debug)]
 pub enum RelayErr {
@@ -146,6 +154,7 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
 ) -> Result<(Bytes, Option<MessageMetadata>), RelayErr> {
     let start = std::time::Instant::now();
     let mut head_done = false;
+    let mut head_len = 0usize;
     loop {
         let (scan, meta) = scan_message_with_metadata(acc, is_request, max_body);
         match scan {
@@ -160,8 +169,19 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
             MessageScan::Incomplete => {
                 // Latch once the head is fully received; after that, body reads
                 // are untimed (a large upload mustn't trip the header timeout).
-                if !head_done && acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                    head_done = true;
+                if !head_done {
+                    if let Some(i) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                        head_done = true;
+                        head_len = i + 4;
+                    } else if acc.len() > MAX_HEAD_BYTES {
+                        return Err(RelayErr::Closed); // head never ends
+                    }
+                }
+                // A chunked body declares no length up front, so the limit has
+                // to be applied while it is still arriving. Without this an
+                // endless chunked upload would be buffered until memory ran out.
+                if head_done && max_body > 0 && (acc.len() - head_len) as u64 > max_body {
+                    return Err(RelayErr::TooLarge);
                 }
                 let n = match head_timeout {
                     Some(t) if !head_done => {
@@ -277,6 +297,8 @@ const RESP_400: &[u8] =
 const RESP_403: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const RESP_502: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const RESP_504: &[u8] =
+    b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const RESP_429: &[u8] =
     b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -525,6 +547,7 @@ pub async fn proxy_forward<K: Connect>(
     // Header-read (slowloris) timeout + request body-size limit from config.
     let head_timeout = (!cfg.header_read_timeout.is_zero()).then_some(cfg.header_read_timeout);
     let max_body = cfg.max_request_body_bytes;
+    let read_timeout = (!cfg.upstream_read_timeout.is_zero()).then_some(cfg.upstream_read_timeout);
 
     loop {
         // Parse-once: pull metadata out of the framing pass and hand it to
@@ -658,55 +681,63 @@ pub async fn proxy_forward<K: Connect>(
             }
         };
 
-        // Round-trip. Retry once on a fresh connection only when it is safe:
-        // the connection was a reused keep-alive, the request is idempotent,
-        // and the upstream closed without sending a single response byte (the
-        // signature of a stale idle connection). Anything else — a reset
-        // mid-response, an unparseable response — is a 502, never a replay.
-        let resp = match try_roundtrip(&mut conn, &head, &body, head_request, forward_interim).await
+        // Send the request and wait for the response head. Retry once on a
+        // fresh connection only when it is safe: the connection was a reused
+        // keep-alive, the request is idempotent, and the upstream closed
+        // without sending a single response byte (the signature of a stale
+        // idle connection). Anything else — a reset mid-head, an unparseable
+        // response, a timeout — is an error response, never a replay.
+        let started = match begin_roundtrip(
+            &mut conn,
+            &head,
+            &body,
+            head_request,
+            forward_interim,
+            read_timeout,
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(failed) if reused && idempotent && !failed.response_started => {
-                let retried = match connect_fresh(&connector, &target, security, dns_client).await {
-                    Ok((mut fresh, fresh_ca)) => {
-                        match try_roundtrip(&mut fresh, &head, &body, head_request, forward_interim)
-                            .await
-                        {
-                            Ok(r) => {
-                                conn = fresh;
-                                created_at = fresh_ca;
-                                Some(r)
-                            }
-                            Err(_) => None,
-                        }
+            Ok(r) => Ok(r),
+            Err(failed) if reused && idempotent && failed.retryable => {
+                match connect_fresh(&connector, &target, security, dns_client).await {
+                    Ok((fresh, fresh_ca)) => {
+                        conn = fresh;
+                        created_at = fresh_ca;
+                        begin_roundtrip(
+                            &mut conn,
+                            &head,
+                            &body,
+                            head_request,
+                            forward_interim,
+                            read_timeout,
+                        )
+                        .await
                     }
-                    Err(_) => None,
-                };
-                match retried {
-                    Some(r) => r,
-                    None => {
-                        let _ = client.write_all(RESP_502).await;
-                        break;
-                    }
+                    Err(_) => Err(failed),
                 }
             }
-            Err(_) => {
-                let _ = client.write_all(RESP_502).await;
+            Err(failed) => Err(failed),
+        };
+        let started = match started {
+            Ok(r) => r,
+            Err(failed) => {
+                let status = if failed.timed_out { RESP_504 } else { RESP_502 };
+                let _ = client.write_all(status).await;
                 break;
             }
         };
 
+        // Relay the response as it arrives. From here on the client has (or is
+        // about to have) part of the response, so a failure can only be
+        // signalled by closing its connection.
+        let relayed = relay_response(&mut client, &mut conn, started, read_timeout).await;
+
         // Keep the upstream for the next request (fast path) only if it can
         // carry one; otherwise it is dropped (closed) here.
-        if resp.reusable {
+        if relayed.upstream_reusable {
             current = Some((target, conn, created_at));
         }
-        if client.write_all(&resp.bytes).await.is_err() {
-            break;
-        }
-        // A close-delimited body has no length the client could use to find
-        // its end; closing the client connection is what terminates it.
-        if resp.close_client {
+        if !relayed.client_open {
             break;
         }
     }
@@ -744,77 +775,95 @@ fn is_idempotent_method(method: &[u8]) -> bool {
     )
 }
 
-/// A complete upstream response, plus what it implies for both connections.
-struct UpstreamResponse {
-    /// Bytes to relay to the client: any forwarded 1xx interim responses
-    /// followed by the final response.
-    bytes: Bytes,
-    /// The upstream connection can carry another request.
-    reusable: bool,
-    /// The body was delimited by upstream close, so the client connection must
-    /// be closed after `bytes` to mark the end of the body.
-    close_client: bool,
+/// The final response head has arrived; the body (if any) is still to be
+/// relayed by `relay_response`.
+struct ResponseStarted {
+    /// Forwarded 1xx interim responses that preceded the final one, if any.
+    interim: Option<BytesMut>,
+    /// Everything read so far, starting with the final response's head.
+    buf: BytesMut,
+    /// Length of that head.
+    head: usize,
+    body: ResponseBody,
+    keep_alive: bool,
 }
 
-/// A round-trip that produced no usable response.
+/// A round-trip that produced no response head.
 struct RoundtripFailed {
-    /// Whether any response byte arrived before the failure. `false` is the
-    /// only case in which the request may be replayed on another connection.
-    response_started: bool,
+    /// The upstream closed (or the write failed) before a single response
+    /// byte arrived — the only case in which the request may be replayed on
+    /// another connection.
+    retryable: bool,
+    /// The upstream stayed silent past the read timeout (-> 504, not 502).
+    timed_out: bool,
+}
+
+impl RoundtripFailed {
+    const BAD_RESPONSE: Self = RoundtripFailed {
+        retryable: false,
+        timed_out: false,
+    };
 }
 
 /// Upper bound on 1xx interim responses per request, so an upstream can't keep
 /// a worker reading them forever.
 const MAX_INTERIM_RESPONSES: usize = 16;
 
-/// One request->response round-trip on `conn`. Takes head and body separately
-/// so the upstream write goes out as one `writev(2)` call (no head+body
-/// concatenation copy) — `write_all_vectored` handles the fallback if vectored
-/// I/O isn't available on the backend.
+/// How much room to offer the upstream per read while relaying a body. This,
+/// not the size of the response, is what bounds the proxy's memory use.
+const RELAY_READ_BYTES: usize = 64 * 1024;
+
+/// One read from the upstream, bounded by the idle timeout when one is set.
+async fn read_upstream<C: ProxyIo>(
+    conn: &mut C,
+    acc: &mut BytesMut,
+    timeout: Option<Duration>,
+) -> std::io::Result<usize> {
+    match timeout {
+        Some(t) => conn.read_append_timeout(acc, t).await,
+        None => conn.read_append(acc).await,
+    }
+}
+
+/// Send one request on `conn` and read until the final response head is in.
+/// Takes head and body separately so the upstream write goes out as one
+/// `writev(2)` call (no head+body concatenation copy) — `write_all_vectored`
+/// handles the fallback if vectored I/O isn't available on the backend.
 ///
-/// The response is framed with the response rules of RFC 7230 §3.3.3 (see
-/// `scan_response`): `head_request` suppresses the body, 1xx interim responses
-/// are skipped over (and relayed when `forward_interim`), and a response with
-/// no declared length is read until the upstream closes.
-async fn try_roundtrip<C: ProxyIo>(
+/// The head is framed with the response rules of RFC 7230 §3.3.3 (see
+/// `scan_response_head`): `head_request` suppresses the body, and 1xx interim
+/// responses are skipped over (and kept for relaying when `forward_interim`).
+/// Nothing is written to the client here, so a failure can still be answered
+/// with an error status or, when `retryable`, a second attempt.
+async fn begin_roundtrip<C: ProxyIo>(
     conn: &mut C,
     head: &Bytes,
     body: &Bytes,
     head_request: bool,
     forward_interim: bool,
-) -> Result<UpstreamResponse, RoundtripFailed> {
+    read_timeout: Option<Duration>,
+) -> Result<ResponseStarted, RoundtripFailed> {
     if conn.write_all_vectored(head, body).await.is_err() {
         return Err(RoundtripFailed {
-            response_started: false,
+            retryable: true,
+            timed_out: false,
         });
     }
-    // No head timeout / body limit on upstream responses (we trust the origin;
-    // bunker's hyper path likewise doesn't size-limit responses).
-    let mut acc: BytesMut = BytesMut::with_capacity(512);
+    let mut acc: BytesMut = BytesMut::with_capacity(4096);
     let mut interim: Option<BytesMut> = None; // forwarded 1xx bytes, if any
     let mut interim_count = 0usize;
-    // Prepend any forwarded interim responses to the final response bytes.
-    let assemble = |interim: Option<BytesMut>, rest: BytesMut| match interim {
-        Some(mut pre) => {
-            pre.extend_from_slice(&rest);
-            pre.freeze()
-        }
-        None => rest.freeze(), // common case: zero-copy
-    };
     loop {
-        match scan_response(&acc, head_request) {
-            ResponseScan::Complete {
-                total,
+        match scan_response_head(&acc, head_request) {
+            ResponseHead::Complete {
+                head,
                 interim: true,
                 ..
             } => {
                 interim_count += 1;
                 if interim_count > MAX_INTERIM_RESPONSES {
-                    return Err(RoundtripFailed {
-                        response_started: true,
-                    });
+                    return Err(RoundtripFailed::BAD_RESPONSE);
                 }
-                let msg = acc.split_to(total);
+                let msg = acc.split_to(head);
                 if forward_interim {
                     interim
                         .get_or_insert_with(BytesMut::new)
@@ -822,51 +871,190 @@ async fn try_roundtrip<C: ProxyIo>(
                 }
                 // The final response follows; rescan what's already buffered.
             }
-            ResponseScan::Complete {
-                total, keep_alive, ..
+            ResponseHead::Complete {
+                head,
+                keep_alive,
+                body,
+                ..
             } => {
-                let msg = acc.split_to(total);
-                // Bytes after the response mean the upstream is out of step
-                // with us; such a connection must not carry another request.
-                let reusable = keep_alive && acc.is_empty();
-                return Ok(UpstreamResponse {
-                    bytes: assemble(interim, msg),
-                    reusable,
-                    close_client: false,
-                });
-            }
-            ResponseScan::UntilClose { .. } => {
-                loop {
-                    match conn.read_append(&mut acc).await {
-                        Ok(0) => break, // upstream closed: end of body
-                        Ok(_) => {}
-                        Err(_) => {
-                            return Err(RoundtripFailed {
-                                response_started: true,
-                            })
-                        }
-                    }
-                }
-                return Ok(UpstreamResponse {
-                    bytes: assemble(interim, acc),
-                    reusable: false,
-                    close_client: true,
-                });
-            }
-            ResponseScan::Error(_) => {
-                return Err(RoundtripFailed {
-                    response_started: true,
+                return Ok(ResponseStarted {
+                    interim,
+                    buf: acc,
+                    head,
+                    body,
+                    keep_alive,
                 })
             }
-            ResponseScan::Incomplete => match conn.read_append(&mut acc).await {
-                Ok(n) if n > 0 => {}
-                // EOF or I/O error before a full response.
-                _ => {
-                    return Err(RoundtripFailed {
-                        response_started: interim_count > 0 || !acc.is_empty(),
-                    })
+            ResponseHead::Error(_) => return Err(RoundtripFailed::BAD_RESPONSE),
+            ResponseHead::Incomplete => {
+                if acc.len() > MAX_HEAD_BYTES {
+                    return Err(RoundtripFailed::BAD_RESPONSE); // head never ends
                 }
-            },
+                let nothing_yet = interim_count == 0 && acc.is_empty();
+                match read_upstream(conn, &mut acc, read_timeout).await {
+                    Ok(n) if n > 0 => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        return Err(RoundtripFailed {
+                            retryable: false,
+                            timed_out: true,
+                        })
+                    }
+                    // EOF or I/O error before a full head.
+                    _ => {
+                        return Err(RoundtripFailed {
+                            retryable: nothing_yet,
+                            timed_out: false,
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What relaying a response left behind.
+struct Relayed {
+    /// The upstream connection can carry another request.
+    upstream_reusable: bool,
+    /// The client connection can carry another request. False when the body
+    /// was delimited by upstream close (closing is what marks its end), and
+    /// when the response could not be delivered in full.
+    client_open: bool,
+}
+
+impl Relayed {
+    /// The response was cut short, or the client went away: neither
+    /// connection is in a known state.
+    const ABORTED: Self = Relayed {
+        upstream_reusable: false,
+        client_open: false,
+    };
+}
+
+/// Relay a started response to the client, passing the body on as it arrives.
+/// Each piece is written to the client before the next is read from the
+/// upstream, so memory use stays at about one read however large the body is
+/// (a download of any size, or a stream that never ends), and a slow client
+/// slows the upstream down instead of filling the proxy.
+async fn relay_response<C: ProxyIo>(
+    client: &mut C,
+    conn: &mut C,
+    started: ResponseStarted,
+    read_timeout: Option<Duration>,
+) -> Relayed {
+    let ResponseStarted {
+        interim,
+        mut buf,
+        head,
+        body,
+        keep_alive,
+    } = started;
+    if let Some(pre) = interim {
+        if client.write_all(&pre).await.is_err() {
+            return Relayed::ABORTED;
+        }
+    }
+    // Make room for the next read. `buf` is emptied after every write, so this
+    // reuses one allocation rather than growing.
+    fn make_room(buf: &mut BytesMut) {
+        if buf.capacity() - buf.len() < RELAY_READ_BYTES / 4 {
+            buf.reserve(RELAY_READ_BYTES);
+        }
+    }
+
+    match body {
+        ResponseBody::None => {
+            if client.write_all(&buf[..head]).await.is_err() {
+                return Relayed::ABORTED;
+            }
+            // Bytes after the response mean the upstream is out of step with
+            // us; such a connection must not carry another request.
+            Relayed {
+                upstream_reusable: keep_alive && buf.len() == head,
+                client_open: true,
+            }
+        }
+        ResponseBody::Length(len) => {
+            let mut remaining = len;
+            let mut offset = head; // the head goes out with the first piece
+            let mut surplus = false;
+            loop {
+                let available = (buf.len() - offset) as u64;
+                let take = available.min(remaining) as usize;
+                surplus |= available > remaining;
+                if client.write_all(&buf[..offset + take]).await.is_err() {
+                    return Relayed::ABORTED;
+                }
+                remaining -= take as u64;
+                if remaining == 0 {
+                    return Relayed {
+                        upstream_reusable: keep_alive && !surplus,
+                        client_open: true,
+                    };
+                }
+                buf.clear();
+                offset = 0;
+                make_room(&mut buf);
+                match read_upstream(conn, &mut buf, read_timeout).await {
+                    Ok(n) if n > 0 => {}
+                    // Closed, failed or stalled short of the declared length.
+                    _ => return Relayed::ABORTED,
+                }
+            }
+        }
+        ResponseBody::Chunked => {
+            let mut tracker = ChunkedTracker::new();
+            let mut offset = head;
+            loop {
+                match tracker.advance(&buf[offset..]) {
+                    ChunkProgress::Done(n) => {
+                        if client.write_all(&buf[..offset + n]).await.is_err() {
+                            return Relayed::ABORTED;
+                        }
+                        return Relayed {
+                            upstream_reusable: keep_alive && buf.len() == offset + n,
+                            client_open: true,
+                        };
+                    }
+                    ChunkProgress::More(n) => {
+                        let ready = offset + n;
+                        if ready > 0 {
+                            if client.write_all(&buf[..ready]).await.is_err() {
+                                return Relayed::ABORTED;
+                            }
+                            // Keep only the unfinished line, if any.
+                            buf.advance(ready);
+                        }
+                        offset = 0;
+                    }
+                    ChunkProgress::Malformed => return Relayed::ABORTED,
+                }
+                make_room(&mut buf);
+                match read_upstream(conn, &mut buf, read_timeout).await {
+                    Ok(n) if n > 0 => {}
+                    _ => return Relayed::ABORTED,
+                }
+            }
+        }
+        ResponseBody::UntilClose => {
+            loop {
+                if !buf.is_empty() && client.write_all(&buf).await.is_err() {
+                    return Relayed::ABORTED;
+                }
+                buf.clear();
+                make_room(&mut buf);
+                match read_upstream(conn, &mut buf, read_timeout).await {
+                    Ok(0) => break, // upstream closed: end of body
+                    Ok(_) => {}
+                    Err(_) => return Relayed::ABORTED,
+                }
+            }
+            // The client has no length to find the end by; closing its
+            // connection is what terminates the body.
+            Relayed {
+                upstream_reusable: false,
+                client_open: false,
+            }
         }
     }
 }
@@ -1720,27 +1908,76 @@ mod tests {
     /// A `MockConn` behind a shared handle, so a test can keep inspecting what
     /// was written after `proxy_forward` has taken ownership of the connection.
     #[derive(Clone)]
-    struct SharedConn(Rc<std::cell::RefCell<MockConn>>);
+    struct SharedConn {
+        conn: Rc<std::cell::RefCell<MockConn>>,
+        opts: Rc<std::cell::RefCell<ConnOpts>>,
+    }
+    /// Optional misbehaviour for a `SharedConn`.
+    #[derive(Default)]
+    struct ConnOpts {
+        /// Once the scripted reads run out, time out instead of reporting EOF
+        /// (an upstream that has gone silent).
+        stall_when_drained: bool,
+        /// Fail writes once this many bytes have been accepted (a client that
+        /// has gone away).
+        fail_writes_after: Option<usize>,
+        /// Another connection to observe: at every read on this one, how many
+        /// bytes the watched one had been sent so far is appended to `seen`.
+        watch: Option<Rc<std::cell::RefCell<MockConn>>>,
+        seen: Vec<usize>,
+    }
     impl SharedConn {
         fn new(chunks: Vec<&[u8]>) -> Self {
-            SharedConn(Rc::new(std::cell::RefCell::new(MockConn::new(chunks))))
+            SharedConn {
+                conn: Rc::new(std::cell::RefCell::new(MockConn::new(chunks))),
+                opts: Rc::default(),
+            }
         }
         fn written(&self) -> String {
-            String::from_utf8_lossy(&self.0.borrow().written).into_owned()
+            String::from_utf8_lossy(&self.conn.borrow().written).into_owned()
+        }
+        fn unread(&self) -> usize {
+            self.conn.borrow().reads.len()
+        }
+        fn stalling(self) -> Self {
+            self.opts.borrow_mut().stall_when_drained = true;
+            self
+        }
+        fn failing_writes_after(self, bytes: usize) -> Self {
+            self.opts.borrow_mut().fail_writes_after = Some(bytes);
+            self
+        }
+        fn watching(self, other: &SharedConn) -> Self {
+            self.opts.borrow_mut().watch = Some(Rc::clone(&other.conn));
+            self
+        }
+        fn seen(&self) -> Vec<usize> {
+            self.opts.borrow().seen.clone()
         }
     }
     impl ProxyIo for SharedConn {
         async fn read_append(&mut self, acc: &mut bytes::BytesMut) -> std::io::Result<usize> {
-            match self.0.borrow_mut().reads.pop_front() {
+            let mut opts = self.opts.borrow_mut();
+            if let Some(watched) = opts.watch.clone() {
+                opts.seen.push(watched.borrow().written.len());
+            }
+            match self.conn.borrow_mut().reads.pop_front() {
                 Some(chunk) => {
                     acc.extend_from_slice(&chunk);
                     Ok(chunk.len())
                 }
+                None if opts.stall_when_drained => Err(std::io::ErrorKind::TimedOut.into()),
                 None => Ok(0), // EOF
             }
         }
         async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-            self.0.borrow_mut().written.extend_from_slice(data);
+            let mut conn = self.conn.borrow_mut();
+            if let Some(limit) = self.opts.borrow().fail_writes_after {
+                if conn.written.len() >= limit {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+            }
+            conn.written.extend_from_slice(data);
             Ok(())
         }
     }
@@ -1788,6 +2025,7 @@ mod tests {
             pool_max_lifetime: Duration::ZERO,
             connect_timeout: Duration::ZERO,
             header_read_timeout: Duration::ZERO,
+            upstream_read_timeout: Duration::ZERO,
             max_request_body_bytes: 0,
             max_requests_per_conn: 0,
             max_connections: 0,
@@ -1799,7 +2037,11 @@ mod tests {
     /// read each), against the scripted `upstreams`. Returns what the client
     /// received and the connector (for its connect count).
     fn run_forward_test(requests: Vec<&[u8]>, upstreams: &[SharedConn]) -> (String, ScriptConnect) {
-        let client = SharedConn::new(requests);
+        run_forward_with(SharedConn::new(requests), upstreams)
+    }
+
+    /// Like `run_forward_test`, for a client connection the test built itself.
+    fn run_forward_with(client: SharedConn, upstreams: &[SharedConn]) -> (String, ScriptConnect) {
         let connector = ScriptConnect::new(upstreams);
         let pool = new_pool(4, 16, Duration::ZERO, Duration::ZERO);
         block_on(proxy_forward(
@@ -1825,7 +2067,7 @@ mod tests {
                 b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: 93.184.216.34\r\n\
                    Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
             ],
-            &[upstream.clone()],
+            std::slice::from_ref(&upstream),
         );
         let sent = upstream.written();
         assert!(sent.starts_with("POST /up HTTP/1.1\r\n"), "{sent}");
@@ -1942,7 +2184,7 @@ mod tests {
     fn forward_does_not_retry_after_a_partial_response() {
         let upstream = SharedConn::new(vec![
             OK_2,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", // then EOF
+            b"HTTP/1.1 200 OK\r\nContent-Len", // then EOF
         ]);
         let spare = SharedConn::new(vec![OK_2]);
         let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare.clone()]);
@@ -1954,9 +2196,234 @@ mod tests {
         assert_eq!(spare.written(), "");
     }
 
-    /// Regression: a POST on a reused connection that failed was sent again,
-    /// so the origin could execute it twice. A POST now always travels on a
-    /// fresh connection and is never replayed.
+    /// A body cut short after its head went out can't become a 502 any more:
+    /// the client gets what arrived and then a closed connection, which tells
+    /// it the response is incomplete. The request is not replayed, and nothing
+    /// else is served on either connection.
+    #[test]
+    fn forward_truncated_body_closes_the_client_connection() {
+        let truncated: [&[u8]; 2] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+        ];
+        for response in truncated {
+            let upstream = SharedConn::new(vec![OK_2, response]); // then EOF
+            let spare = SharedConn::new(vec![OK_2, OK_2]);
+            let (client, connector) =
+                run_forward_test(vec![GET, GET, GET], &[upstream, spare.clone()]);
+            let mut expected = OK_2.to_vec();
+            expected.extend_from_slice(response);
+            assert_eq!(client.as_bytes(), expected);
+            assert_eq!(connector.connects(), 1, "must not reconnect to replay");
+            assert_eq!(spare.written(), "");
+        }
+    }
+
+    /// Regression: the whole response was read into memory before any of it
+    /// was sent on, so a large download cost its size in RAM and an endless
+    /// stream never reached the client at all. Each piece must be on its way
+    /// to the client before the next one is read.
+    #[test]
+    fn forward_streams_the_body_as_it_arrives() {
+        let cases: [Vec<&[u8]>; 3] = [
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n",
+                b"one",
+                b"two",
+                b"six",
+            ],
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                b"3\r\none\r\n",
+                b"3\r\ntwo\r\n",
+                b"0\r\n\r\n",
+            ],
+            // An event stream: no length at all.
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                b"data: 1\n\n",
+                b"data: 2\n\n",
+                b"data: 3\n\n",
+            ],
+        ];
+        for pieces in cases {
+            let client = SharedConn::new(vec![GET]);
+            let upstream = SharedConn::new(pieces.clone()).watching(&client);
+            let (received, _) = run_forward_with(client, std::slice::from_ref(&upstream));
+            assert_eq!(received.as_bytes(), pieces.concat());
+
+            // Before the upstream's read number n+1, the client had already
+            // been sent everything from reads 1..=n. (The very first read
+            // happens with nothing sent yet.)
+            let seen = upstream.seen();
+            let mut sent = 0usize;
+            for (n, piece) in pieces.iter().enumerate() {
+                assert_eq!(seen[n], sent, "before read {} of {pieces:?}", n + 1);
+                sent += piece.len();
+            }
+        }
+    }
+
+    /// Framing that straddles read boundaries (a chunk-size line and a chunk's
+    /// CRLF split across reads) is relayed byte for byte, and the upstream
+    /// stays usable for the next request.
+    #[test]
+    fn forward_streamed_responses_keep_the_upstream_reusable() {
+        let responses: [Vec<&[u8]>; 3] = [
+            vec![
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1",
+                b"0\r\n0123456789abcdef\r",
+                b"\n3;x=y\r\nab",
+                b"c\r\n0\r\nX-Trailer: t\r",
+                b"\n\r\n",
+            ],
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nab",
+                b"cd",
+                b"ef",
+            ],
+            // Everything in one read, the common case for small responses.
+            vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"],
+        ];
+        for pieces in responses {
+            let mut script = pieces.clone();
+            script.push(OK_2);
+            let upstream = SharedConn::new(script);
+            let (client, connector) =
+                run_forward_test(vec![GET, GET], std::slice::from_ref(&upstream));
+            let mut expected = pieces.concat();
+            expected.extend_from_slice(OK_2);
+            assert_eq!(client.as_bytes(), expected);
+            assert_eq!(connector.connects(), 1, "upstream should be reused");
+            assert_eq!(upstream.written().matches("GET /a").count(), 2);
+        }
+    }
+
+    /// Bytes beyond the end of a response mean the upstream is out of step;
+    /// they are not sent to the client and the connection is not reused.
+    #[test]
+    fn forward_drops_surplus_bytes_and_the_connection_that_sent_them() {
+        let responses: [&[u8]; 2] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOKjunk",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOK\r\n0\r\n\r\njunk",
+        ];
+        for response in responses {
+            // The first upstream would answer a second request if asked.
+            let first = SharedConn::new(vec![response, OK_2]);
+            let second = SharedConn::new(vec![OK_2]);
+            let (client, connector) = run_forward_test(vec![GET, GET], &[first.clone(), second]);
+            assert!(!client.contains("junk"), "{client}");
+            assert!(client.ends_with("OK"), "{client}");
+            assert_eq!(connector.connects(), 2);
+            assert_eq!(first.written().matches("GET /a").count(), 1);
+        }
+    }
+
+    /// A malformed chunked body is not passed on past the bad framing.
+    #[test]
+    fn forward_stops_at_malformed_chunked_framing() {
+        let upstream = SharedConn::new(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOK\r\n",
+            b"zz\r\nsmuggled",
+        ]);
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare]);
+        assert!(client.ends_with("2\r\nOK\r\n"), "{client}");
+        assert_eq!(connector.connects(), 1);
+    }
+
+    /// When the client goes away mid-download the proxy stops pulling from the
+    /// upstream instead of reading the rest of an (endless) body.
+    #[test]
+    fn forward_stops_reading_when_the_client_is_gone() {
+        let mut script: Vec<&[u8]> = vec![b"HTTP/1.1 200 OK\r\n\r\n"];
+        script.extend(std::iter::repeat_n(&b"0123456789"[..], 1000));
+        let upstream = SharedConn::new(script);
+        let client = SharedConn::new(vec![GET]).failing_writes_after(100);
+        let (received, _) = run_forward_with(client, std::slice::from_ref(&upstream));
+        assert!(received.len() < 200, "{}", received.len());
+        assert!(upstream.unread() > 900, "{} reads left", upstream.unread());
+    }
+
+    /// An upstream that never answers gets a 504 once the read timeout fires,
+    /// and the request is not replayed, even on a reused connection.
+    #[test]
+    fn forward_answers_504_when_the_upstream_is_silent() {
+        let upstream = SharedConn::new(vec![OK_2]).stalling();
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare.clone()]);
+        assert!(
+            client.ends_with(std::str::from_utf8(RESP_504).unwrap()),
+            "{client}"
+        );
+        assert_eq!(
+            connector.connects(),
+            1,
+            "a timeout is not a stale connection"
+        );
+        assert_eq!(spare.written(), "");
+    }
+
+    /// An upstream that stalls mid-body: the client's connection is closed
+    /// rather than left waiting forever.
+    #[test]
+    fn forward_closes_the_client_when_the_upstream_stalls_mid_body() {
+        let upstream =
+            SharedConn::new(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"]).stalling();
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare]);
+        assert!(client.ends_with("\r\n\r\nabc"), "{client}");
+        assert_eq!(connector.connects(), 1);
+    }
+
+    /// A response head that never ends is cut off instead of buffered.
+    #[test]
+    fn forward_rejects_an_endless_response_head() {
+        let mut script: Vec<&[u8]> = vec![b"HTTP/1.1 200 OK\r\n"];
+        let filler = [b'a'; 1024];
+        script.extend(std::iter::repeat_n(&filler[..], 1000));
+        let upstream = SharedConn::new(script);
+        let (client, _) = run_forward_test(vec![GET], std::slice::from_ref(&upstream));
+        assert_eq!(client.as_bytes(), RESP_502);
+        assert!(upstream.unread() > 900, "{} reads left", upstream.unread());
+    }
+
+    /// Regression: the body limit was only applied to a chunked upload once it
+    /// was complete, so one that never completed was buffered without bound.
+    #[test]
+    fn chunked_upload_over_the_limit_is_rejected_while_still_arriving() {
+        let mut script: Vec<&[u8]> =
+            vec![b"POST http://h/ HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"];
+        script.extend(std::iter::repeat_n(&b"8\r\n01234567\r\n"[..], 1000));
+        let mut conn = MockConn::new(script);
+        let mut acc = BytesMut::new();
+        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 100));
+        assert!(matches!(result, Err(RelayErr::TooLarge)), "{result:?}");
+        assert!(conn.reads.len() > 900, "{} reads left", conn.reads.len());
+
+        // Within the limit it still goes through.
+        let mut ok = MockConn::new(vec![
+            b"POST http://h/ HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"8\r\n01234567\r\n",
+            b"0\r\n\r\n",
+        ]);
+        let mut acc = BytesMut::new();
+        assert!(block_on(relay_once(&mut ok, &mut acc, true, None, 100)).is_ok());
+    }
+
+    /// A request head that never ends is cut off instead of buffered.
+    #[test]
+    fn endless_request_head_is_rejected() {
+        let mut script: Vec<&[u8]> = vec![b"GET http://h/ HTTP/1.1\r\n"];
+        let filler = [b'a'; 1024];
+        script.extend(std::iter::repeat_n(&filler[..], 1000));
+        let mut conn = MockConn::new(script);
+        let mut acc = BytesMut::new();
+        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 0));
+        assert!(matches!(result, Err(RelayErr::Closed)), "{result:?}");
+        assert!(conn.reads.len() > 900, "{} reads left", conn.reads.len());
+    }
+
     #[test]
     fn pool_sweep_closes_expired_connections_for_hosts_never_revisited() {
         let start = std::time::Instant::now();
@@ -2016,6 +2483,9 @@ mod tests {
         assert_eq!(per_worker_pool_cap(1000, 0), 1000);
     }
 
+    /// Regression: a POST on a reused connection that failed was sent again,
+    /// so the origin could execute it twice. A POST now always travels on a
+    /// fresh connection and is never replayed.
     #[test]
     fn forward_never_replays_a_post() {
         const POST: &[u8] = b"POST http://93.184.216.34/charge HTTP/1.1\r\n\

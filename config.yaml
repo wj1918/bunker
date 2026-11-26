@@ -56,6 +56,7 @@ proxy:
 
     # ---- timeouts ----
     header_read_timeout_seconds: 30   # Slowloris protection (0 = disabled)
+    upstream_read_timeout_seconds: 120 # Max wait for the origin to send more (0 = disabled)
 
     # ---- rate limiting per source IP ----
     rate_limit:

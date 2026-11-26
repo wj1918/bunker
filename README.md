@@ -152,6 +152,9 @@ proxy:
     # Raise above 30 if you tunnel over high-latency links
     # and see slowloris-style timeouts on legitimate POSTs.
     header_read_timeout_seconds: 30
+    # Longest wait for the origin to send more of a response. An idle limit,
+    # not a total, so long downloads and event streams are unaffected.
+    upstream_read_timeout_seconds: 120
 
   connection_pool:
     enabled: true
