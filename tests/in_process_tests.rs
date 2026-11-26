@@ -124,13 +124,53 @@ fn test_dns_failover_config() -> DnsFailoverConfig {
 
 /// Start a proxy server and return its address
 async fn start_test_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    start_test_proxy_with(test_security_config()).await
+}
+
+/// A local origin for the proxy tests, so none of them needs the internet:
+/// answers every connection's first request with `200 OK` and the body "OK".
+async fn start_test_origin() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// A proxy that may reach loopback, for tests that talk to `start_test_origin`.
+fn loopback_allowed() -> SecurityConfig {
+    SecurityConfig {
+        block_private_ips: false,
+        ..test_security_config()
+    }
+}
+
+/// Start a proxy server with the given security settings
+async fn start_test_proxy_with(
+    security: SecurityConfig,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let port = get_available_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let listener = TcpListener::bind(addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
 
     let tls_connector = Arc::new(create_tls_connector().unwrap());
-    let security = Arc::new(test_security_config());
+    let security = Arc::new(security);
     let logging = Arc::new(test_logging_config());
     let tcp_keepalive = Arc::new(test_tcp_keepalive_config());
     let pool_config = test_pool_config();
@@ -398,24 +438,10 @@ async fn test_proxy_bad_request_no_host() {
     let (proxy_addr, _handle) = start_test_proxy().await;
 
     let request = "GET /test HTTP/1.1\r\n\r\n";
-    let response = proxy_request(proxy_addr, request).await;
-
-    match response {
-        Ok(resp) => {
-            assert!(
-                resp.contains("400") || resp.contains("Bad Request"),
-                "Expected 400, got: {}",
-                resp
-            );
-        }
-        Err(e) => {
-            // Connection close is also acceptable for bad requests
-            println!(
-                "Connection closed/error (acceptable for bad request): {}",
-                e
-            );
-        }
-    }
+    let response = proxy_request(proxy_addr, request)
+        .await
+        .expect("a request without a host must be answered, not dropped");
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 }
 
 #[tokio::test]
@@ -515,53 +541,62 @@ async fn test_proxy_connect_blocked_loopback() {
 }
 
 #[tokio::test]
-async fn test_proxy_http_request_to_external() {
-    let (proxy_addr, _handle) = start_test_proxy().await;
+async fn test_proxy_http_request_is_forwarded() {
+    let origin = start_test_origin().await;
+    let (proxy_addr, _handle) = start_test_proxy_with(loopback_allowed()).await;
 
     let request =
-        "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-    let response = proxy_request(proxy_addr, request).await;
-
-    match response {
-        Ok(resp) => {
-            // Should get 200 OK, 502, 503, or 504 (network issues/timeout)
-            assert!(
-                resp.contains("200")
-                    || resp.contains("502")
-                    || resp.contains("503")
-                    || resp.contains("504"),
-                "Expected 200, 502, 503, or 504, got: {}",
-                &resp[..resp.len().min(200)]
-            );
-        }
-        Err(e) => {
-            // Network errors are acceptable in CI environments
-            println!("Network error (acceptable): {}", e);
-        }
-    }
+        format!("GET http://{origin}/ HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n");
+    let response = proxy_request(proxy_addr, &request)
+        .await
+        .expect("the proxy must answer");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("OK"), "{response}");
 }
 
 #[tokio::test]
-async fn test_proxy_connect_to_external() {
-    let (proxy_addr, _handle) = start_test_proxy().await;
+async fn test_proxy_connect_tunnel_is_established() {
+    let origin = start_test_origin().await;
+    let (proxy_addr, _handle) = start_test_proxy_with(loopback_allowed()).await;
 
-    let request = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
-    let response = proxy_request(proxy_addr, request).await;
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(format!("CONNECT {origin} HTTP/1.1\r\nHost: {origin}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
 
-    match response {
-        Ok(resp) => {
-            // Should get 200 Connection Established or 502 (network issues)
-            assert!(
-                resp.contains("200") || resp.contains("502") || resp.contains("503"),
-                "Expected 200, 502, or 503, got: {}",
-                resp
-            );
+    // Read the proxy's answer, then speak to the origin through the tunnel.
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    let read = async {
+        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed before the CONNECT was answered");
+            seen.extend_from_slice(&buf[..n]);
         }
-        Err(e) => {
-            // Network errors are acceptable
-            println!("Network error (acceptable): {}", e);
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("no answer to CONNECT");
+    let answer = String::from_utf8_lossy(&seen).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut through = Vec::new();
+    let read = async {
+        while !through.ends_with(b"OK") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "tunnel closed before the origin's answer arrived");
+            through.extend_from_slice(&buf[..n]);
         }
-    }
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("nothing came back through the tunnel");
+    assert!(String::from_utf8_lossy(&through).starts_with("HTTP/1.1 200 OK"));
 }
 
 #[tokio::test]
