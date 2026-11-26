@@ -1458,6 +1458,9 @@ mod tokio_backend {
             let conn = on.connect(addr).await.unwrap();
             let sock = socket2::SockRef::from(&conn.0);
             assert!(sock.keepalive().unwrap());
+            // socket2 has no getter for the idle time on Windows, so there
+            // only the on/off state can be read back.
+            #[cfg(not(windows))]
             assert_eq!(
                 sock.tcp_keepalive_time().unwrap(),
                 std::time::Duration::from_secs(77)
