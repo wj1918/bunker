@@ -235,6 +235,16 @@ pub fn split_host_port(authority: &str) -> (&str, Option<u16>) {
     }
 }
 
+/// True if `host` is `domain` itself or a subdomain of it (`a.b.domain`),
+/// compared ASCII case-insensitively. An empty `domain` matches nothing.
+fn host_is_or_under(host: &str, domain: &str) -> bool {
+    if domain.is_empty() || host.len() < domain.len() {
+        return false;
+    }
+    let (prefix, tail) = host.as_bytes().split_at(host.len() - domain.len());
+    tail.eq_ignore_ascii_case(domain.as_bytes()) && (prefix.is_empty() || prefix.ends_with(b"."))
+}
+
 /// Check whether a target (already split into host + optional port) should be
 /// blocked. SSRF prevention via port policy, blocked-host patterns, and
 /// literal private-IP / dangerous-hostname detection.
@@ -257,15 +267,21 @@ pub fn is_blocked_target(
         }
     }
 
+    // Hostnames are case-insensitive and may be written with a trailing dot
+    // (the fully-qualified form). Both spellings resolve to the same host, so
+    // match on the canonical form: `WWW.EVIL.COM` and `www.evil.com.` must hit
+    // a `*.evil.com` pattern exactly like `www.evil.com` does.
+    let host = host.strip_suffix('.').unwrap_or(host);
+
     // Check blocked hosts patterns
     for pattern in &security.blocked_hosts {
-        if pattern.starts_with("*.") {
-            // Wildcard pattern like "*.internal"
-            let suffix = &pattern[1..]; // ".internal"
-            if host.ends_with(suffix) || host == &pattern[2..] {
+        let pattern = pattern.strip_suffix('.').unwrap_or(pattern);
+        if let Some(domain) = pattern.strip_prefix("*.") {
+            // Wildcard pattern like "*.internal": the domain and its subdomains.
+            if host_is_or_under(host, domain) {
                 return Some("Host matches blocked pattern");
             }
-        } else if host == pattern || host.ends_with(&format!(".{}", pattern)) {
+        } else if host_is_or_under(host, pattern) {
             return Some("Host in blocklist");
         }
     }
@@ -281,10 +297,7 @@ pub fn is_blocked_target(
 
         // Also check common dangerous hostnames
         let dangerous_hosts = ["localhost", "metadata", "metadata.google.internal"];
-        if dangerous_hosts
-            .iter()
-            .any(|&h| host == h || host.ends_with(&format!(".{}", h)))
-        {
+        if dangerous_hosts.iter().any(|&h| host_is_or_under(host, h)) {
             return Some("Dangerous hostname blocked");
         }
     }
@@ -878,5 +891,65 @@ mod tests {
         // Public bracketed IPv6 is allowed.
         let (host, port) = split_host_port("[2001:4860:4860::8888]:443");
         assert!(is_blocked_target(host, port, &security).is_none());
+    }
+
+    /// Regression: blocked-host matching was case-sensitive and didn't know the
+    /// trailing-dot (fully-qualified) spelling, so both bypassed the blocklist.
+    #[test]
+    fn blocked_hosts_ignore_case_and_trailing_dot() {
+        let mut sec = default_security();
+        sec.block_private_ips = false;
+        sec.blocked_hosts = vec!["*.evil.com".to_string(), "Facebook.com.".to_string()];
+
+        for host in [
+            "www.evil.com",
+            "WWW.EVIL.COM",
+            "www.evil.com.",
+            "Www.Evil.Com.",
+            "evil.com",
+            "EVIL.COM.",
+            "facebook.com",
+            "FACEBOOK.COM",
+            "facebook.com.",
+            "m.FaceBook.com.",
+        ] {
+            assert!(
+                is_blocked_target(host, Some(80), &sec).is_some(),
+                "{host} should be blocked"
+            );
+        }
+        // Not a subdomain: only a shared suffix.
+        for host in ["notevil.com", "evil.com.example.org", "myfacebook.com"] {
+            assert!(
+                is_blocked_target(host, Some(80), &sec).is_none(),
+                "{host} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_hostnames_ignore_case_and_trailing_dot() {
+        let sec = default_security(); // block_private_ips: true
+        for host in [
+            "LOCALHOST",
+            "localhost.",
+            "Foo.LocalHost.",
+            "METADATA.GOOGLE.INTERNAL.",
+            "127.0.0.1.",
+        ] {
+            assert!(
+                is_blocked_target(host, Some(80), &sec).is_some(),
+                "{host} should be blocked"
+            );
+        }
+        assert!(is_blocked_target("notlocalhost", Some(80), &sec).is_none());
+    }
+
+    #[test]
+    fn empty_blocked_host_pattern_matches_nothing() {
+        let mut sec = default_security();
+        sec.blocked_hosts = vec![String::new(), "*.".to_string(), ".".to_string()];
+        assert!(is_blocked_target("example.com", Some(80), &sec).is_none());
+        assert!(is_blocked_target("example.com.", Some(80), &sec).is_none());
     }
 }

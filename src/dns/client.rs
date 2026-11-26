@@ -103,6 +103,21 @@ impl DnsClient {
     }
 }
 
+/// An unpredictable DNS transaction ID from the OS CSPRNG.
+fn random_query_id() -> u16 {
+    let mut bytes = [0u8; 2];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return u16::from_ne_bytes(bytes);
+    }
+    // The OS RNG essentially never fails. If it does, fall back to std's
+    // randomly keyed SipHash (seeded from the OS at thread start, re-keyed per
+    // `RandomState`) rather than a predictable constant.
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish() as u16
+}
+
 /// Upstream-backed resolution: A + AAAA in parallel, cache check first, fall
 /// back to `handle_dns_query_with_resolver` (which handles failover, retries,
 /// serve-stale, and anti-spoofing).
@@ -114,12 +129,13 @@ async fn resolve_via_upstream(
     resolver: &UdpDnsResolver,
     enable_logging: bool,
 ) -> Result<Vec<IpAddr>, DnsError> {
-    // Use a fixed synthetic ID for the wire queries — the cache rewrites
-    // IDs on lookup and we're not feeding anyone, so this value doesn't
-    // need to be random.
-    const SYNTH_ID: u16 = 0;
-    let a_query = builder::build_query(host, RecordType::A, SYNTH_ID);
-    let aaaa_query = builder::build_query(host, RecordType::AAAA, SYNTH_ID);
+    // Each query gets its own unpredictable transaction ID. The ID is half of
+    // what an off-path attacker must guess to forge an upstream reply (the
+    // other half is the source port) — `validate_upstream_response` checks it,
+    // and that check is worthless against a fixed, known value. The cache
+    // rewrites IDs on lookup, so nothing downstream depends on the value.
+    let a_query = builder::build_query(host, RecordType::A, random_query_id());
+    let aaaa_query = builder::build_query(host, RecordType::AAAA, random_query_id());
 
     // Run A and AAAA in parallel. Each task: cache check first, then if miss
     // forward to upstreams (with the existing failover/serve-stale machinery).
@@ -315,5 +331,74 @@ mod tests {
         let client = DnsClient::new_upstream(cache, upstreams, failover, security, false);
         let ips = client.resolve("example.test").await.unwrap();
         assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+    }
+
+    /// A fake upstream on loopback. Answers A queries with 192.0.2.1 and AAAA
+    /// queries with an empty answer, and reports each transaction ID it sees.
+    async fn spawn_fake_upstream() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<u16>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                let query = &buf[..len];
+                let _ = tx.send(u16::from_be_bytes([query[0], query[1]]));
+                // QTYPE is the 2 bytes before the trailing 2-byte QCLASS.
+                let qtype = u16::from_be_bytes([query[len - 4], query[len - 3]]);
+                let response = if qtype == 1 {
+                    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+                    builder::build_response_with_ips(query, &[ip], RecordType::A, 60)
+                } else {
+                    builder::build_response_with_ips(query, &[], RecordType::AAAA, 60)
+                };
+                let _ = socket.send_to(&response, from).await;
+            }
+        });
+        (addr, rx)
+    }
+
+    /// Regression: every query the proxy sent upstream carried transaction ID
+    /// 0, so a forged reply only had to guess the source port.
+    #[tokio::test]
+    async fn upstream_queries_use_unpredictable_transaction_ids() {
+        let (upstream, mut seen) = spawn_fake_upstream().await;
+        let client = DnsClient::new_upstream(
+            new_cache(),
+            Arc::new(vec![upstream]),
+            Arc::new(DnsFailoverConfig::default()),
+            Arc::new(DnsSecurityConfig::default()),
+            false,
+        );
+
+        const HOSTS: usize = 8;
+        for i in 0..HOSTS {
+            let ips = client.resolve(&format!("host{i}.test")).await.unwrap();
+            assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+        }
+
+        let mut ids = Vec::new();
+        while let Ok(id) = seen.try_recv() {
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), HOSTS * 2, "one A and one AAAA query per host");
+        let distinct: std::collections::HashSet<u16> = ids.iter().copied().collect();
+        // 16 random 16-bit IDs: even one collision is a ~0.2% event, so
+        // demanding at least 12 distinct values can't flake in practice,
+        // while a constant (or A/AAAA-shared constant) ID fails outright.
+        assert!(
+            distinct.len() >= 12,
+            "transaction IDs look predictable: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn random_query_ids_vary() {
+        let ids: std::collections::HashSet<u16> = (0..64).map(|_| random_query_id()).collect();
+        assert!(
+            ids.len() > 32,
+            "only {} distinct IDs in 64 draws",
+            ids.len()
+        );
     }
 }

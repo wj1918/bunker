@@ -75,6 +75,7 @@ dependencies = [
  "chrono",
  "embed-resource",
  "flate2",
+ "getrandom",
  "httparse",
  "hyper",
  "hyper-util",

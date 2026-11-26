@@ -27,6 +27,9 @@ bytes = "1"
 httparse = "1"
 mimalloc = "0.1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# OS randomness for DNS transaction IDs. Already in the dependency tree (via
+# ring), so this adds no new crate.
+getrandom = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
 socket2 = { version = "0.6", features = ["all"] }

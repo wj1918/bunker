@@ -500,6 +500,141 @@ pub fn scan_message_with_metadata(
     (scan, metadata)
 }
 
+/// Result of scanning a buffer for one HTTP/1 *response*, framed per RFC 7230
+/// §3.3.3 — which, unlike request framing, depends on the request method and
+/// the status code, and allows a body delimited by connection close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseScan {
+    /// A complete response occupies the first `total` bytes (`head` of them are
+    /// the status line + headers).
+    Complete {
+        head: usize,
+        total: usize,
+        /// A 1xx interim response (other than 101): NOT the answer to the
+        /// request — the final response follows on the same connection.
+        interim: bool,
+        /// Whether the upstream connection may carry another request after
+        /// this response (HTTP/1.1 without `Connection: close`, or HTTP/1.0
+        /// with `Connection: keep-alive`).
+        keep_alive: bool,
+    },
+    /// The head is complete and the body has no declared length: it runs until
+    /// the upstream closes the connection. `head` is the head length.
+    UntilClose { head: usize },
+    /// Need more bytes.
+    Incomplete,
+    /// Malformed head or rejected framing.
+    Error(MessageError),
+}
+
+/// True if any `Connection` header in `pairs` lists `token` (case-insensitive).
+fn connection_has_token(pairs: &[(&[u8], &[u8])], token: &[u8]) -> bool {
+    pairs
+        .iter()
+        .filter(|(name, _)| eq_ignore_ascii_case_bytes(name, b"connection"))
+        .flat_map(|(_, value)| value.split(|&c| c == b','))
+        .any(|t| eq_ignore_ascii_case_bytes(trim_ows(t), token))
+}
+
+/// Scan `buf` for exactly one HTTP/1 response. `head_request` says whether the
+/// request this answers was a HEAD (its response never has a body, whatever
+/// Content-Length / Transfer-Encoding claim).
+///
+/// Rules, in RFC 7230 §3.3.3 order:
+///   1. HEAD responses, 1xx, 204 and 304 end at the head.
+///   2. Transfer-Encoding with final coding `chunked` => chunked body.
+///      (Content-Length together with Transfer-Encoding, or an unframeable
+///      Transfer-Encoding, is rejected — same strictness as for requests.)
+///   3. Content-Length => fixed-length body.
+///   4. Neither => the body runs until the connection closes.
+///
+/// Pure and incremental, like `scan_message`.
+pub fn scan_response(buf: &[u8], head_request: bool) -> ResponseScan {
+    let head_end = match find(buf, b"\r\n\r\n") {
+        Some(i) => i + 4,
+        None => return ResponseScan::Incomplete,
+    };
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut resp = httparse::Response::new(&mut headers);
+    match resp.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => debug_assert_eq!(n, head_end),
+        Ok(httparse::Status::Partial) => return ResponseScan::Incomplete,
+        Err(httparse::Error::TooManyHeaders) => {
+            return ResponseScan::Error(MessageError::TooManyHeaders)
+        }
+        Err(_) => return ResponseScan::Error(MessageError::BadHead),
+    }
+    let code = resp.code.unwrap_or(0);
+    let http10 = resp.version == Some(0);
+    let pairs: Vec<(&[u8], &[u8])> = resp
+        .headers
+        .iter()
+        .map(|h| (h.name.as_bytes(), h.value))
+        .collect();
+
+    let keep_alive = if http10 {
+        connection_has_token(&pairs, b"keep-alive")
+    } else {
+        !connection_has_token(&pairs, b"close")
+    };
+
+    // (1) Responses that never carry a body.
+    if (100..200).contains(&code) {
+        // 101 Switching Protocols ends HTTP on this connection: it is final,
+        // and the connection can't carry another request.
+        let interim = code != 101;
+        return ResponseScan::Complete {
+            head: head_end,
+            total: head_end,
+            interim,
+            keep_alive: interim && keep_alive,
+        };
+    }
+    if head_request || code == 204 || code == 304 {
+        return ResponseScan::Complete {
+            head: head_end,
+            total: head_end,
+            interim: false,
+            keep_alive,
+        };
+    }
+
+    // (2)-(4) Framing from the headers.
+    let has_length_header = pairs.iter().any(|(name, _)| {
+        eq_ignore_ascii_case_bytes(name, b"content-length")
+            || eq_ignore_ascii_case_bytes(name, b"transfer-encoding")
+    });
+    if !has_length_header {
+        return ResponseScan::UntilClose { head: head_end };
+    }
+    let body_len = match analyze_framing(&pairs) {
+        Err(e) => return ResponseScan::Error(MessageError::Framing(e)),
+        Ok(BodyFraming::None) => 0,
+        Ok(BodyFraming::ContentLength(n)) => match usize::try_from(n) {
+            Ok(n) => n,
+            Err(_) => return ResponseScan::Error(MessageError::BadHead),
+        },
+        Ok(BodyFraming::Chunked) => match scan_chunked(&buf[head_end..]) {
+            ChunkScan::Complete(len) => len,
+            ChunkScan::Incomplete => return ResponseScan::Incomplete,
+            ChunkScan::Malformed => return ResponseScan::Error(MessageError::BadChunked),
+        },
+    };
+    let total = match head_end.checked_add(body_len) {
+        Some(t) => t,
+        None => return ResponseScan::Error(MessageError::BadHead),
+    };
+    if buf.len() < total {
+        return ResponseScan::Incomplete;
+    }
+    ResponseScan::Complete {
+        head: head_end,
+        total,
+        interim: false,
+        keep_alive,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,6 +1181,165 @@ mod tests {
                 ..
             } => {}
             other => panic!("expected Complete chunked, got {:?}", other),
+        }
+    }
+
+    // ---- scan_response: RFC 7230 §3.3.3 response rules ----
+
+    fn complete(head: usize, total: usize, keep_alive: bool) -> ResponseScan {
+        ResponseScan::Complete {
+            head,
+            total,
+            interim: false,
+            keep_alive,
+        }
+    }
+
+    #[test]
+    fn response_content_length_body() {
+        let r = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let head = r.len() - 5;
+        assert_eq!(scan_response(r, false), complete(head, r.len(), true));
+        // Body not all here yet.
+        assert_eq!(
+            scan_response(&r[..r.len() - 1], false),
+            ResponseScan::Incomplete
+        );
+    }
+
+    #[test]
+    fn response_to_head_has_no_body_despite_content_length() {
+        // The origin describes the body a GET would return but sends none.
+        let r = b"HTTP/1.1 200 OK\r\nContent-Length: 1256\r\n\r\n";
+        assert_eq!(scan_response(r, true), complete(r.len(), r.len(), true));
+        // The same bytes answering a GET are an unfinished response.
+        assert_eq!(scan_response(r, false), ResponseScan::Incomplete);
+    }
+
+    #[test]
+    fn response_to_head_has_no_body_despite_chunked() {
+        let r = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(scan_response(r, true), complete(r.len(), r.len(), true));
+    }
+
+    #[test]
+    fn response_204_and_304_have_no_body() {
+        for status in ["204 No Content", "304 Not Modified"] {
+            let r = format!("HTTP/1.1 {status}\r\nContent-Length: 10\r\n\r\n");
+            assert_eq!(
+                scan_response(r.as_bytes(), false),
+                complete(r.len(), r.len(), true),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_1xx_is_interim_and_ends_at_head() {
+        let interim = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let mut buf = interim.to_vec();
+        buf.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+        assert_eq!(
+            scan_response(&buf, false),
+            ResponseScan::Complete {
+                head: interim.len(),
+                total: interim.len(),
+                interim: true,
+                keep_alive: true,
+            }
+        );
+        // 103 Early Hints carries headers but is still interim and bodiless.
+        let hints = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n";
+        assert!(matches!(
+            scan_response(hints, false),
+            ResponseScan::Complete { interim: true, total, .. } if total == hints.len()
+        ));
+    }
+
+    #[test]
+    fn response_101_is_final_and_not_reusable() {
+        let r = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(scan_response(r, false), complete(r.len(), r.len(), false));
+    }
+
+    #[test]
+    fn response_without_length_runs_until_close() {
+        let r = b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html>";
+        let head = r.len() - 6;
+        assert_eq!(scan_response(r, false), ResponseScan::UntilClose { head });
+        // HTTP/1.1 without a length is close-delimited too.
+        let r11 = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial";
+        assert!(matches!(
+            scan_response(r11, false),
+            ResponseScan::UntilClose { .. }
+        ));
+    }
+
+    #[test]
+    fn response_explicit_zero_length_is_complete_not_until_close() {
+        let r = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(scan_response(r, false), complete(r.len(), r.len(), true));
+    }
+
+    #[test]
+    fn response_chunked_body() {
+        let r = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let head = find(r, b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(scan_response(r, false), complete(head, r.len(), true));
+        assert_eq!(
+            scan_response(&r[..r.len() - 2], false),
+            ResponseScan::Incomplete
+        );
+    }
+
+    #[test]
+    fn response_keep_alive_follows_version_and_connection_header() {
+        let ka = |r: &[u8]| match scan_response(r, false) {
+            ResponseScan::Complete { keep_alive, .. } => keep_alive,
+            other => panic!("expected Complete, got {:?}", other),
+        };
+        assert!(ka(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+        assert!(!ka(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(!ka(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: foo, Close\r\n\r\n"
+        ));
+        // HTTP/1.0 closes by default...
+        assert!(!ka(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"));
+        // ...unless it opts in.
+        assert!(ka(
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn response_rejects_conflicting_framing_and_bad_heads() {
+        assert_eq!(
+            scan_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+                false
+            ),
+            ResponseScan::Error(MessageError::Framing(FramingError::ClTeConflict))
+        );
+        assert_eq!(
+            scan_response(b"NOT-HTTP garbage\r\n\r\n", false),
+            ResponseScan::Error(MessageError::BadHead)
+        );
+        assert_eq!(
+            scan_response(b"HTTP/1.1 200 OK\r\nContent-Le", false),
+            ResponseScan::Incomplete
+        );
+    }
+
+    #[test]
+    fn scan_response_never_panics_on_truncation() {
+        let r =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX: y\r\n\r\n";
+        for head_request in [false, true] {
+            for n in 0..=r.len() {
+                let _ = scan_response(&r[..n], head_request);
+            }
         }
     }
 }

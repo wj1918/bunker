@@ -64,6 +64,10 @@ pub trait DnsResolver: Send + Sync {
     ) -> impl Future<Output = Result<Vec<u8>, DnsError>> + Send;
 }
 
+/// Largest payload a UDP datagram can carry (65535 minus IP and UDP headers
+/// is smaller still; this bound is simply never exceeded).
+pub(crate) const MAX_UDP_PAYLOAD: usize = 65535;
+
 /// UDP-based DNS resolver implementation
 pub struct UdpDnsResolver {
     security: DnsSecurityConfig,
@@ -99,8 +103,13 @@ impl DnsResolver for UdpDnsResolver {
             .await
             .map_err(|e| DnsError::ParseError(e.to_string()))?;
 
-        let mut response_buf = vec![0u8; 512];
-        let result = tokio::time::timeout(timeout, socket.recv_from(&mut response_buf)).await;
+        // Room for the largest possible UDP payload. Client queries are
+        // forwarded verbatim, including an EDNS0 OPT record that tells the
+        // upstream it may answer with up to 1232 / 4096 / ... bytes; a 512-byte
+        // buffer silently cut such answers short on Linux (and was then cached
+        // corrupted) and failed the read outright on Windows.
+        let mut recv_buf = vec![0u8; MAX_UDP_PAYLOAD];
+        let result = tokio::time::timeout(timeout, socket.recv_from(&mut recv_buf)).await;
 
         match result {
             Ok(Ok((len, from))) => {
@@ -115,7 +124,9 @@ impl DnsResolver for UdpDnsResolver {
                     }
                     return Err(DnsError::SpoofingDetected);
                 }
-                response_buf.truncate(len);
+                // Copy out just the datagram: the result is long-lived (it is
+                // cached), so it must not keep the 64 KiB receive allocation.
+                let response_buf = recv_buf[..len].to_vec();
                 // Transaction-ID + question-section echo checks. These run
                 // unconditionally — the spoofing surface they cover (off-path
                 // ID guess; on-path attacker who spoofs the upstream's source
@@ -367,5 +378,42 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DnsError::UpstreamFailed));
+    }
+
+    /// Regression: upstream answers were read into a 512-byte buffer, so a
+    /// larger answer (normal once the client advertises EDNS0) came back cut
+    /// short on Linux and failed the read on Windows.
+    #[tokio::test]
+    async fn udp_resolver_returns_answers_larger_than_512_bytes() {
+        use crate::dns::wire::{builder, RecordType};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let query = builder::build_query("big.test", RecordType::A, 0x4242);
+        // 100 A records: well over 512 bytes, under a typical 1232-byte limit.
+        let ips: Vec<IpAddr> = (0..100)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)))
+            .collect();
+        let big = builder::build_response_with_ips(&query, &ips, RecordType::A, 60);
+        assert!(big.len() > 512, "test answer is only {} bytes", big.len());
+
+        let expected = big.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, from) = upstream.recv_from(&mut buf).await.unwrap();
+            upstream.send_to(&big, from).await.unwrap();
+        });
+
+        let resolver = UdpDnsResolver::new(DnsSecurityConfig::default());
+        let got = resolver
+            .resolve(&query, upstream_addr, Duration::from_secs(3), false)
+            .await
+            .expect("large answer should be accepted");
+        assert_eq!(got.len(), expected.len());
+        assert_eq!(got, expected);
+        // The cached copy must not pin the 64 KiB receive buffer.
+        assert!(got.capacity() < 4096, "capacity {}", got.capacity());
     }
 }

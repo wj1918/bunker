@@ -1,7 +1,8 @@
 //! Forward-proxy request rewriting (pure, I/O-free). A forward proxy receives
 //! absolute-form request lines (`GET http://host:port/path HTTP/1.1`) and must
 //! rewrite them to origin-form (`GET /path HTTP/1.1`) before sending upstream,
-//! strip hop-by-hop headers, and add `X-Forwarded-For`. This module does exactly
+//! strip hop-by-hop headers, set `Host` to the routed target, and set
+//! `X-Forwarded-For` to the client's address. This module does exactly
 //! that on raw bytes so it's reusable by any runtime backend and unit-testable.
 //!
 //! Like framing.rs, the dangerous parsing reuses httparse; the rewriting and
@@ -15,6 +16,14 @@ use std::net::IpAddr;
 const MAX_HEADERS: usize = 100;
 
 /// RFC 7230 hop-by-hop headers — must not be forwarded to the upstream.
+///
+/// `Transfer-Encoding` is deliberately NOT stripped, although it is hop-by-hop:
+/// the body is relayed undecoded, so a chunked body must keep the header that
+/// frames it. Dropping it would hand the origin a request with no body length,
+/// followed by raw chunk bytes it would parse as a second request (request
+/// smuggling / connection desync). The framing pass has already rejected any
+/// Transfer-Encoding whose final coding isn't a single `chunked`, and any
+/// request carrying both Transfer-Encoding and Content-Length.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -23,12 +32,46 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
     "te",
     "trailers",
-    "transfer-encoding",
     "upgrade",
 ];
 
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Headers of the client's request that are not copied to the upstream:
+/// hop-by-hop headers, plus two the proxy writes itself.
+///
+/// * `Host` — re-emitted from the target the request is actually routed to
+///   (see `push_host_header`). Forwarding the client's own value would let
+///   `GET http://allowed.example/` with `Host: blocked.example` pass the
+///   blocklist on the URL while a shared server routes by the header.
+/// * `X-Forwarded-For` — replaced by the real peer address. Copying the
+///   client's would put a forged address first in the list, where origins that
+///   trust the header read it. (The hyper path drops it for the same reason.)
+fn is_dropped_request_header(name: &str) -> bool {
+    is_hop_by_hop(name)
+        || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("x-forwarded-for")
+}
+
+/// Append `Host: <target>` for the host the request is routed to. The port is
+/// omitted when it is the scheme's default; IPv6 literals get their brackets
+/// back (`split_host_port` strips them).
+fn push_host_header(out: &mut Vec<u8>, host: &str, port: u16, default_port: u16) {
+    out.extend_from_slice(b"Host: ");
+    if host.contains(':') {
+        out.push(b'[');
+        out.extend_from_slice(host.as_bytes());
+        out.push(b']');
+    } else {
+        out.extend_from_slice(host.as_bytes());
+    }
+    if port != default_port {
+        out.push(b':');
+        out.extend_from_slice(port.to_string().as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// The resolved upstream target of a forward-proxy request.
@@ -99,7 +142,7 @@ pub fn rewrite_forward_with_metadata(
     }
 
     // Determine (host, port, origin-form path) from the request target.
-    let (host, port, origin_path): (String, u16, String) = if let Some(rest) =
+    let (host, port, default_port, origin_path): (String, u16, u16, String) = if let Some(rest) =
         strip_scheme(request_target)
     {
         // absolute-form: http(s)://authority[/path]
@@ -112,11 +155,12 @@ pub fn rewrite_forward_with_metadata(
             "/"
         };
         let (h, p) = split_host_port(authority);
-        let port = p.filter(|&p| p != 0).unwrap_or(if tls { 443 } else { 80 });
+        let default_port = if tls { 443 } else { 80 };
+        let port = p.filter(|&p| p != 0).unwrap_or(default_port);
         if h.is_empty() {
             return Err(ForwardError::NoTarget);
         }
-        (h.to_string(), port, path.to_string())
+        (h.to_string(), port, default_port, path.to_string())
     } else if request_target.starts_with('/') {
         // origin-form: route via the Host header.
         let host_hdr = parsed
@@ -132,6 +176,7 @@ pub fn rewrite_forward_with_metadata(
         (
             h.to_string(),
             p.filter(|&p| p != 0).unwrap_or(80),
+            80,
             request_target.to_string(),
         )
     } else {
@@ -144,8 +189,9 @@ pub fn rewrite_forward_with_metadata(
     out.push(b' ');
     out.extend_from_slice(origin_path.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
+    push_host_header(&mut out, &host, port, default_port);
     for h in parsed.headers.iter() {
-        if is_hop_by_hop(h.name) {
+        if is_dropped_request_header(h.name) {
             continue;
         }
         out.extend_from_slice(h.name.as_bytes());
@@ -186,7 +232,7 @@ fn rewrite_fast_path(
         std::str::from_utf8(&req[m.path.clone()]).map_err(|_| ForwardError::BadRequest)?;
 
     // Mirror the slow-path target-extraction exactly so behavior is bit-identical.
-    let (host, port, origin_path): (String, u16, String) = if let Some(rest) =
+    let (host, port, default_port, origin_path): (String, u16, u16, String) = if let Some(rest) =
         strip_scheme(request_target)
     {
         // absolute-form: http(s)://authority[/path]
@@ -199,11 +245,12 @@ fn rewrite_fast_path(
             "/"
         };
         let (h, p) = split_host_port(authority);
-        let port = p.filter(|&p| p != 0).unwrap_or(if tls { 443 } else { 80 });
+        let default_port = if tls { 443 } else { 80 };
+        let port = p.filter(|&p| p != 0).unwrap_or(default_port);
         if h.is_empty() {
             return Err(ForwardError::NoTarget);
         }
-        (h.to_string(), port, path.to_string())
+        (h.to_string(), port, default_port, path.to_string())
     } else if request_target.starts_with('/') {
         // origin-form: route via the Host header (looked up by name range).
         let host_hdr = m
@@ -223,6 +270,7 @@ fn rewrite_fast_path(
         (
             h.to_string(),
             p.filter(|&p| p != 0).unwrap_or(80),
+            80,
             request_target.to_string(),
         )
     } else {
@@ -235,6 +283,7 @@ fn rewrite_fast_path(
     out.push(b' ');
     out.extend_from_slice(origin_path.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
+    push_host_header(&mut out, &host, port, default_port);
     for hr in &m.headers {
         let name_bytes = &req[hr.name.clone()];
         // Hop-by-hop check needs the name as &str for case-insensitive compare.
@@ -244,7 +293,7 @@ fn rewrite_fast_path(
             Ok(s) => s,
             Err(_) => continue,
         };
-        if is_hop_by_hop(name_str) {
+        if is_dropped_request_header(name_str) {
             continue;
         }
         out.extend_from_slice(name_bytes);
@@ -469,5 +518,107 @@ mod tests {
             }
         );
         assert!(out.starts_with("GET /p HTTP/1.1\r\n"));
+    }
+
+    /// Regression: the chunked body is relayed undecoded, so the header that
+    /// frames it must survive the rewrite on both the slow and the fast path.
+    #[test]
+    fn chunked_request_keeps_transfer_encoding() {
+        let raw = "POST http://example.com/up HTTP/1.1\r\nHost: example.com\r\n\
+                   Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n\
+                   5\r\nhello\r\n0\r\n\r\n";
+        let req = Bytes::from(raw.as_bytes().to_vec());
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+
+        let (scan, meta) = crate::proxy::framing::scan_message_with_metadata(&req, true, 0);
+        assert!(matches!(
+            scan,
+            crate::proxy::framing::MessageScan::Complete { .. }
+        ));
+
+        let slow = rewrite_forward_with_metadata(&req, ip, None).unwrap();
+        let fast = rewrite_forward_with_metadata(&req, ip, meta.as_ref()).unwrap();
+        assert_eq!(slow, fast, "fast path must match the slow path");
+
+        let (_, head, body) = slow;
+        let head = String::from_utf8(head.to_vec()).unwrap();
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"), "{head}");
+        // Real hop-by-hop headers are still stripped.
+        assert!(!head.to_ascii_lowercase().contains("connection:"), "{head}");
+        assert_eq!(&body[..], b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    /// Rewrite on both paths and insist they agree; return the upstream head.
+    fn rewritten_head(raw: &str) -> String {
+        let req = Bytes::from(raw.as_bytes().to_vec());
+        let ip: IpAddr = "10.0.0.7".parse().unwrap();
+        let (_, meta) = crate::proxy::framing::scan_message_with_metadata(&req, true, 0);
+        let slow = rewrite_forward_with_metadata(&req, ip, None).unwrap();
+        let fast = rewrite_forward_with_metadata(&req, ip, meta.as_ref()).unwrap();
+        assert_eq!(slow, fast, "fast path must match the slow path");
+        String::from_utf8(slow.1.to_vec()).unwrap()
+    }
+
+    /// Regression: the client's Host header was forwarded as-is, so it could
+    /// name a different (blocked) site than the URL the checks ran on.
+    #[test]
+    fn host_header_is_rewritten_to_the_routed_target() {
+        let head = rewritten_head(
+            "GET http://allowed.example/x HTTP/1.1\r\nHost: blocked.example\r\nAccept: */*\r\n\r\n",
+        );
+        assert_eq!(
+            head,
+            "GET /x HTTP/1.1\r\nHost: allowed.example\r\nAccept: */*\r\n\
+             X-Forwarded-For: 10.0.0.7\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn host_header_is_added_when_the_client_sent_none() {
+        let head = rewritten_head("GET http://example.com/ HTTP/1.1\r\n\r\n");
+        assert!(head.contains("\r\nHost: example.com\r\n"), "{head}");
+    }
+
+    #[test]
+    fn host_header_keeps_non_default_port_and_ipv6_brackets() {
+        let h = |raw| rewritten_head(raw);
+        assert!(h("GET http://example.com:8080/ HTTP/1.1\r\n\r\n")
+            .contains("\r\nHost: example.com:8080\r\n"));
+        assert!(
+            h("GET http://example.com:80/ HTTP/1.1\r\n\r\n").contains("\r\nHost: example.com\r\n")
+        );
+        assert!(
+            h("GET https://example.com/ HTTP/1.1\r\n\r\n").contains("\r\nHost: example.com\r\n")
+        );
+        // 443 is not the default for http://, so it must be spelled out.
+        assert!(h("GET http://example.com:443/ HTTP/1.1\r\n\r\n")
+            .contains("\r\nHost: example.com:443\r\n"));
+        assert!(h("GET http://[2001:db8::1]:8080/ HTTP/1.1\r\n\r\n")
+            .contains("\r\nHost: [2001:db8::1]:8080\r\n"));
+        assert!(
+            h("GET http://[2001:db8::1]/ HTTP/1.1\r\n\r\n").contains("\r\nHost: [2001:db8::1]\r\n")
+        );
+        // origin-form: routed by Host, which is re-emitted in canonical form.
+        assert!(h("GET /p HTTP/1.1\r\nhOsT: example.com:8443\r\n\r\n")
+            .contains("\r\nHost: example.com:8443\r\n"));
+    }
+
+    /// Regression: a client-supplied X-Forwarded-For was forwarded ahead of
+    /// the proxy's, letting the client forge the address origins trust.
+    #[test]
+    fn client_supplied_x_forwarded_for_is_dropped() {
+        let head = rewritten_head(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\
+             X-Forwarded-For: 10.0.0.1\r\nx-forwarded-for: 192.168.0.9, 8.8.8.8\r\n\r\n",
+        );
+        assert_eq!(
+            head.to_ascii_lowercase().matches("x-forwarded-for").count(),
+            1
+        );
+        assert!(
+            head.ends_with("X-Forwarded-For: 10.0.0.7\r\n\r\n"),
+            "{head}"
+        );
+        assert_eq!(head.matches("Host:").count(), 1);
     }
 }

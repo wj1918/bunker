@@ -16,7 +16,8 @@ use crate::proxy::forward::{
     parse_connect_target, rewrite_forward_with_metadata, ForwardError, Target,
 };
 use crate::proxy::framing::{
-    scan_message_with_metadata, MessageError, MessageMetadata, MessageScan,
+    scan_message_with_metadata, scan_response, MessageError, MessageMetadata, MessageScan,
+    ResponseScan,
 };
 use crate::security::{
     is_blocked_target, is_source_ip_allowed, resolved_addrs_blocked, RateLimiter,
@@ -575,15 +576,36 @@ pub async fn proxy_forward<K: Connect>(
             );
         }
 
+        // What the response framing and the retry policy need to know about
+        // the request. `head` is the rewritten head, so it starts with the method.
+        let method = head.split(|&b| b == b' ').next().unwrap_or(&[]);
+        let head_request = method == b"HEAD";
+        let idempotent = is_idempotent_method(method);
+        // 1xx interim responses are forwarded, except to HTTP/1.0 clients,
+        // which don't know them (RFC 7231 §6.2).
+        let forward_interim = meta.as_ref().is_none_or(|m| m.version != 0);
+
         // Acquire an upstream for this target: fast 1-slot, else pool, else
         // resolve+validate+connect. `reused` => might be a stale keep-alive.
+        //
+        // Non-idempotent requests (POST, PATCH, ...) always get a fresh
+        // connection: if a reused keep-alive turned out to be dead we could
+        // not tell whether the origin had already acted on the request, so we
+        // could neither retry it safely nor avoid a spurious 502.
         let acquired = match current.take() {
-            Some((t, c, ca)) if t == target => Ok((c, ca, true)),
-            Some((t, c, ca)) => {
-                pool.borrow_mut().checkin(t.host, t.port, c, ca); // park old target's conn
-                acquire(&connector, &pool, &target, security, dns_client).await
+            Some((t, c, ca)) if idempotent && t == target => Ok((c, ca, true)),
+            held => {
+                if let Some((t, c, ca)) = held {
+                    pool.borrow_mut().checkin(t.host, t.port, c, ca); // park it
+                }
+                if idempotent {
+                    acquire(&connector, &pool, &target, security, dns_client).await
+                } else {
+                    connect_fresh(&connector, &target, security, dns_client)
+                        .await
+                        .map(|(c, created_at)| (c, created_at, false))
+                }
             }
-            None => acquire(&connector, &pool, &target, security, dns_client).await,
         };
         let (mut conn, mut created_at, reused) = match acquired {
             Ok(triple) => triple,
@@ -597,38 +619,55 @@ pub async fn proxy_forward<K: Connect>(
             }
         };
 
-        // Round-trip, retrying once on a fresh connection if a reused one was dead.
-        let resp = match try_roundtrip(&mut conn, &head, &body).await {
-            Some(r) => r,
-            None if reused => {
-                match connect_fresh(&connector, &target, security, dns_client).await {
+        // Round-trip. Retry once on a fresh connection only when it is safe:
+        // the connection was a reused keep-alive, the request is idempotent,
+        // and the upstream closed without sending a single response byte (the
+        // signature of a stale idle connection). Anything else — a reset
+        // mid-response, an unparseable response — is a 502, never a replay.
+        let resp = match try_roundtrip(&mut conn, &head, &body, head_request, forward_interim).await
+        {
+            Ok(r) => r,
+            Err(failed) if reused && idempotent && !failed.response_started => {
+                let retried = match connect_fresh(&connector, &target, security, dns_client).await {
                     Ok((mut fresh, fresh_ca)) => {
-                        match try_roundtrip(&mut fresh, &head, &body).await {
-                            Some(r) => {
+                        match try_roundtrip(&mut fresh, &head, &body, head_request, forward_interim)
+                            .await
+                        {
+                            Ok(r) => {
                                 conn = fresh;
                                 created_at = fresh_ca;
-                                r
+                                Some(r)
                             }
-                            None => {
-                                let _ = client.write_all(RESP_502).await;
-                                break;
-                            }
+                            Err(_) => None,
                         }
                     }
-                    Err(_) => {
+                    Err(_) => None,
+                };
+                match retried {
+                    Some(r) => r,
+                    None => {
                         let _ = client.write_all(RESP_502).await;
                         break;
                     }
                 }
             }
-            None => {
+            Err(_) => {
                 let _ = client.write_all(RESP_502).await;
                 break;
             }
         };
 
-        current = Some((target, conn, created_at)); // keep for the next request (fast path)
-        if client.write_all(&resp).await.is_err() {
+        // Keep the upstream for the next request (fast path) only if it can
+        // carry one; otherwise it is dropped (closed) here.
+        if resp.reusable {
+            current = Some((target, conn, created_at));
+        }
+        if client.write_all(&resp.bytes).await.is_err() {
+            break;
+        }
+        // A close-delimited body has no length the client could use to find
+        // its end; closing the client connection is what terminates it.
+        if resp.close_client {
             break;
         }
     }
@@ -657,19 +696,140 @@ async fn acquire<K: Connect>(
         .map(|(c, created_at)| (c, created_at, false))
 }
 
-/// One request->response round-trip on `conn`. None if the connection failed
-/// (write error or EOF before a full response) — i.e. it's dead. Takes head
-/// and body separately so the upstream write goes out as one `writev(2)` call
-/// (no head+body concatenation copy) — `write_all_vectored` handles the
-/// fallback if vectored I/O isn't available on the backend.
-async fn try_roundtrip<C: ProxyIo>(conn: &mut C, head: &Bytes, body: &Bytes) -> Option<Bytes> {
+/// Methods a proxy may automatically retry (RFC 7231 §4.2.2). HTTP methods are
+/// case-sensitive, so this is an exact match.
+fn is_idempotent_method(method: &[u8]) -> bool {
+    matches!(
+        method,
+        b"GET" | b"HEAD" | b"PUT" | b"DELETE" | b"OPTIONS" | b"TRACE"
+    )
+}
+
+/// A complete upstream response, plus what it implies for both connections.
+struct UpstreamResponse {
+    /// Bytes to relay to the client: any forwarded 1xx interim responses
+    /// followed by the final response.
+    bytes: Bytes,
+    /// The upstream connection can carry another request.
+    reusable: bool,
+    /// The body was delimited by upstream close, so the client connection must
+    /// be closed after `bytes` to mark the end of the body.
+    close_client: bool,
+}
+
+/// A round-trip that produced no usable response.
+struct RoundtripFailed {
+    /// Whether any response byte arrived before the failure. `false` is the
+    /// only case in which the request may be replayed on another connection.
+    response_started: bool,
+}
+
+/// Upper bound on 1xx interim responses per request, so an upstream can't keep
+/// a worker reading them forever.
+const MAX_INTERIM_RESPONSES: usize = 16;
+
+/// One request->response round-trip on `conn`. Takes head and body separately
+/// so the upstream write goes out as one `writev(2)` call (no head+body
+/// concatenation copy) — `write_all_vectored` handles the fallback if vectored
+/// I/O isn't available on the backend.
+///
+/// The response is framed with the response rules of RFC 7230 §3.3.3 (see
+/// `scan_response`): `head_request` suppresses the body, 1xx interim responses
+/// are skipped over (and relayed when `forward_interim`), and a response with
+/// no declared length is read until the upstream closes.
+async fn try_roundtrip<C: ProxyIo>(
+    conn: &mut C,
+    head: &Bytes,
+    body: &Bytes,
+    head_request: bool,
+    forward_interim: bool,
+) -> Result<UpstreamResponse, RoundtripFailed> {
     if conn.write_all_vectored(head, body).await.is_err() {
-        return None;
+        return Err(RoundtripFailed {
+            response_started: false,
+        });
     }
-    let mut resp_acc: BytesMut = BytesMut::with_capacity(512);
     // No head timeout / body limit on upstream responses (we trust the origin;
     // bunker's hyper path likewise doesn't size-limit responses).
-    relay_once(conn, &mut resp_acc, false, None, 0).await.ok()
+    let mut acc: BytesMut = BytesMut::with_capacity(512);
+    let mut interim: Option<BytesMut> = None; // forwarded 1xx bytes, if any
+    let mut interim_count = 0usize;
+    // Prepend any forwarded interim responses to the final response bytes.
+    let assemble = |interim: Option<BytesMut>, rest: BytesMut| match interim {
+        Some(mut pre) => {
+            pre.extend_from_slice(&rest);
+            pre.freeze()
+        }
+        None => rest.freeze(), // common case: zero-copy
+    };
+    loop {
+        match scan_response(&acc, head_request) {
+            ResponseScan::Complete {
+                total,
+                interim: true,
+                ..
+            } => {
+                interim_count += 1;
+                if interim_count > MAX_INTERIM_RESPONSES {
+                    return Err(RoundtripFailed {
+                        response_started: true,
+                    });
+                }
+                let msg = acc.split_to(total);
+                if forward_interim {
+                    interim
+                        .get_or_insert_with(BytesMut::new)
+                        .extend_from_slice(&msg);
+                }
+                // The final response follows; rescan what's already buffered.
+            }
+            ResponseScan::Complete {
+                total, keep_alive, ..
+            } => {
+                let msg = acc.split_to(total);
+                // Bytes after the response mean the upstream is out of step
+                // with us; such a connection must not carry another request.
+                let reusable = keep_alive && acc.is_empty();
+                return Ok(UpstreamResponse {
+                    bytes: assemble(interim, msg),
+                    reusable,
+                    close_client: false,
+                });
+            }
+            ResponseScan::UntilClose { .. } => {
+                loop {
+                    match conn.read_append(&mut acc).await {
+                        Ok(0) => break, // upstream closed: end of body
+                        Ok(_) => {}
+                        Err(_) => {
+                            return Err(RoundtripFailed {
+                                response_started: true,
+                            })
+                        }
+                    }
+                }
+                return Ok(UpstreamResponse {
+                    bytes: assemble(interim, acc),
+                    reusable: false,
+                    close_client: true,
+                });
+            }
+            ResponseScan::Error(_) => {
+                return Err(RoundtripFailed {
+                    response_started: true,
+                })
+            }
+            ResponseScan::Incomplete => match conn.read_append(&mut acc).await {
+                Ok(n) if n > 0 => {}
+                // EOF or I/O error before a full response.
+                _ => {
+                    return Err(RoundtripFailed {
+                        response_started: interim_count > 0 || !acc.is_empty(),
+                    })
+                }
+            },
+        }
+    }
 }
 
 /// Relay one client connection against one upstream connection for their shared
@@ -1491,6 +1651,283 @@ mod tests {
         let mut off = SecurityConfig::default();
         off.block_private_ips = false;
         assert!(block_on(resolve_target("127.0.0.1", 80, &off, &dns)).is_ok());
+    }
+
+    // ---- proxy_forward end-to-end over scripted connections ----
+
+    /// A `MockConn` behind a shared handle, so a test can keep inspecting what
+    /// was written after `proxy_forward` has taken ownership of the connection.
+    #[derive(Clone)]
+    struct SharedConn(Rc<std::cell::RefCell<MockConn>>);
+    impl SharedConn {
+        fn new(chunks: Vec<&[u8]>) -> Self {
+            SharedConn(Rc::new(std::cell::RefCell::new(MockConn::new(chunks))))
+        }
+        fn written(&self) -> String {
+            String::from_utf8_lossy(&self.0.borrow().written).into_owned()
+        }
+    }
+    impl ProxyIo for SharedConn {
+        async fn read_append(&mut self, acc: &mut bytes::BytesMut) -> std::io::Result<usize> {
+            match self.0.borrow_mut().reads.pop_front() {
+                Some(chunk) => {
+                    acc.extend_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+                None => Ok(0), // EOF
+            }
+        }
+        async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.0.borrow_mut().written.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    /// Hands out pre-scripted upstream connections in order. A connect beyond
+    /// the script fails (-> 502), so `connects()` tells how many were opened.
+    #[derive(Clone)]
+    struct ScriptConnect {
+        upstreams: Rc<std::cell::RefCell<std::collections::VecDeque<SharedConn>>>,
+        connects: Rc<std::cell::Cell<usize>>,
+    }
+    impl ScriptConnect {
+        fn new(upstreams: &[SharedConn]) -> Self {
+            ScriptConnect {
+                upstreams: Rc::new(std::cell::RefCell::new(upstreams.iter().cloned().collect())),
+                connects: Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+        fn connects(&self) -> usize {
+            self.connects.get()
+        }
+    }
+    impl Connect for ScriptConnect {
+        type Conn = SharedConn;
+        async fn connect(&self, _: SocketAddr) -> std::io::Result<SharedConn> {
+            self.connects.set(self.connects.get() + 1);
+            self.upstreams
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| std::io::Error::other("no scripted upstream left"))
+        }
+        async fn tunnel(_: SharedConn, _: SharedConn) {
+            unreachable!("no CONNECT in these tests")
+        }
+    }
+
+    fn forward_test_config() -> Arc<EngineConfig> {
+        Arc::new(EngineConfig {
+            security: Arc::new(SecurityConfig::default()),
+            dns_client: panic_client(), // targets are literal IPs: never resolved
+            rate_limit: RateLimitConfig::default(),
+            pool_max_per_host: 4,
+            pool_max_total: 16,
+            pool_idle_timeout: Duration::ZERO,
+            pool_max_lifetime: Duration::ZERO,
+            connect_timeout: Duration::ZERO,
+            header_read_timeout: Duration::ZERO,
+            max_request_body_bytes: 0,
+            max_requests_per_conn: 0,
+            max_connections: 0,
+            log_requests: false,
+        })
+    }
+
+    /// Run `proxy_forward` for one client connection sending `requests` (one
+    /// read each), against the scripted `upstreams`. Returns what the client
+    /// received and the connector (for its connect count).
+    fn run_forward_test(requests: Vec<&[u8]>, upstreams: &[SharedConn]) -> (String, ScriptConnect) {
+        let client = SharedConn::new(requests);
+        let connector = ScriptConnect::new(upstreams);
+        let pool = new_pool(4, 16, Duration::ZERO, Duration::ZERO);
+        block_on(proxy_forward(
+            client.clone(),
+            connector.clone(),
+            forward_test_config(),
+            "10.0.0.7".parse().unwrap(),
+            pool,
+        ));
+        (client.written(), connector)
+    }
+
+    const GET: &[u8] = b"GET http://93.184.216.34/a HTTP/1.1\r\nHost: 93.184.216.34\r\n\r\n";
+    const OK_2: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+
+    /// Regression: a chunked upload reached the origin without its
+    /// Transfer-Encoding header, so the chunk bytes parsed as a second request.
+    #[test]
+    fn forward_chunked_upload_keeps_its_framing() {
+        let upstream = SharedConn::new(vec![OK_2]);
+        let (client, _) = run_forward_test(
+            vec![
+                b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: 93.184.216.34\r\n\
+                   Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            ],
+            &[upstream.clone()],
+        );
+        let sent = upstream.written();
+        assert!(sent.starts_with("POST /up HTTP/1.1\r\n"), "{sent}");
+        assert!(sent.contains("Transfer-Encoding: chunked\r\n"), "{sent}");
+        assert!(sent.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"), "{sent}");
+        assert_eq!(client.as_bytes(), OK_2);
+    }
+
+    /// Regression: a HEAD response advertising a Content-Length made the proxy
+    /// wait for a body that never comes. It must complete at the head, and the
+    /// upstream connection must stay usable for the next request.
+    #[test]
+    fn forward_head_response_has_no_body() {
+        let head_resp: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 1256\r\n\r\n";
+        let upstream = SharedConn::new(vec![head_resp, OK_2]);
+        let (client, connector) = run_forward_test(
+            vec![
+                b"HEAD http://93.184.216.34/a HTTP/1.1\r\nHost: 93.184.216.34\r\n\r\n",
+                GET,
+            ],
+            &[upstream],
+        );
+        let expected = [head_resp, OK_2].concat();
+        assert_eq!(client.as_bytes(), &expected[..]);
+        assert_eq!(connector.connects(), 1, "upstream should be reused");
+    }
+
+    /// Regression: `100 Continue` was returned as the whole response and the
+    /// real one stayed queued on the upstream, to be served to the next request.
+    #[test]
+    fn forward_interim_response_is_followed_by_the_final_one() {
+        let upstream = SharedConn::new(vec![
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond",
+        ]);
+        let (client, connector) = run_forward_test(
+            vec![
+                b"PUT http://93.184.216.34/a HTTP/1.1\r\nHost: 93.184.216.34\r\n\
+                  Expect: 100-continue\r\nContent-Length: 1\r\n\r\nx",
+                GET,
+            ],
+            &[upstream],
+        );
+        assert_eq!(
+            client,
+            "HTTP/1.1 100 Continue\r\n\r\n\
+             HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst\
+             HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond"
+        );
+        assert_eq!(connector.connects(), 1);
+    }
+
+    /// An HTTP/1.0 client doesn't know 1xx responses: drop them, keep the final.
+    #[test]
+    fn forward_interim_response_is_not_sent_to_http10_clients() {
+        let upstream = SharedConn::new(vec![b"HTTP/1.1 100 Continue\r\n\r\n", OK_2]);
+        let (client, _) = run_forward_test(
+            vec![b"GET http://93.184.216.34/a HTTP/1.0\r\nHost: 93.184.216.34\r\n\r\n"],
+            &[upstream],
+        );
+        assert_eq!(client.as_bytes(), OK_2);
+    }
+
+    /// Regression: a response with no Content-Length / chunked encoding reached
+    /// the client as headers only. The body runs to upstream close; afterwards
+    /// the client connection is closed and the upstream is not reused.
+    #[test]
+    fn forward_close_delimited_response_delivers_the_body() {
+        let upstream = SharedConn::new(vec![
+            b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html>",
+            b"body</html>",
+        ]);
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare.clone()]);
+        assert_eq!(
+            client,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html>body</html>"
+        );
+        // The second pipelined request is not served: the connection closed.
+        assert_eq!(connector.connects(), 1);
+        assert_eq!(spare.written(), "");
+    }
+
+    /// An upstream that announces `Connection: close` must not be reused.
+    #[test]
+    fn forward_does_not_reuse_upstream_after_connection_close() {
+        let first = SharedConn::new(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+        ]);
+        let second = SharedConn::new(vec![OK_2]);
+        let (_, connector) = run_forward_test(vec![GET, GET], &[first.clone(), second.clone()]);
+        assert_eq!(connector.connects(), 2);
+        assert_eq!(first.written().matches("GET /a").count(), 1);
+        assert_eq!(second.written().matches("GET /a").count(), 1);
+    }
+
+    /// A stale keep-alive (closed with no response byte) is the one case where
+    /// an idempotent request is replayed on a fresh connection.
+    #[test]
+    fn forward_retries_idempotent_request_on_stale_connection() {
+        let stale = SharedConn::new(vec![OK_2]); // answers once, then EOF
+        let fresh = SharedConn::new(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nnew"]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[stale, fresh.clone()]);
+        assert!(client.ends_with("\r\n\r\nnew"), "{client}");
+        assert!(!client.contains("502"), "{client}");
+        assert_eq!(connector.connects(), 2);
+        assert_eq!(fresh.written().matches("GET /a").count(), 1);
+    }
+
+    /// Regression: once response bytes have arrived the origin has acted on the
+    /// request, so a failure is a 502 — never a replay.
+    #[test]
+    fn forward_does_not_retry_after_a_partial_response() {
+        let upstream = SharedConn::new(vec![
+            OK_2,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", // then EOF
+        ]);
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare.clone()]);
+        assert!(
+            client.ends_with(std::str::from_utf8(RESP_502).unwrap()),
+            "{client}"
+        );
+        assert_eq!(connector.connects(), 1, "must not reconnect to replay");
+        assert_eq!(spare.written(), "");
+    }
+
+    /// Regression: a POST on a reused connection that failed was sent again,
+    /// so the origin could execute it twice. A POST now always travels on a
+    /// fresh connection and is never replayed.
+    #[test]
+    fn forward_never_replays_a_post() {
+        const POST: &[u8] = b"POST http://93.184.216.34/charge HTTP/1.1\r\n\
+            Host: 93.184.216.34\r\nContent-Length: 1\r\n\r\nx";
+        let kept = SharedConn::new(vec![OK_2]); // serves the GET, stays open
+        let dies = SharedConn::new(vec![]); // accepts the POST, then EOF
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(
+            vec![GET, POST],
+            &[kept.clone(), dies.clone(), spare.clone()],
+        );
+
+        // The POST did not ride the kept-alive connection...
+        assert!(!kept.written().contains("POST"), "{}", kept.written());
+        // ...it went out exactly once, on its own connection...
+        assert_eq!(dies.written().matches("POST /charge").count(), 1);
+        // ...and its failure was reported, not retried.
+        assert!(
+            client.ends_with(std::str::from_utf8(RESP_502).unwrap()),
+            "{client}"
+        );
+        assert_eq!(connector.connects(), 2);
+        assert_eq!(spare.written(), "");
+    }
+
+    #[test]
+    fn idempotent_methods_are_matched_exactly() {
+        for m in ["GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"] {
+            assert!(is_idempotent_method(m.as_bytes()), "{m}");
+        }
+        for m in ["POST", "PATCH", "CONNECT", "get", ""] {
+            assert!(!is_idempotent_method(m.as_bytes()), "{m}");
+        }
     }
 
     /// PanicConnect retained for symmetry / future tests that may need a

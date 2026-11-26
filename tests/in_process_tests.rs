@@ -566,6 +566,48 @@ async fn test_dns_any_query_blocked() {
     }
 }
 
+/// Regression: a receive error must not end the DNS serve loop. On Windows an
+/// oversized datagram (WSAEMSGSIZE) and a reply that hit a closed client port
+/// (WSAECONNRESET) both surface as `recv_from` errors; the server used to
+/// propagate them and stop answering for good. On Linux neither produces an
+/// error, so there this only checks the server keeps serving afterwards.
+#[tokio::test]
+async fn test_dns_server_survives_receive_errors() {
+    let (dns_addr, _handle) = start_test_dns_server().await;
+
+    // 1. Datagram larger than the server's receive buffer.
+    let oversized = UdpSocket::bind("127.0.0.1:0").unwrap();
+    oversized.send_to(&[0u8; 600], dns_addr).unwrap();
+
+    // 2. Query whose reply lands on a closed port: the ANY query is answered
+    //    locally (REFUSED), and the client socket is gone before it arrives.
+    {
+        let vanishing = UdpSocket::bind("127.0.0.1:0").unwrap();
+        vanishing
+            .send_to(&build_any_dns_query("example.com", 0x0001), dns_addr)
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 3. The server must still answer. ANY is refused locally, so this needs
+    //    no upstream and is a hard assertion. Async socket: a blocking recv
+    //    would stall the single-threaded test runtime the server runs on.
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .send_to(&build_any_dns_query("example.com", 0x4242), dns_addr)
+        .await
+        .unwrap();
+
+    let mut response = [0u8; 512];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut response))
+        .await
+        .expect("DNS server stopped answering after a receive error")
+        .unwrap();
+    assert!(len >= 12);
+    assert_eq!(&response[..2], &[0x42, 0x42]);
+    assert!(response[2] & 0x80 != 0, "Should be a response");
+}
+
 #[tokio::test]
 async fn test_dns_multiple_queries() {
     let (dns_addr, _handle) = start_test_dns_server().await;

@@ -148,9 +148,37 @@ pub async fn run_dns_server_on(
         }
     });
 
-    let mut recv_buf = [0u8; 512];
+    // Queries are small, but EDNS0 options (cookies, padding) can take one past
+    // the classic 512-byte limit; a larger datagram would be cut short on Linux
+    // and fail the read on Windows.
+    let mut recv_buf = vec![0u8; 4096];
+    let mut consecutive_recv_errors: u32 = 0;
     loop {
-        let (len, src) = socket.recv_from(&mut recv_buf).await?;
+        // A receive error must never end the serve loop: on Windows a UDP
+        // socket reports WSAECONNRESET on recv when an earlier reply hit a
+        // closed client port, and WSAEMSGSIZE for an oversized datagram.
+        // Neither says anything about the socket's health, so log and keep
+        // serving. Back off only if errors keep repeating, so a persistently
+        // broken socket cannot spin the loop.
+        let (len, src) = match socket.recv_from(&mut recv_buf).await {
+            Ok(received) => {
+                consecutive_recv_errors = 0;
+                received
+            }
+            Err(e) => {
+                consecutive_recv_errors = consecutive_recv_errors.saturating_add(1);
+                warn!(
+                    error = %e,
+                    consecutive = consecutive_recv_errors,
+                    "DNS receive error; continuing to serve"
+                );
+                let backoff = recv_error_backoff(consecutive_recv_errors);
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                }
+                continue;
+            }
+        };
         let buf = recv_buf[..len].to_vec();
 
         // Check source IP allowlist
@@ -236,6 +264,15 @@ pub async fn run_dns_server_on(
             });
         }
     }
+}
+
+/// Delay before the next receive attempt after `consecutive` receive errors in
+/// a row. The first few errors retry immediately (a stray ICMP-induced reset is
+/// a one-off); after that the delay grows linearly up to one second.
+fn recv_error_backoff(consecutive: u32) -> std::time::Duration {
+    const FREE_RETRIES: u32 = 3;
+    let over = consecutive.saturating_sub(FREE_RETRIES);
+    std::time::Duration::from_millis((u64::from(over) * 10).min(1000))
 }
 
 /// Common path for both Upstream and Os spawn arms: send the response on
@@ -602,6 +639,20 @@ pub async fn handle_dns_query_os(
 mod tests {
     use super::*;
     use crate::dns::wire::{builder, RecordType};
+
+    #[test]
+    fn recv_error_backoff_retries_immediately_then_caps() {
+        use std::time::Duration;
+        // First few errors: no delay (a stray connection-reset is a one-off).
+        assert_eq!(recv_error_backoff(1), Duration::ZERO);
+        assert_eq!(recv_error_backoff(3), Duration::ZERO);
+        // Then it grows...
+        assert_eq!(recv_error_backoff(4), Duration::from_millis(10));
+        assert_eq!(recv_error_backoff(13), Duration::from_millis(100));
+        // ...and is capped, including at the saturated counter value.
+        assert_eq!(recv_error_backoff(10_000), Duration::from_secs(1));
+        assert_eq!(recv_error_backoff(u32::MAX), Duration::from_secs(1));
+    }
     use crate::error::DnsError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
