@@ -188,6 +188,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Spawn log cleanup task if file logging enabled
     logging::spawn_log_cleanup_task(Arc::new(config.logging.clone()));
 
+    // Ctrl-C and (on Unix) SIGTERM: say so, flush the log file, then exit.
+    // Left to the default action the process would die with its last log
+    // lines still in the writer's buffer.
+    tokio::spawn(async {
+        wait_for_stop_signal().await;
+        println!("Stop requested, shutting down");
+        tracing::info!("Stop requested, shutting down");
+        logging::shutdown();
+        std::process::exit(0);
+    });
+
     tracing::debug!(config = ?config, "Configuration loaded");
 
     // Setup tray on Windows
@@ -218,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 match msg {
                     TrayMessage::Quit => {
                         println!("Quit requested from tray");
+                        logging::shutdown();
                         std::process::exit(0);
                     }
                     TrayMessage::Minimize => {
@@ -625,6 +637,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         });
+    }
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C everywhere, and
+/// SIGTERM on Unix (what service managers and `kill` send).
+async fn wait_for_stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

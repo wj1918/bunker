@@ -131,7 +131,8 @@ dns:
 # Logging (cross-cutting - used by both proxy and DNS)
 # ============================================================
 logging:
-  log_requests: true
+  log_requests: true                  # false = only warnings and errors are logged
+                                      # (refused requests, failures); "level" is ignored
   format: text                        # "text" or "json"
   level: info                         # EnvFilter expr - bare level or per-module
                                       # ("warn,bunker::dns=debug"). Default: info.

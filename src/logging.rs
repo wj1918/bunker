@@ -20,28 +20,66 @@ pub struct LogGuard {
     _file_guard: Option<WorkerGuard>,
 }
 
+/// The file writer's guard, parked where `shutdown` can reach it. The process
+/// usually ends through `std::process::exit` (tray Quit, Ctrl-C), which runs
+/// no destructors — so a guard owned by `main` would never be dropped and the
+/// last buffered log lines would be lost.
+static FILE_GUARD: std::sync::Mutex<Option<WorkerGuard>> = std::sync::Mutex::new(None);
+
+impl LogGuard {
+    fn holding(guard: Option<WorkerGuard>) -> LogGuard {
+        if let Some(guard) = guard {
+            *FILE_GUARD.lock().unwrap_or_else(|p| p.into_inner()) = Some(guard);
+        }
+        LogGuard { _file_guard: None }
+    }
+}
+
+/// Flush buffered log lines to the log file. Call before exiting the process.
+pub fn shutdown() {
+    // Dropping the guard flushes the writer thread and waits for it.
+    drop(FILE_GUARD.lock().unwrap_or_else(|p| p.into_inner()).take());
+}
+
+/// The level used when neither `RUST_LOG` nor `logging.level` sets one.
+///
+/// `log_requests: false` used to switch logging off entirely, which also
+/// silenced warnings and errors — including every request the proxy refused.
+/// It now only lowers the default to "warn": the routine lines go, the ones
+/// that report a problem stay.
+fn default_level(log_requests: bool) -> &'static str {
+    if log_requests {
+        "info"
+    } else {
+        "warn"
+    }
+}
+
 /// Initialize the logging system based on configuration.
 /// Returns a guard that must be kept alive for file logging to work.
 pub fn init_logging(config: &LoggingConfig) -> LogGuard {
-    if !config.log_requests {
-        return LogGuard { _file_guard: None };
-    }
-
     // Precedence: RUST_LOG env var (ad-hoc debugging) > logging.level config >
-    // built-in default "info". A malformed config value is logged-and-fallen-back
+    // built-in default. A malformed config value is logged-and-fallen-back
     // rather than panicked at startup so a typo in YAML doesn't take the proxy down.
+    let fallback = default_level(config.log_requests);
     let env_filter = if let Ok(env) = std::env::var("RUST_LOG") {
         EnvFilter::try_new(&env).unwrap_or_else(|_| {
-            eprintln!("WARNING: invalid RUST_LOG ({env:?}), falling back to 'info'");
-            EnvFilter::new("info")
+            eprintln!("WARNING: invalid RUST_LOG ({env:?}), falling back to '{fallback}'");
+            EnvFilter::new(fallback)
         })
-    } else if let Some(cfg_level) = config.level.as_deref().filter(|s| !s.is_empty()) {
+    } else if let Some(cfg_level) = config
+        .level
+        .as_deref()
+        .filter(|s| !s.is_empty() && config.log_requests)
+    {
         EnvFilter::try_new(cfg_level).unwrap_or_else(|_| {
-            eprintln!("WARNING: invalid logging.level ({cfg_level:?}), falling back to 'info'");
-            EnvFilter::new("info")
+            eprintln!(
+                "WARNING: invalid logging.level ({cfg_level:?}), falling back to '{fallback}'"
+            );
+            EnvFilter::new(fallback)
         })
     } else {
-        EnvFilter::new("info")
+        EnvFilter::new(fallback)
     };
 
     match (&config.format, &config.file) {
@@ -71,9 +109,7 @@ pub fn init_logging(config: &LoggingConfig) -> LogGuard {
                 .with(fmt::layer().with_writer(io::stdout))
                 .with(fmt::layer().json().with_writer(file_writer))
                 .init();
-            LogGuard {
-                _file_guard: Some(guard),
-            }
+            LogGuard::holding(Some(guard))
         }
 
         // JSON to stdout + JSON to file
@@ -84,9 +120,7 @@ pub fn init_logging(config: &LoggingConfig) -> LogGuard {
                 .with(fmt::layer().json().with_writer(io::stdout))
                 .with(fmt::layer().json().with_writer(file_writer))
                 .init();
-            LogGuard {
-                _file_guard: Some(guard),
-            }
+            LogGuard::holding(Some(guard))
         }
     }
 }
@@ -331,5 +365,19 @@ mod tests {
         assert!(config.log_requests);
         assert_eq!(config.format, LogFormat::Text);
         assert!(config.file.is_none());
+    }
+
+    /// Regression: `log_requests: false` disabled logging altogether, so
+    /// refusals, warnings and errors went unrecorded.
+    #[test]
+    fn log_requests_off_still_leaves_warnings_on() {
+        assert_eq!(default_level(true), "info");
+        assert_eq!(default_level(false), "warn");
+    }
+
+    #[test]
+    fn shutdown_is_safe_without_a_file_writer_and_when_repeated() {
+        shutdown();
+        shutdown();
     }
 }
