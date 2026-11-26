@@ -13,11 +13,18 @@ use tracing::warn;
 
 /// Normalize an IP address for rate limiting purposes.
 /// For IPv6 with subnet rate limiting enabled, maps to /64 subnet.
+///
+/// An IPv4 client that arrives on a dual-stack listener shows up as
+/// `::ffff:a.b.c.d`. Those are turned back into plain IPv4 first: every
+/// mapped address has the same first 64 bits, so grouping them by /64 would
+/// put all IPv4 clients into one bucket.
 fn normalize_ip_for_rate_limit(ip: IpAddr, ipv6_subnet: bool) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
-            if ipv6_subnet {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else if ipv6_subnet {
                 // Zero out the last 64 bits (interface identifier)
                 let segments = v6.segments();
                 let normalized = Ipv6Addr::new(
@@ -501,6 +508,35 @@ mod tests {
         // Adding 3rd should evict oldest
         assert!(limiter.is_allowed(ip3));
         assert_eq!(limiter.tracked_ip_count(), 2);
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_are_limited_per_ipv4_client() {
+        let a: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let b: IpAddr = "::ffff:192.0.2.2".parse().unwrap();
+        let plain_a: IpAddr = "192.0.2.1".parse().unwrap();
+
+        for subnet in [true, false] {
+            assert_eq!(normalize_ip_for_rate_limit(a, subnet), plain_a);
+            assert_ne!(
+                normalize_ip_for_rate_limit(a, subnet),
+                normalize_ip_for_rate_limit(b, subnet)
+            );
+        }
+
+        // One client using up its budget must not lock out another, and the
+        // mapped and plain forms of one address share a budget.
+        let mut limiter = RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            max_requests: 2,
+            window_seconds: 60,
+            ipv6_subnet_rate_limit: true,
+            ..Default::default()
+        });
+        assert!(limiter.is_allowed(a));
+        assert!(limiter.is_allowed(plain_a));
+        assert!(!limiter.is_allowed(a));
+        assert!(limiter.is_allowed(b));
     }
 
     #[test]
