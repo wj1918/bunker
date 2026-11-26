@@ -62,20 +62,36 @@ pub trait DnsResolver: Send + Sync {
         timeout: Duration,
         enable_logging: bool,
     ) -> impl Future<Output = Result<Vec<u8>, DnsError>> + Send;
+
+    /// Whether `upstream` recently failed to answer and should be tried last.
+    fn is_down(&self, _upstream: SocketAddr) -> bool {
+        false
+    }
+
+    /// Record whether `upstream` answered (`true`) or timed out / errored.
+    fn report(&self, _upstream: SocketAddr, _answered: bool) {}
 }
 
 /// Largest payload a UDP datagram can carry (65535 minus IP and UDP headers
 /// is smaller still; this bound is simply never exceeded).
 pub(crate) const MAX_UDP_PAYLOAD: usize = 65535;
 
+/// How long an upstream that failed to answer is tried last instead of first.
+const DOWN_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// UDP-based DNS resolver implementation
 pub struct UdpDnsResolver {
     security: DnsSecurityConfig,
+    /// Upstreams that recently failed to answer, and when.
+    down: std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>,
 }
 
 impl UdpDnsResolver {
     pub fn new(security: DnsSecurityConfig) -> Self {
-        Self { security }
+        Self {
+            security,
+            down: Default::default(),
+        }
     }
 }
 
@@ -109,49 +125,92 @@ impl DnsResolver for UdpDnsResolver {
         // buffer silently cut such answers short on Linux (and was then cached
         // corrupted) and failed the read outright on Windows.
         let mut recv_buf = vec![0u8; MAX_UDP_PAYLOAD];
-        let result = tokio::time::timeout(timeout, socket.recv_from(&mut recv_buf)).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut warned = false;
 
-        match result {
-            Ok(Ok((len, from))) => {
-                // Verify response comes from expected upstream (anti-spoofing)
-                if self.security.verify_upstream_source && from != upstream {
-                    if enable_logging {
+        // Wait for the upstream's answer until the deadline. A datagram that
+        // is not that answer — wrong source, wrong transaction ID, wrong
+        // question — is dropped and the wait continues. Giving up on the first
+        // such datagram (as this used to) let anyone who could reach the
+        // socket fail a lookup with a single junk packet, before the genuine
+        // answer had a chance to arrive.
+        loop {
+            let received = tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await;
+            let (len, from) = match received {
+                Ok(Ok(datagram)) => datagram,
+                Ok(Err(e)) => return Err(DnsError::ParseError(e.to_string())),
+                Err(_) => return Err(DnsError::Timeout),
+            };
+            // Source check (anti-spoofing), then transaction-ID and
+            // question-section echo. The latter run unconditionally — they
+            // also cover an on-path attacker who spoofs the upstream's address.
+            let problem = if self.security.verify_upstream_source && from != upstream {
+                Some("unexpected source")
+            } else if validate_upstream_response(query, &recv_buf[..len]).is_err() {
+                Some("ID or question mismatch")
+            } else {
+                None
+            };
+            match problem {
+                // Copy out just the datagram: the result is long-lived (it is
+                // cached), so it must not keep the 64 KiB receive allocation.
+                None => return Ok(recv_buf[..len].to_vec()),
+                Some(problem) => {
+                    // Once per query: a flood must not flood the log too.
+                    if enable_logging && !warned {
+                        warned = true;
                         warn!(
                             from = %from,
                             expected = %upstream,
-                            "DNS response from unexpected source (spoofing detected)"
+                            problem,
+                            "DNS datagram ignored (possible spoofing attempt)"
                         );
                     }
-                    return Err(DnsError::SpoofingDetected);
                 }
-                // Copy out just the datagram: the result is long-lived (it is
-                // cached), so it must not keep the 64 KiB receive allocation.
-                let response_buf = recv_buf[..len].to_vec();
-                // Transaction-ID + question-section echo checks. These run
-                // unconditionally — the spoofing surface they cover (off-path
-                // ID guess; on-path attacker who spoofs the upstream's source
-                // IP) is real, and the checks cost only a u16 compare plus a
-                // bounded byte-equal on the question.
-                if let Err(e) = validate_upstream_response(query, &response_buf) {
-                    if enable_logging {
-                        warn!(
-                            from = %from,
-                            upstream = %upstream,
-                            error = %e,
-                            "DNS response failed ID/QNAME verification (spoofing)"
-                        );
-                    }
-                    return Err(e);
-                }
-                Ok(response_buf)
             }
-            Ok(Err(e)) => Err(DnsError::ParseError(e.to_string())),
-            Err(_) => Err(DnsError::Timeout),
+        }
+    }
+
+    fn is_down(&self, upstream: SocketAddr) -> bool {
+        self.down
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&upstream)
+            .is_some_and(|since| since.elapsed() < DOWN_COOLDOWN)
+    }
+
+    fn report(&self, upstream: SocketAddr, answered: bool) {
+        let mut down = self
+            .down
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if answered {
+            down.remove(&upstream);
+        } else {
+            down.insert(upstream, std::time::Instant::now());
         }
     }
 }
 
-/// Handle DNS query with failover support using a generic resolver
+/// An answer that says this upstream could not or would not resolve the name,
+/// as opposed to an answer about the name. Another upstream may do better.
+fn is_upstream_refusal(response: &[u8]) -> bool {
+    const SERVFAIL: u8 = 2;
+    const NOTIMP: u8 = 4;
+    const REFUSED: u8 = 5;
+    response
+        .get(3)
+        .is_some_and(|flags| matches!(flags & 0x0f, SERVFAIL | NOTIMP | REFUSED))
+}
+
+/// Handle DNS query with failover support using a generic resolver.
+///
+/// Upstreams are tried in the configured order, except that one which
+/// recently failed to answer goes to the back of the queue — otherwise every
+/// lookup would wait out the full timeout on a dead first upstream. An
+/// upstream that answers SERVFAIL / REFUSED / NOTIMP counts as failed for this
+/// query and the next is asked; if none does better, that answer is returned
+/// so the client still sees the real response code.
 #[allow(dead_code)]
 pub async fn handle_dns_query_with_resolver<R: DnsResolver>(
     resolver: &R,
@@ -162,13 +221,17 @@ pub async fn handle_dns_query_with_resolver<R: DnsResolver>(
     enable_logging: bool,
 ) -> Result<Vec<u8>, DnsError> {
     let total_attempts = 1 + max_retries;
+    let mut refusal: Option<Vec<u8>> = None;
 
     for attempt in 0..total_attempts {
         if attempt > 0 && enable_logging {
             debug!(attempt = attempt, max_retries = max_retries, "DNS retry");
         }
 
-        for (idx, upstream) in upstreams.iter().enumerate() {
+        // Healthy upstreams first, in configured order; then the rest.
+        let (healthy, down): (Vec<SocketAddr>, Vec<SocketAddr>) =
+            upstreams.iter().partition(|u| !resolver.is_down(**u));
+        for (idx, upstream) in healthy.iter().chain(down.iter()).enumerate() {
             if enable_logging {
                 debug!(
                     upstream = %upstream,
@@ -182,8 +245,18 @@ pub async fn handle_dns_query_with_resolver<R: DnsResolver>(
                 .resolve(query_buf, *upstream, timeout, enable_logging)
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    resolver.report(*upstream, true);
+                    if !is_upstream_refusal(&response) {
+                        return Ok(response);
+                    }
+                    if enable_logging {
+                        debug!(upstream = %upstream, "DNS upstream refused or failed the query");
+                    }
+                    refusal = Some(response);
+                }
                 Err(e) => {
+                    resolver.report(*upstream, false);
                     if enable_logging {
                         warn!(upstream = %upstream, error = %e, "DNS upstream failed");
                     }
@@ -191,9 +264,14 @@ pub async fn handle_dns_query_with_resolver<R: DnsResolver>(
                 }
             }
         }
+        // Every upstream was asked. If one of them answered (with a refusal),
+        // asking the same servers again will not change it.
+        if refusal.is_some() {
+            break;
+        }
     }
 
-    Err(DnsError::UpstreamFailed)
+    refusal.ok_or(DnsError::UpstreamFailed)
 }
 
 #[cfg(test)]
@@ -415,5 +493,234 @@ mod tests {
         assert_eq!(got, expected);
         // The cached copy must not pin the 64 KiB receive buffer.
         assert!(got.capacity() < 4096, "capacity {}", got.capacity());
+    }
+
+    // ---------- stray datagrams, failover, upstream health ----------
+
+    fn udp_resolver() -> UdpDnsResolver {
+        UdpDnsResolver::new(DnsSecurityConfig::default())
+    }
+
+    /// Regression: the first datagram that was not the upstream's answer
+    /// failed the lookup. Now it is ignored and the real answer is used.
+    #[tokio::test]
+    async fn stray_datagrams_do_not_fail_the_lookup() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let query = builder::build_query("example.com", RecordType::A, 0xBEEF);
+        let answer = builder::build_response(
+            "example.com",
+            "93.184.216.34",
+            0xBEEF,
+            300,
+            ResponseCode::NoError,
+        );
+        let wrong_id =
+            builder::build_response("example.com", "6.6.6.6", 0x0001, 300, ResponseCode::NoError);
+        let wrong_name = builder::build_response(
+            "evil.example",
+            "6.6.6.6",
+            0xBEEF,
+            300,
+            ResponseCode::NoError,
+        );
+
+        let expected = answer.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, resolver_addr) = upstream.recv_from(&mut buf).await.unwrap();
+            // From an unrelated address, with a perfectly valid-looking answer.
+            stranger.send_to(&wrong_name, resolver_addr).await.unwrap();
+            stranger.send_to(&answer, resolver_addr).await.unwrap();
+            // From the upstream's own address, but not answering our query.
+            upstream.send_to(&wrong_id, resolver_addr).await.unwrap();
+            upstream.send_to(&wrong_name, resolver_addr).await.unwrap();
+            upstream.send_to(&[0u8; 3], resolver_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            upstream.send_to(&answer, resolver_addr).await.unwrap();
+        });
+
+        let got = udp_resolver()
+            .resolve(&query, upstream_addr, Duration::from_secs(3), false)
+            .await;
+        assert_eq!(got.unwrap(), expected);
+    }
+
+    /// Junk alone never satisfies the query: it still times out.
+    #[tokio::test]
+    async fn only_stray_datagrams_end_in_a_timeout() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let query = builder::build_query("example.com", RecordType::A, 0xBEEF);
+        let wrong_id =
+            builder::build_response("example.com", "6.6.6.6", 0x0001, 300, ResponseCode::NoError);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, resolver_addr) = upstream.recv_from(&mut buf).await.unwrap();
+            for _ in 0..5 {
+                upstream.send_to(&wrong_id, resolver_addr).await.unwrap();
+            }
+        });
+        let got = udp_resolver()
+            .resolve(&query, upstream_addr, Duration::from_millis(300), false)
+            .await;
+        assert!(matches!(got, Err(DnsError::Timeout)), "{got:?}");
+    }
+
+    /// Per-upstream scripted answers, recording the order upstreams are asked
+    /// in and keeping the health marks the failover logic reports.
+    #[derive(Default)]
+    struct ScriptedResolver {
+        answers: std::collections::HashMap<SocketAddr, Vec<u8>>,
+        asked: std::sync::Mutex<Vec<SocketAddr>>,
+        down: std::sync::Mutex<std::collections::HashSet<SocketAddr>>,
+    }
+    impl DnsResolver for ScriptedResolver {
+        async fn resolve(
+            &self,
+            _query: &[u8],
+            upstream: SocketAddr,
+            _timeout: Duration,
+            _enable_logging: bool,
+        ) -> Result<Vec<u8>, DnsError> {
+            self.asked.lock().unwrap().push(upstream);
+            self.answers
+                .get(&upstream)
+                .cloned()
+                .ok_or(DnsError::Timeout)
+        }
+        fn is_down(&self, upstream: SocketAddr) -> bool {
+            self.down.lock().unwrap().contains(&upstream)
+        }
+        fn report(&self, upstream: SocketAddr, answered: bool) {
+            let mut down = self.down.lock().unwrap();
+            if answered {
+                down.remove(&upstream);
+            } else {
+                down.insert(upstream);
+            }
+        }
+    }
+
+    fn reply(rcode: ResponseCode) -> Vec<u8> {
+        builder::build_response("example.com", "93.184.216.34", 1, 300, rcode)
+    }
+
+    async fn ask(
+        resolver: &ScriptedResolver,
+        upstreams: &[SocketAddr],
+        retries: u32,
+    ) -> Result<Vec<u8>, DnsError> {
+        handle_dns_query_with_resolver(
+            resolver,
+            &[0, 1],
+            upstreams,
+            Duration::from_secs(1),
+            retries,
+            false,
+        )
+        .await
+    }
+
+    /// Regression: SERVFAIL from the first upstream was returned as the
+    /// answer and the second upstream was never asked.
+    #[tokio::test]
+    async fn refusal_from_one_upstream_fails_over_to_the_next() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "192.0.2.1:53".parse().unwrap(),
+            "192.0.2.2:53".parse().unwrap(),
+        );
+        for refusal in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::NotImp,
+        ] {
+            let mut resolver = ScriptedResolver::default();
+            resolver.answers.insert(a, reply(refusal));
+            resolver.answers.insert(b, reply(ResponseCode::NoError));
+            let got = ask(&resolver, &[a, b], 1).await.unwrap();
+            assert_eq!(got, reply(ResponseCode::NoError), "{refusal:?}");
+            assert_eq!(*resolver.asked.lock().unwrap(), vec![a, b]);
+        }
+
+        // NXDOMAIN is an answer about the name, not a failure of the server.
+        let mut resolver = ScriptedResolver::default();
+        resolver.answers.insert(a, reply(ResponseCode::NxDomain));
+        resolver.answers.insert(b, reply(ResponseCode::NoError));
+        assert_eq!(
+            ask(&resolver, &[a, b], 1).await.unwrap(),
+            reply(ResponseCode::NxDomain)
+        );
+        assert_eq!(*resolver.asked.lock().unwrap(), vec![a]);
+    }
+
+    /// When every upstream refuses, the client gets that answer (not a
+    /// made-up error), and the same servers are not asked again.
+    #[tokio::test]
+    async fn refusal_from_every_upstream_is_returned_as_is() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "192.0.2.1:53".parse().unwrap(),
+            "192.0.2.2:53".parse().unwrap(),
+        );
+        let mut resolver = ScriptedResolver::default();
+        resolver.answers.insert(a, reply(ResponseCode::ServFail));
+        resolver.answers.insert(b, reply(ResponseCode::Refused));
+        assert_eq!(
+            ask(&resolver, &[a, b], 3).await.unwrap(),
+            reply(ResponseCode::Refused)
+        );
+        assert_eq!(resolver.asked.lock().unwrap().len(), 2);
+    }
+
+    /// Regression: a dead first upstream was tried first on every lookup, so
+    /// each one waited out the full timeout. After it fails once it goes to
+    /// the back; when it answers again it returns to its place.
+    #[tokio::test]
+    async fn an_upstream_that_failed_is_tried_last_until_it_answers() {
+        let (dead, live): (SocketAddr, SocketAddr) = (
+            "192.0.2.1:53".parse().unwrap(),
+            "192.0.2.2:53".parse().unwrap(),
+        );
+        let mut resolver = ScriptedResolver::default();
+        resolver.answers.insert(live, reply(ResponseCode::NoError));
+
+        ask(&resolver, &[dead, live], 0).await.unwrap();
+        assert_eq!(
+            std::mem::take(&mut *resolver.asked.lock().unwrap()),
+            vec![dead, live]
+        );
+        // Second lookup: straight to the live one.
+        ask(&resolver, &[dead, live], 0).await.unwrap();
+        assert_eq!(
+            std::mem::take(&mut *resolver.asked.lock().unwrap()),
+            vec![live]
+        );
+
+        // If the live one dies too, the marked-down one is still tried.
+        resolver.answers.clear();
+        resolver.answers.insert(dead, reply(ResponseCode::NoError));
+        ask(&resolver, &[dead, live], 0).await.unwrap();
+        assert_eq!(
+            std::mem::take(&mut *resolver.asked.lock().unwrap()),
+            vec![live, dead]
+        );
+        // It answered, so it is first again.
+        ask(&resolver, &[dead, live], 0).await.unwrap();
+        assert_eq!(
+            std::mem::take(&mut *resolver.asked.lock().unwrap()),
+            vec![dead]
+        );
+    }
+
+    #[test]
+    fn udp_resolver_remembers_and_forgets_failed_upstreams() {
+        let resolver = udp_resolver();
+        let upstream: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        assert!(!resolver.is_down(upstream));
+        resolver.report(upstream, false);
+        assert!(resolver.is_down(upstream));
+        resolver.report(upstream, true);
+        assert!(!resolver.is_down(upstream));
     }
 }

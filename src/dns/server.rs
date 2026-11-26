@@ -472,6 +472,10 @@ pub async fn handle_dns_query<R: DnsResolver>(
 
 /// Try upstream servers with failover logic.
 /// Made public for testing with mock resolvers.
+///
+/// A thin wrapper: the failover policy (order, health, refusals) lives in one
+/// place, `handle_dns_query_with_resolver`, shared with the proxy's resolver.
+/// This used to be a second copy of that loop, and the two had drifted apart.
 pub async fn try_upstreams_with_resolver<R: DnsResolver>(
     resolver: &R,
     query_buf: &[u8],
@@ -480,38 +484,16 @@ pub async fn try_upstreams_with_resolver<R: DnsResolver>(
     max_retries: u32,
     enable_logging: bool,
 ) -> Result<Vec<u8>, ()> {
-    let total_attempts = 1 + max_retries;
-
-    for attempt in 0..total_attempts {
-        if attempt > 0 && enable_logging {
-            debug!(attempt = attempt, max_retries = max_retries, "DNS retry");
-        }
-
-        for (idx, upstream) in upstreams.iter().enumerate() {
-            if enable_logging {
-                debug!(
-                    upstream = %upstream,
-                    index = idx + 1,
-                    total = upstreams.len(),
-                    "DNS trying upstream"
-                );
-            }
-
-            match resolver
-                .resolve(query_buf, *upstream, timeout, enable_logging)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    if enable_logging {
-                        warn!(upstream = %upstream, error = %e, "DNS upstream failed");
-                    }
-                }
-            }
-        }
-    }
-
-    Err(())
+    crate::dns::resolver::handle_dns_query_with_resolver(
+        resolver,
+        query_buf,
+        upstreams,
+        timeout,
+        max_retries,
+        enable_logging,
+    )
+    .await
+    .map_err(|_| ())
 }
 
 /// Handle a DNS query in OS-resolver mode: parse the query, call getaddrinfo
