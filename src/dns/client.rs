@@ -59,7 +59,9 @@ impl DnsClient {
         security: Arc<DnsSecurityConfig>,
         enable_logging: bool,
     ) -> Self {
-        let resolver = UdpDnsResolver::new((*security).clone());
+        // The proxy needs the addresses themselves, so a truncated UDP
+        // answer is followed up over TCP.
+        let resolver = UdpDnsResolver::new((*security).clone()).with_tcp_fallback();
         DnsClient::Upstream {
             cache,
             upstreams,
@@ -300,7 +302,8 @@ async fn fetch_via_upstream_with_cache(
 /// extra upstream query on every request.
 fn cacheable_ttl(response: &[u8]) -> Option<u64> {
     let parsed = DnsResponse::parse(response).ok()?;
-    if parsed.response_code() != ResponseCode::NoError {
+    // A truncated answer is by definition incomplete: never cache it.
+    if parsed.response_code() != ResponseCode::NoError || crate::dns::wire::is_truncated(response) {
         return None;
     }
     if parsed.answer_count() == 0 {

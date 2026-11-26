@@ -216,6 +216,10 @@ async fn start_test_proxy_with(
 /// The address every `FakeUpstream` answers A queries with.
 const FAKE_ANSWER: [u8; 4] = [192, 0, 2, 1];
 
+/// Records in the answer for names starting with "big": 16 bytes each, so the
+/// answer is well past the 512 bytes a plain UDP client can take.
+const BIG_ANSWER_RECORDS: u8 = 50;
+
 /// A stand-in for the upstream resolver, on loopback, so the DNS tests need
 /// no network and every assertion can be a hard one. Answers each query with
 /// one A record (`FAKE_ANSWER`, TTL 60) and counts the queries it receives.
@@ -237,12 +241,21 @@ impl FakeUpstream {
                 let mut reply = buf[..len].to_vec();
                 reply[2] = 0x81; // response, recursion desired
                 reply[3] = 0x80; // recursion available, NOERROR
-                reply[7] = 1; // one answer
-                reply.extend_from_slice(&[0xc0, 0x0c]); // name: pointer to the question
-                reply.extend_from_slice(&[0, 1, 0, 1]); // type A, class IN
-                reply.extend_from_slice(&60u32.to_be_bytes()); // TTL
-                reply.extend_from_slice(&[0, 4]); // RDLENGTH
-                reply.extend_from_slice(&FAKE_ANSWER);
+                                 // A name starting with "big" gets an answer too large for a
+                                 // plain 512-byte UDP client; everything else gets one record.
+                let records: u8 = if reply[12..].starts_with(b"\x03big") {
+                    BIG_ANSWER_RECORDS
+                } else {
+                    1
+                };
+                reply[7] = records;
+                for _ in 0..records {
+                    reply.extend_from_slice(&[0xc0, 0x0c]); // name: pointer to the question
+                    reply.extend_from_slice(&[0, 1, 0, 1]); // type A, class IN
+                    reply.extend_from_slice(&60u32.to_be_bytes()); // TTL
+                    reply.extend_from_slice(&[0, 4]); // RDLENGTH
+                    reply.extend_from_slice(&FAKE_ANSWER);
+                }
                 let _ = socket.send_to(&reply, from).await;
             }
         });
@@ -279,6 +292,32 @@ async fn dns_reply(server: SocketAddr, query: &[u8]) -> Vec<u8> {
     assert_eq!(&reply[..2], &query[..2], "transaction ID must match");
     assert!(reply[2] & 0x80 != 0, "QR bit must mark a response");
     reply
+}
+
+/// Send `query` to the DNS server over TCP (two-byte length prefix each way).
+async fn dns_reply_tcp(server: SocketAddr, query: &[u8]) -> Vec<u8> {
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(server).await.unwrap();
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(query).await.unwrap();
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut reply).await.unwrap();
+        reply
+    };
+    let reply = tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("no reply from the DNS server over TCP");
+    assert_eq!(&reply[..2], &query[..2], "transaction ID must match");
+    reply
+}
+
+fn answer_count(reply: &[u8]) -> u16 {
+    u16::from_be_bytes([reply[6], reply[7]])
 }
 
 fn rcode(reply: &[u8]) -> u8 {
@@ -710,6 +749,52 @@ async fn test_dns_cache_hit() {
     // A different name is not a cache hit.
     dns_reply(dns_addr, &build_dns_query("example.org", 0x3333)).await;
     assert_eq!(upstream.queries(), 2);
+}
+
+#[tokio::test]
+async fn test_dns_over_tcp_answers_queries() {
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
+
+    let reply = dns_reply_tcp(dns_addr, &build_dns_query("example.com", 0x7001)).await;
+    assert_eq!(rcode(&reply), NOERROR);
+    assert_eq!(answer_count(&reply), 1);
+    assert!(reply.ends_with(&FAKE_ANSWER));
+
+    // The same policy applies as over UDP.
+    let reply = dns_reply_tcp(dns_addr, &build_any_dns_query("example.com", 0x7002)).await;
+    assert_eq!(rcode(&reply), REFUSED);
+}
+
+/// An answer too big for a plain UDP client comes back truncated (TC bit, no
+/// records), and the retry over TCP that this invites returns all of it.
+#[tokio::test]
+async fn test_dns_large_answer_is_truncated_over_udp_and_whole_over_tcp() {
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
+    let query = build_dns_query("big.example.com", 0x7003);
+
+    // Twice: straight from the upstream, then from the cache.
+    for round in 0..2 {
+        let over_udp = dns_reply(dns_addr, &query).await;
+        assert!(
+            over_udp.len() <= 512,
+            "round {round}: {} bytes",
+            over_udp.len()
+        );
+        assert!(over_udp[2] & 0x02 != 0, "round {round}: TC bit must be set");
+        assert_eq!(answer_count(&over_udp), 0, "round {round}");
+    }
+
+    let over_tcp = dns_reply_tcp(dns_addr, &query).await;
+    assert!(over_tcp[2] & 0x02 == 0, "the TCP answer is complete");
+    assert_eq!(answer_count(&over_tcp), u16::from(BIG_ANSWER_RECORDS));
+    assert!(over_tcp.len() > 512);
+    assert_eq!(
+        upstream.queries(),
+        1,
+        "one upstream query served all three clients"
+    );
 }
 
 #[tokio::test]

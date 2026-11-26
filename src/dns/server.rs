@@ -4,14 +4,17 @@ use crate::config::{DnsCacheConfig, DnsFailoverConfig, DnsSecurityConfig, Loggin
 use crate::dns::cache::DnsCache;
 use crate::dns::resolver::{DnsResolver, UdpDnsResolver};
 use crate::dns::validation::{create_dns_error_response, validate_dns_query};
-use crate::dns::wire::{builder, DnsQuery, DnsResponse, RecordType, ResponseCode};
+use crate::dns::wire::{
+    builder, fit_for_udp, is_truncated, DnsQuery, DnsResponse, RecordType, ResponseCode,
+};
 use crate::security::{is_source_ip_allowed, DnsRateLimiter};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Bind the DNS UDP socket. Call this synchronously on the main thread before
 /// spawning the loop, so bind failures (notably EACCES on port 53 when running
@@ -148,6 +151,34 @@ pub async fn run_dns_server_on(
         }
     });
 
+    // DNS over TCP on the same address, for answers too large for UDP: a client
+    // that receives a truncated UDP answer retries over TCP. Failing to bind
+    // (the port may be taken for TCP by something else) leaves UDP working.
+    match TcpListener::bind(listen_addr).await {
+        Ok(listener) => {
+            let ctx = TcpContext {
+                upstreams: Arc::clone(&upstream_addrs),
+                security: Arc::clone(&security),
+                cache: Arc::clone(&cache),
+                failover: Arc::clone(&failover_config),
+                // Over TCP the whole answer is wanted, so a truncated upstream
+                // answer is followed up over TCP as well.
+                resolver: Arc::new(UdpDnsResolver::new((*security).clone()).with_tcp_fallback()),
+                rate_limiter: Arc::clone(&rate_limiter),
+                allowed_source_ips: Arc::new(allowed_source_ips.clone()),
+                min_ttl_seconds,
+                enable_logging,
+            };
+            tokio::spawn(serve_tcp(listener, ctx));
+            if enable_logging {
+                info!(listen = %listen_addr, "DNS server also listening on TCP");
+            }
+        }
+        Err(e) => {
+            warn!(listen = %listen_addr, error = %e, "DNS over TCP unavailable (bind failed); serving UDP only");
+        }
+    }
+
     // Queries are small, but EDNS0 options (cookies, padding) can take one past
     // the classic 512-byte limit; a larger datagram would be cut short on Linux
     // and fail the read on Windows.
@@ -266,6 +297,133 @@ pub async fn run_dns_server_on(
     }
 }
 
+/// Everything a DNS-over-TCP connection needs, shared by reference count.
+#[derive(Clone)]
+struct TcpContext {
+    upstreams: Arc<Vec<SocketAddr>>,
+    security: Arc<DnsSecurityConfig>,
+    cache: Arc<Mutex<DnsCache>>,
+    failover: Arc<DnsFailoverConfig>,
+    resolver: Arc<UdpDnsResolver>,
+    rate_limiter: Arc<Mutex<DnsRateLimiter>>,
+    allowed_source_ips: Arc<Vec<String>>,
+    min_ttl_seconds: u32,
+    enable_logging: bool,
+}
+
+/// TCP connections served at once. TCP is the exception path (large answers),
+/// and each connection holds a socket and a task, so the number is kept small.
+const MAX_TCP_CONNECTIONS: usize = 64;
+/// How long a TCP client may take to send its next query (or the rest of one).
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Queries answered on one TCP connection before it is closed.
+const MAX_TCP_QUERIES_PER_CONNECTION: usize = 100;
+
+/// Accept loop for DNS over TCP.
+async fn serve_tcp(listener: TcpListener, ctx: TcpContext) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
+    let mut failures = 0u32;
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => {
+                failures = 0;
+                accepted
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                if failures == 1 {
+                    warn!(error = %e, "DNS TCP accept failed");
+                }
+                tokio::time::sleep(recv_error_backoff(failures.saturating_add(3))).await;
+                continue;
+            }
+        };
+        // Same source allowlist as UDP; unauthorized peers get no answer.
+        if !ctx.allowed_source_ips.is_empty()
+            && !is_source_ip_allowed(&peer.ip(), &ctx.allowed_source_ips)
+        {
+            continue;
+        }
+        // At the limit the connection is simply closed.
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            continue;
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            serve_tcp_connection(stream, peer, &ctx).await;
+        });
+    }
+}
+
+/// Answer the queries on one DNS-over-TCP connection (RFC 1035 §4.2.2: every
+/// message is preceded by its length as two bytes).
+async fn serve_tcp_connection(mut stream: TcpStream, peer: SocketAddr, ctx: &TcpContext) {
+    for _ in 0..MAX_TCP_QUERIES_PER_CONNECTION {
+        let read = async {
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await?;
+            let mut query = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut query).await?;
+            Ok::<_, std::io::Error>(query)
+        };
+        // EOF, an error, or a client that went quiet: done with this connection.
+        let Ok(Ok(query)) = tokio::time::timeout(TCP_IDLE_TIMEOUT, read).await else {
+            return;
+        };
+
+        let response = if !ctx.rate_limiter.lock().await.is_allowed(peer.ip()) {
+            if ctx.enable_logging {
+                warn!(client = %peer.ip(), max_qps = ctx.security.max_qps, "DNS rate limit exceeded");
+            }
+            create_dns_error_response(&query, ResponseCode::Refused)
+        } else {
+            let result = if ctx.upstreams.is_empty() {
+                handle_dns_query_os(
+                    &query,
+                    peer,
+                    &ctx.security,
+                    Arc::clone(&ctx.cache),
+                    ctx.min_ttl_seconds,
+                    ctx.enable_logging,
+                )
+                .await
+            } else {
+                handle_dns_query(
+                    &*ctx.resolver,
+                    &query,
+                    peer,
+                    &ctx.upstreams,
+                    &ctx.security,
+                    Arc::clone(&ctx.cache),
+                    &ctx.failover,
+                    ctx.enable_logging,
+                )
+                .await
+            };
+            match result {
+                Ok(response) => Some(response),
+                Err(_) => create_dns_error_response(&query, ResponseCode::ServFail),
+            }
+        };
+        // Nothing sensible to say (the query was not even a DNS header): close.
+        let Some(response) = response else { return };
+        let Ok(length) = u16::try_from(response.len()) else {
+            return;
+        };
+        let write = async {
+            stream.write_all(&length.to_be_bytes()).await?;
+            stream.write_all(&response).await
+        };
+        if !matches!(
+            tokio::time::timeout(TCP_IDLE_TIMEOUT, write).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+    }
+}
+
 /// Delay before the next receive attempt after `consecutive` receive errors in
 /// a row. The first few errors retry immediately (a stray ICMP-induced reset is
 /// a one-off); after that the delay grows linearly up to one second.
@@ -287,6 +445,10 @@ async fn send_or_servfail(
 ) {
     match result {
         Ok(response) => {
+            // An answer larger than this client can take over UDP (a cached
+            // one fetched for a client with a bigger limit, say) goes out as
+            // "truncated, retry over TCP" instead.
+            let response = fit_for_udp(query_buf, response);
             if enable_logging {
                 debug!(bytes = response.len(), client = %src, "DNS sending response");
             }
@@ -420,7 +582,11 @@ pub async fn handle_dns_query<R: DnsResolver>(
                 }
 
                 // Only cache successful responses with answers
-                if response.response_code() == ResponseCode::NoError && answer_count > 0 {
+                // (A truncated answer is incomplete by definition: not cached.)
+                if response.response_code() == ResponseCode::NoError
+                    && answer_count > 0
+                    && !is_truncated(&response_buf)
+                {
                     let min_ttl = response.min_ttl();
 
                     let mut cache_guard = cache.lock().await;

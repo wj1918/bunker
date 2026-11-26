@@ -1,12 +1,13 @@
 //! DNS resolver trait with generics for zero-cost abstraction.
 
 use crate::config::DnsSecurityConfig;
-use crate::dns::wire::DnsQuery;
+use crate::dns::wire::{is_truncated, DnsQuery};
 use crate::error::DnsError;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, warn};
 
 /// DNS header size in octets (RFC 1035 §4.1.1).
@@ -82,6 +83,8 @@ const DOWN_COOLDOWN: Duration = Duration::from_secs(30);
 /// UDP-based DNS resolver implementation
 pub struct UdpDnsResolver {
     security: DnsSecurityConfig,
+    /// Fetch the full answer over TCP when the UDP one comes back truncated.
+    tcp_fallback: bool,
     /// Upstreams that recently failed to answer, and when.
     down: std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>,
 }
@@ -90,8 +93,50 @@ impl UdpDnsResolver {
     pub fn new(security: DnsSecurityConfig) -> Self {
         Self {
             security,
+            tcp_fallback: false,
             down: Default::default(),
         }
+    }
+
+    /// When an upstream's UDP answer is truncated (TC bit), ask it again over
+    /// TCP and return the full answer.
+    ///
+    /// For callers that need the whole answer themselves: the proxy's own
+    /// lookups, and queries that reached the DNS server over TCP. A query
+    /// from a UDP client is better served by passing the truncated answer
+    /// through — the client then retries over TCP, as the protocol intends.
+    pub fn with_tcp_fallback(mut self) -> Self {
+        self.tcp_fallback = true;
+        self
+    }
+}
+
+/// One DNS exchange over TCP (RFC 1035 §4.2.2: each message is preceded by its
+/// length as two bytes), bounded by `timeout` in total.
+async fn query_over_tcp(
+    query: &[u8],
+    upstream: SocketAddr,
+    timeout: Duration,
+) -> Result<Vec<u8>, DnsError> {
+    let exchange = async {
+        let length = u16::try_from(query.len())
+            .map_err(|_| std::io::Error::other("query too long for DNS over TCP"))?;
+        let mut stream = TcpStream::connect(upstream).await?;
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(query).await?;
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await?;
+        let mut response = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(Ok(response)) => {
+            validate_upstream_response(query, &response)?;
+            Ok(response)
+        }
+        Ok(Err(e)) => Err(DnsError::ParseError(e.to_string())),
+        Err(_) => Err(DnsError::Timeout),
     }
 }
 
@@ -152,9 +197,19 @@ impl DnsResolver for UdpDnsResolver {
                 None
             };
             match problem {
-                // Copy out just the datagram: the result is long-lived (it is
-                // cached), so it must not keep the 64 KiB receive allocation.
-                None => return Ok(recv_buf[..len].to_vec()),
+                None => {
+                    // Copy out just the datagram: the result is long-lived (it
+                    // is cached), so it must not keep the 64 KiB allocation.
+                    let answer = recv_buf[..len].to_vec();
+                    if self.tcp_fallback && is_truncated(&answer) {
+                        // Too big for UDP. If TCP fails too, the truncated
+                        // answer is still the best we have.
+                        if let Ok(full) = query_over_tcp(query, upstream, timeout).await {
+                            return Ok(full);
+                        }
+                    }
+                    return Ok(answer);
+                }
                 Some(problem) => {
                     // Once per query: a flood must not flood the log too.
                     if enable_logging && !warned {
@@ -722,5 +777,87 @@ mod tests {
         assert!(resolver.is_down(upstream));
         resolver.report(upstream, true);
         assert!(!resolver.is_down(upstream));
+    }
+
+    // ---------- TCP fallback for truncated answers ----------
+
+    /// An upstream that answers over UDP with an empty truncated reply and
+    /// over TCP (same port) with the real answer.
+    async fn truncating_upstream(answer: Vec<u8>) -> SocketAddr {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, from)) = udp.recv_from(&mut buf).await {
+                let mut reply = buf[..len].to_vec();
+                reply[2] = 0x83; // response, TC set
+                reply[3] = 0x80;
+                let _ = udp.send_to(&reply, from).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tcp.accept().await {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).await.is_err() {
+                    continue;
+                }
+                let mut query = vec![0u8; u16::from_be_bytes(length) as usize];
+                let _ = stream.read_exact(&mut query).await;
+                let _ = stream.write_all(&(answer.len() as u16).to_be_bytes()).await;
+                let _ = stream.write_all(&answer).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_answer_is_fetched_over_tcp_when_asked_to() {
+        let query = builder::build_query("example.com", RecordType::A, 0xBEEF);
+        let full = builder::build_response(
+            "example.com",
+            "93.184.216.34",
+            0xBEEF,
+            300,
+            ResponseCode::NoError,
+        );
+        let upstream = truncating_upstream(full.clone()).await;
+        let wait = Duration::from_secs(3);
+
+        // Without the fallback the truncated answer is passed through.
+        let passed = udp_resolver()
+            .resolve(&query, upstream, wait, false)
+            .await
+            .unwrap();
+        assert!(is_truncated(&passed));
+
+        let fetched = udp_resolver()
+            .with_tcp_fallback()
+            .resolve(&query, upstream, wait, false)
+            .await
+            .unwrap();
+        assert_eq!(fetched, full);
+    }
+
+    /// An answer over TCP is held to the same checks as one over UDP, and if
+    /// TCP yields nothing usable the truncated UDP answer is still returned.
+    #[tokio::test]
+    async fn tcp_fallback_rejects_a_mismatched_answer() {
+        let query = builder::build_query("example.com", RecordType::A, 0xBEEF);
+        let wrong = builder::build_response(
+            "evil.example",
+            "6.6.6.6",
+            0xBEEF,
+            300,
+            ResponseCode::NoError,
+        );
+        let upstream = truncating_upstream(wrong).await;
+        let got = udp_resolver()
+            .with_tcp_fallback()
+            .resolve(&query, upstream, Duration::from_secs(3), false)
+            .await
+            .unwrap();
+        assert!(is_truncated(&got), "fell back to the UDP answer");
+        assert!(crate::dns::wire::extract_ips(&got, RecordType::A).is_empty());
     }
 }

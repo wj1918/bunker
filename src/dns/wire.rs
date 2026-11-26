@@ -399,6 +399,81 @@ pub fn extract_ips(response: &[u8], qtype: RecordType) -> Vec<IpAddr> {
     ips
 }
 
+/// True if `msg` has the TC (truncated) bit set: the sender could not fit the
+/// whole answer in a UDP datagram and the full one must be fetched over TCP.
+pub fn is_truncated(msg: &[u8]) -> bool {
+    msg.len() >= HEADER_SIZE && msg[2] & 0x02 != 0
+}
+
+/// Classic DNS-over-UDP payload limit, for a client that does not say otherwise.
+const PLAIN_UDP_LIMIT: usize = 512;
+
+/// The largest UDP response the sender of `query` says it can take: the size
+/// advertised in its EDNS0 OPT record (RFC 6891), or 512 bytes without one.
+pub fn udp_payload_limit(query: &[u8]) -> usize {
+    fn advertised(query: &[u8]) -> Option<usize> {
+        if query.len() < HEADER_SIZE {
+            return None;
+        }
+        let count = |i: usize| u16::from_be_bytes([query[i], query[i + 1]]) as usize;
+        let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+        let mut pos = HEADER_SIZE;
+        for _ in 0..qd {
+            pos = skip_name(query, pos)?.checked_add(4)?;
+        }
+        for index in 0..an + ns + ar {
+            let fixed = skip_name(query, pos)?;
+            let field = |at: usize| {
+                let bytes = query.get(fixed + at..fixed + at + 2)?;
+                Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+            };
+            const TYPE_OPT: u16 = 41;
+            if index >= an + ns && field(0)? == TYPE_OPT {
+                // For OPT the CLASS field carries the UDP payload size.
+                return Some(field(2)? as usize);
+            }
+            pos = fixed.checked_add(10)?.checked_add(field(8)? as usize)?;
+        }
+        None
+    }
+    advertised(query)
+        .unwrap_or(PLAIN_UDP_LIMIT)
+        .max(PLAIN_UDP_LIMIT)
+}
+
+/// Make `response` safe to send to the UDP client that sent `query`.
+///
+/// A response within the client's limit is returned unchanged. A larger one —
+/// typically a cached answer first fetched for a client with a bigger limit,
+/// or over TCP — is replaced by an empty answer with the TC bit set, which
+/// tells the client to ask again over TCP. Sending it as it is would either
+/// be cut off by the client's buffer or fail outright.
+pub fn fit_for_udp(query: &[u8], response: Vec<u8>) -> Vec<u8> {
+    if response.len() <= udp_payload_limit(query) || response.len() < HEADER_SIZE {
+        return response;
+    }
+    let question_count = u16::from_be_bytes([response[4], response[5]]) as usize;
+    let mut end = Some(HEADER_SIZE);
+    for _ in 0..question_count {
+        end = end
+            .and_then(|pos| skip_name(&response, pos))
+            .and_then(|pos| pos.checked_add(4))
+            .filter(|&pos| pos <= response.len());
+    }
+    let mut out = match end {
+        Some(end) => response[..end].to_vec(),
+        // Unparseable question: header only, declaring no question.
+        None => {
+            let mut header = response[..HEADER_SIZE].to_vec();
+            header[4..6].fill(0);
+            header
+        }
+    };
+    out[2] |= 0x02; // TC
+    out[6..12].fill(0); // no answer, authority or additional records
+    out
+}
+
 /// Create an error response from a query
 ///
 /// Takes the original query bytes and returns a response with the specified error code.
@@ -1152,5 +1227,77 @@ mod tests {
         let parsed = DnsResponse::parse(&buf).unwrap();
         assert_eq!(parsed.answer_count(), 0);
         assert_eq!(parsed.min_ttl(), 60); // Default when no answers
+    }
+
+    // ---------- UDP size limits and truncation ----------
+
+    /// A query for `name` with an EDNS0 OPT record advertising `size`.
+    fn query_with_edns(name: &str, size: u16) -> Vec<u8> {
+        let mut q = builder::build_query(name, RecordType::A, 0x4242);
+        q[11] = 1; // ARCOUNT = 1
+        q.push(0); // root name
+        q.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
+        q.extend_from_slice(&size.to_be_bytes()); // CLASS = UDP payload size
+        q.extend_from_slice(&[0, 0, 0, 0]); // extended RCODE + flags
+        q.extend_from_slice(&[0, 0]); // RDLENGTH
+        q
+    }
+
+    fn response_with_addresses(query: &[u8], count: u8) -> Vec<u8> {
+        let ips: Vec<IpAddr> = (0..count)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(192, 0, 2, i)))
+            .collect();
+        builder::build_response_with_ips(query, &ips, RecordType::A, 60)
+    }
+
+    #[test]
+    fn udp_payload_limit_comes_from_edns_or_defaults_to_512() {
+        let plain = builder::build_query("example.com", RecordType::A, 1);
+        assert_eq!(udp_payload_limit(&plain), 512);
+        assert_eq!(
+            udp_payload_limit(&query_with_edns("example.com", 1232)),
+            1232
+        );
+        assert_eq!(
+            udp_payload_limit(&query_with_edns("example.com", 4096)),
+            4096
+        );
+        // A client may not advertise less than the classic limit.
+        assert_eq!(udp_payload_limit(&query_with_edns("example.com", 100)), 512);
+        // Garbage and truncated input never panic and never go below the default.
+        assert_eq!(udp_payload_limit(&[]), 512);
+        let edns = query_with_edns("example.com", 4096);
+        for cut in 0..edns.len() {
+            // Either the size was already readable or the default applies.
+            let limit = udp_payload_limit(&edns[..cut]);
+            assert!(limit == 512 || limit == 4096, "cut at {cut}: {limit}");
+        }
+    }
+
+    /// Regression: a cached answer larger than a UDP client's limit was sent
+    /// to it whole.
+    #[test]
+    fn oversized_answer_is_replaced_by_a_truncated_one_for_udp() {
+        let plain = builder::build_query("example.com", RecordType::A, 0x4242);
+        let small = response_with_addresses(&plain, 3);
+        assert!(!is_truncated(&small));
+        assert_eq!(fit_for_udp(&plain, small.clone()), small, "fits: unchanged");
+
+        let big = response_with_addresses(&plain, 60);
+        assert!(big.len() > 512);
+        let sent = fit_for_udp(&plain, big.clone());
+        assert!(is_truncated(&sent));
+        assert!(sent.len() <= 512);
+        assert_eq!(&sent[..2], &big[..2], "transaction ID kept");
+        assert_eq!(&sent[4..6], &[0, 1], "question kept");
+        assert_eq!(&sent[6..12], &[0; 6], "no records");
+        assert_eq!(sent[12..], plain[12..], "question section echoed");
+        let parsed = DnsResponse::parse(&sent).unwrap();
+        assert_eq!(parsed.response_code(), ResponseCode::NoError);
+        assert!(extract_ips(&sent, RecordType::A).is_empty());
+
+        // The same answer fits a client that advertised a larger buffer.
+        let roomy = query_with_edns("example.com", 4096);
+        assert_eq!(fit_for_udp(&roomy, big.clone()), big);
     }
 }

@@ -220,6 +220,11 @@ New-NetFirewallRule -DisplayName "Bunker HTTP Proxy" `
 New-NetFirewallRule -DisplayName "Bunker DNS Server" `
     -Direction Inbound -Protocol UDP -LocalPort 53 `
     -Action Allow -Profile Private,Domain
+
+# Allow DNS over TCP (TCP 53) - used for answers too large for UDP
+New-NetFirewallRule -DisplayName "Bunker DNS Server (TCP)" `
+    -Direction Inbound -Protocol TCP -LocalPort 53 `
+    -Action Allow -Profile Private,Domain
 ```
 
 Verify: `Get-NetFirewallRule -DisplayName "Bunker*" | Select-Object DisplayName, Enabled, Profile`
@@ -405,7 +410,7 @@ dig @192.168.1.1 google.com
 | SSH/SFTP | Yes | CONNECT tunnel |
 | WebSocket (wss://) | Yes | CONNECT tunnel |
 | Any TLS/TCP | Yes | CONNECT tunnel |
-| DNS (UDP) | Yes | Built-in server |
+| DNS (UDP and TCP) | Yes | Built-in server; TCP carries answers too large for UDP |
 | SOCKS5 | No | Not supported |
 | HTTP/2 | No | Not supported |
 
