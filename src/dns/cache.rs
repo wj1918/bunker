@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 struct DnsCacheEntry {
     response: Vec<u8>,
     expires_at: Instant,
-    #[allow(dead_code)] // Useful for debugging
+    #[cfg_attr(not(test), allow(dead_code))] // Read by tests; useful for debugging
     ttl_seconds: u64,
 }
 
@@ -27,9 +27,22 @@ impl DnsCache {
         }
     }
 
-    /// Create cache key from query name and type
+    /// Create cache key from query name and type.
+    ///
+    /// The DNS server looks names up in fully qualified form (`example.com.`)
+    /// and the proxy in bare form (`example.com`). Both must land on the same
+    /// entry, so the root dot is not part of the key.
     fn make_key(name: &str, query_type: RecordType) -> String {
+        let name = name.strip_suffix('.').unwrap_or(name);
         format!("{}:{:?}", name.to_lowercase(), query_type)
+    }
+
+    /// The TTL an entry was stored with, after the min/max bounds (test only).
+    #[cfg(test)]
+    pub fn stored_ttl(&self, name: &str, query_type: RecordType) -> Option<u64> {
+        self.entries
+            .get(&Self::make_key(name, query_type))
+            .map(|e| e.ttl_seconds)
     }
 
     /// Get cached response if valid and not expired
@@ -192,6 +205,25 @@ mod tests {
         cache.cleanup();
         let (total_after, _) = cache.stats();
         assert!(total_after <= total_before);
+    }
+
+    #[test]
+    fn fully_qualified_and_bare_names_share_an_entry() {
+        let mut cache = DnsCache::new(default_config());
+        cache.put("example.com.", RecordType::A, vec![0, 0, 7], 300);
+        assert!(cache.get("example.com", RecordType::A, 0).is_some());
+        assert!(cache.get_stale("EXAMPLE.com", RecordType::A, 0).is_some());
+
+        cache.put("other.test", RecordType::A, vec![0, 0, 8], 300);
+        assert!(cache.get("other.test.", RecordType::A, 0).is_some());
+
+        // Storing under the other spelling replaces, not duplicates.
+        cache.put("example.com", RecordType::A, vec![0, 0, 9], 300);
+        assert_eq!(cache.stats().0, 2);
+        assert_eq!(
+            cache.get("example.com.", RecordType::A, 0),
+            Some(vec![0, 0, 9])
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! - **Upstream** — forwards A + AAAA queries to the configured upstreams via
 //!   `handle_dns_query_with_resolver`, sharing the same cache the DNS server
 //!   uses (Mode 1). Picks up the operator-configured failover, anti-spoofing,
-//!   serve-stale, and TTL bounds.
+//!   serve-stale, and TTL bounds. Only successful replies are cached, for the
+//!   TTL the upstream gave.
 //! - **Os** — wraps `crate::dns::os_resolve(host, cache)`, which calls
 //!   `getaddrinfo` on a tokio worker. Used in Mode 2 (shares cache with the
 //!   DNS server's `OsResolverHandler`) and Mode 3 (own cache, no DNS server).
@@ -24,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::config::{DnsFailoverConfig, DnsSecurityConfig};
 use crate::dns::cache::DnsCache;
 use crate::dns::resolver::{handle_dns_query_with_resolver, UdpDnsResolver};
-use crate::dns::wire::{builder, extract_ips, RecordType};
+use crate::dns::wire::{builder, extract_ips, DnsResponse, RecordType, ResponseCode};
 use crate::error::DnsError;
 
 /// Proxy-side DNS resolver. Two backends; same `resolve(host)` API.
@@ -151,6 +152,7 @@ async fn resolve_via_upstream(
         resolver,
         timeout,
         max_retries,
+        failover.serve_stale,
         enable_logging,
     );
     let aaaa_fut = fetch_via_upstream_with_cache(
@@ -162,6 +164,7 @@ async fn resolve_via_upstream(
         resolver,
         timeout,
         max_retries,
+        failover.serve_stale,
         enable_logging,
     );
 
@@ -196,6 +199,7 @@ async fn fetch_via_upstream_with_cache(
     resolver: &UdpDnsResolver,
     timeout: Duration,
     max_retries: u32,
+    serve_stale: bool,
     enable_logging: bool,
 ) -> Result<Vec<u8>, DnsError> {
     // Cache hit fast path.
@@ -206,9 +210,9 @@ async fn fetch_via_upstream_with_cache(
         }
     }
 
-    // Forward via upstreams (failover + retries + serve-stale + anti-spoofing
-    // already inside this function).
-    let response = handle_dns_query_with_resolver(
+    // Forward via upstreams (failover, retries and anti-spoofing are inside
+    // this function).
+    let response = match handle_dns_query_with_resolver(
         resolver,
         query,
         upstreams,
@@ -216,18 +220,45 @@ async fn fetch_via_upstream_with_cache(
         max_retries,
         enable_logging,
     )
-    .await?;
-
-    // Cache the wire response. Use min_ttl from the response itself (parsed
-    // by DnsCache::put consumers — for now we pass 0 and let the cache's
-    // min_ttl_seconds clamp apply, matching how the DNS server stores
-    // entries via its own cache path).
+    .await
     {
-        let mut cache_guard = cache.lock().await;
-        cache_guard.put(host, qtype, response.clone(), 0);
+        Ok(response) => response,
+        Err(e) => {
+            // Every upstream failed: an expired answer beats no answer.
+            if serve_stale {
+                if let Some(stale) = cache.lock().await.get_stale(host, qtype, 0) {
+                    return Ok(stale);
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    if let Some(ttl) = cacheable_ttl(&response) {
+        cache.lock().await.put(host, qtype, response.clone(), ttl);
     }
 
     Ok(response)
+}
+
+/// Whether an upstream reply may be cached, and for how long (before the
+/// cache applies its own min/max bounds).
+///
+/// Only `NOERROR` replies are kept. A failure such as `SERVFAIL` is usually
+/// transient, and caching it would turn one bad reply into errors for every
+/// request to that host until the entry expires. A `NOERROR` reply with no
+/// answers (the host has no record of this type, typically no AAAA) is kept
+/// for the cache's minimum TTL so that an IPv4-only host does not cost an
+/// extra upstream query on every request.
+fn cacheable_ttl(response: &[u8]) -> Option<u64> {
+    let parsed = DnsResponse::parse(response).ok()?;
+    if parsed.response_code() != ResponseCode::NoError {
+        return None;
+    }
+    if parsed.answer_count() == 0 {
+        return Some(0);
+    }
+    Some(u64::from(parsed.min_ttl()))
 }
 
 #[cfg(test)]
@@ -390,6 +421,158 @@ mod tests {
             distinct.len() >= 12,
             "transaction IDs look predictable: {ids:?}"
         );
+    }
+
+    /// A fake upstream that counts queries. The first `failures` A queries
+    /// get SERVFAIL; later ones get 192.0.2.1 with `ttl`. AAAA queries get an
+    /// empty NOERROR answer.
+    async fn spawn_counting_upstream(
+        failures: usize,
+        ttl: u32,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&queries);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let mut a_seen = 0usize;
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                let query = &buf[..len];
+                counter.fetch_add(1, Ordering::SeqCst);
+                let qtype = u16::from_be_bytes([query[len - 4], query[len - 3]]);
+                let response = if qtype == 1 {
+                    a_seen += 1;
+                    if a_seen <= failures {
+                        crate::dns::wire::create_error_response(query, ResponseCode::ServFail)
+                            .unwrap()
+                    } else {
+                        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+                        builder::build_response_with_ips(query, &[ip], RecordType::A, ttl)
+                    }
+                } else {
+                    builder::build_response_with_ips(query, &[], RecordType::AAAA, ttl)
+                };
+                let _ = socket.send_to(&response, from).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    fn upstream_client(
+        cache: Arc<Mutex<DnsCache>>,
+        upstream: SocketAddr,
+        serve_stale: bool,
+    ) -> DnsClient {
+        DnsClient::new_upstream(
+            cache,
+            Arc::new(vec![upstream]),
+            Arc::new(DnsFailoverConfig {
+                timeout_ms: 500,
+                max_retries: 0,
+                serve_stale,
+            }),
+            Arc::new(DnsSecurityConfig::default()),
+            false,
+        )
+    }
+
+    /// Regression: a SERVFAIL was cached like an answer, so one transient
+    /// upstream failure broke the host until the entry expired.
+    #[tokio::test]
+    async fn upstream_failure_reply_is_not_cached() {
+        let (upstream, _queries) = spawn_counting_upstream(1, 300).await;
+        let cache = new_cache();
+        let client = upstream_client(Arc::clone(&cache), upstream, false);
+
+        assert!(client.resolve("flaky.test").await.is_err());
+        assert_eq!(
+            cache.lock().await.stored_ttl("flaky.test", RecordType::A),
+            None,
+            "SERVFAIL must not be cached"
+        );
+        let ips = client.resolve("flaky.test").await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+    }
+
+    /// Regression: answers were stored with TTL 0, so every record lived for
+    /// exactly the cache minimum whatever the upstream said.
+    #[tokio::test]
+    async fn upstream_answer_is_cached_for_its_own_ttl() {
+        let (upstream, queries) = spawn_counting_upstream(0, 600).await;
+        let cache = new_cache();
+        let client = upstream_client(Arc::clone(&cache), upstream, false);
+
+        client.resolve("ttl.test").await.unwrap();
+        {
+            let guard = cache.lock().await;
+            assert_eq!(guard.stored_ttl("ttl.test", RecordType::A), Some(600));
+            // No AAAA record: remembered for the cache minimum.
+            assert_eq!(guard.stored_ttl("ttl.test", RecordType::AAAA), Some(60));
+            // The DNS server asks for the fully qualified name and must find
+            // the entry the proxy stored.
+            assert!(guard.get("ttl.test.", RecordType::A, 7).is_some());
+        }
+
+        // Both families now come from the cache.
+        let before = queries.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(before, 2);
+        client.resolve("ttl.test").await.unwrap();
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn only_successful_replies_are_cacheable() {
+        let query = builder::build_query("example.test", RecordType::A, 1);
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let answer = builder::build_response_with_ips(&query, &[ip], RecordType::A, 1234);
+        let empty = builder::build_response_with_ips(&query, &[], RecordType::A, 1234);
+        assert_eq!(cacheable_ttl(&answer), Some(1234));
+        assert_eq!(cacheable_ttl(&empty), Some(0));
+        for rcode in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::NxDomain,
+        ] {
+            let reply = crate::dns::wire::create_error_response(&query, rcode).unwrap();
+            assert_eq!(cacheable_ttl(&reply), None, "{rcode:?}");
+        }
+        assert_eq!(cacheable_ttl(&[0u8; 3]), None);
+    }
+
+    /// With `serve_stale` on, an expired entry is used when no upstream
+    /// answers; with it off the lookup fails.
+    #[tokio::test]
+    async fn expired_entry_is_served_only_when_serve_stale_is_on() {
+        // Nothing listens here, so every upstream query fails.
+        let dead = {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.local_addr().unwrap()
+        };
+        for serve_stale in [true, false] {
+            let cache = Arc::new(Mutex::new(DnsCache::new(DnsCacheConfig {
+                enabled: true,
+                max_entries: 100,
+                min_ttl_seconds: 0,
+                max_ttl_seconds: 3600,
+            })));
+            let query = builder::build_query("stale.test", RecordType::A, 0);
+            let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+            let response = builder::build_response_with_ips(&query, &[ip], RecordType::A, 0);
+            cache
+                .lock()
+                .await
+                .put("stale.test", RecordType::A, response, 0);
+
+            let client = upstream_client(cache, dead, serve_stale);
+            let result = client.resolve("stale.test").await;
+            if serve_stale {
+                assert_eq!(result.unwrap(), vec![ip]);
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 
     #[test]
