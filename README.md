@@ -136,6 +136,9 @@ proxy:
   # Use your Windows machine's LAN IP to serve other clients,
   # or 127.0.0.1 for loopback-only.
   listen: "192.168.1.1:8080"
+  # Adds "X-Forwarded-For: <client address>" to forwarded HTTP requests.
+  # Set to false to keep clients' LAN addresses from the sites they visit.
+  forwarded_for: true
 
   security:
     block_private_ips: true
@@ -200,6 +203,8 @@ logging:
 app:
   tray_enabled: true
 ```
+
+**Config is checked at startup.** Bunker refuses to start, with a message naming the problem, if `allowed_source_ips` contains an entry that is not an IP address or CIDR block, or if `listen` or a DNS upstream is not `ip:port` (hostnames are not accepted there). It prints a warning, but still starts, if a listener is reachable from other machines while `allowed_source_ips` is empty — that combination is an open proxy and an open DNS resolver.
 
 ### Step 3: Windows Firewall
 
@@ -379,6 +384,10 @@ dig @192.168.1.1 google.com
 | IP Allowlist | Restrict proxy access to specific IPs/CIDRs |
 | Header Sanitization | Redacts sensitive headers in logs |
 | Slowloris Protection | Header read timeout |
+| HTTPS Only via CONNECT | An `https://` URL sent as a plain proxy request is refused (400) instead of being forwarded unencrypted |
+| Request Smuggling Defense | Ambiguous or malformed request framing is rejected (400) |
+| Config Validation | Invalid allowlist entries, listen addresses and DNS upstreams stop startup; an open listener is flagged |
+| Refusal Logging | Blocked targets, rate-limit and capacity rejections, malformed requests and upstream failures are logged at the default level |
 | Idle Timeouts | Drops origins that stop sending and clients that stop reading or uploading |
 | Dead Peer Detection | TCP keep-alive closes tunnels whose peer vanished |
 | Request Size Limits | Configurable max request body size |
@@ -400,6 +409,8 @@ dig @192.168.1.1 google.com
 | SOCKS5 | No | Not supported |
 | HTTP/2 | No | Not supported |
 
+HTTPS always goes through a CONNECT tunnel, which is what browsers, curl, git and package managers do when given an HTTP proxy. A plain request for an `https://` URL (`GET https://host/ HTTP/1.1` sent to the proxy port) is refused with 400: Bunker does not originate TLS, so forwarding it would send the request in clear text.
+
 ---
 
 ## Troubleshooting
@@ -420,6 +431,23 @@ Get-NetConnectionProfile
 netstat -an | findstr ":53"
 nslookup google.com 127.0.0.1
 ```
+
+**Bunker exits with "invalid configuration":**
+
+The message names the setting. The usual cause is a typo in `allowed_source_ips` (each entry must be an IP address or a CIDR block such as `192.168.1.0/24`) or a hostname where `ip:port` is required (`listen`, DNS upstreams).
+
+**A client cannot connect, or gets 403 / 429 / 502:**
+
+Check the log. Each refusal is recorded with the client address and the reason:
+
+| Log message | Meaning |
+|---|---|
+| `Connection dropped: source address not in allowed_source_ips` | The client's address is not in the allowlist (the connection is closed without a response) |
+| `Request blocked` | The target is a private or special-purpose address, a blocked host, or a port outside `allowed_ports` (403) |
+| `Connection refused: rate limit exceeded` | The client opened too many connections in the window (429) |
+| `Connection refused: max_connections reached` | The proxy is at its connection limit (503) |
+| `Request rejected` / `Malformed request rejected` | The request was not a valid proxy request (400) |
+| `Upstream request failed` | DNS lookup, connect or the origin's response failed (502), or the origin was silent past `upstream_read_timeout_seconds` (504) |
 
 ### Linux Client
 
@@ -544,7 +572,7 @@ The isolated zone is a separate broadcast domain: a dedicated unmanaged switch, 
 **Why this layout:**
 - **Lab / IoT containment** — noisy or untrusted devices can still reach package mirrors, Git, container registries, and DNS, but only via Bunker, which logs every request and enforces the allowlist plus rate limit.
 - **No accidental WAN exposure** — devices without a default route can't be reached by, and can't reach, anything off the isolated subnet directly. The only listener that talks to both sides is Bunker.
-- **Auditable egress** — with `logging.log_requests: true` and `logging.level: debug`, every CONNECT and HTTP request from the zone lands in `C:\Bunker\logs\`. Per-request lines are written at DEBUG, so the default `info` level does not show them.
+- **Auditable egress** — everything Bunker refuses or fails to deliver (blocked targets, rate limiting, malformed requests, unreachable upstreams) is logged at the default level in `C:\Bunker\logs\`. To record every request, allowed ones included, set `logging.log_requests: true` and `logging.level: debug`; per-request lines are written at DEBUG.
 
 **Bunker `~/.bunker/config.yaml` (excerpt):**
 
