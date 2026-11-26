@@ -172,12 +172,95 @@ async fn start_test_proxy() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (actual_addr, handle)
 }
 
-/// Start a DNS server and return its address
+/// The address every `FakeUpstream` answers A queries with.
+const FAKE_ANSWER: [u8; 4] = [192, 0, 2, 1];
+
+/// A stand-in for the upstream resolver, on loopback, so the DNS tests need
+/// no network and every assertion can be a hard one. Answers each query with
+/// one A record (`FAKE_ANSWER`, TTL 60) and counts the queries it receives.
+struct FakeUpstream {
+    addr: SocketAddr,
+    queries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeUpstream {
+    async fn start() -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&queries);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reply = buf[..len].to_vec();
+                reply[2] = 0x81; // response, recursion desired
+                reply[3] = 0x80; // recursion available, NOERROR
+                reply[7] = 1; // one answer
+                reply.extend_from_slice(&[0xc0, 0x0c]); // name: pointer to the question
+                reply.extend_from_slice(&[0, 1, 0, 1]); // type A, class IN
+                reply.extend_from_slice(&60u32.to_be_bytes()); // TTL
+                reply.extend_from_slice(&[0, 4]); // RDLENGTH
+                reply.extend_from_slice(&FAKE_ANSWER);
+                let _ = socket.send_to(&reply, from).await;
+            }
+        });
+        FakeUpstream { addr, queries }
+    }
+
+    fn queries(&self) -> usize {
+        self.queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Send `query` to the DNS server and wait for the reply (`None` on timeout).
+///
+/// Uses an async socket on purpose. These tests run on a single-threaded
+/// runtime together with the server under test; a blocking `recv_from` would
+/// park the only thread, the server would never run, and the wait would
+/// always time out.
+async fn dns_exchange(server: SocketAddr, query: &[u8], wait: Duration) -> Option<Vec<u8>> {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.send_to(query, server).await.unwrap();
+    let mut response = [0u8; 512];
+    match tokio::time::timeout(wait, socket.recv_from(&mut response)).await {
+        Ok(Ok((len, _))) => Some(response[..len].to_vec()),
+        _ => None,
+    }
+}
+
+/// `dns_exchange`, for a query that must be answered.
+async fn dns_reply(server: SocketAddr, query: &[u8]) -> Vec<u8> {
+    let reply = dns_exchange(server, query, Duration::from_secs(3))
+        .await
+        .expect("no reply from the DNS server");
+    assert!(reply.len() >= 12, "reply shorter than a DNS header");
+    assert_eq!(&reply[..2], &query[..2], "transaction ID must match");
+    assert!(reply[2] & 0x80 != 0, "QR bit must mark a response");
+    reply
+}
+
+fn rcode(reply: &[u8]) -> u8 {
+    reply[3] & 0x0f
+}
+const NOERROR: u8 = 0;
+const REFUSED: u8 = 5;
+
+/// Start a DNS server forwarding to a resolver that is never reached, for
+/// tests of queries the server answers by itself.
 async fn start_test_dns_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    // TEST-NET-3: reserved, never routed.
+    start_test_dns_server_with("203.0.113.1:53".parse().unwrap()).await
+}
+
+/// Start a DNS server forwarding to `upstream` and return its address
+async fn start_test_dns_server_with(
+    upstream: SocketAddr,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let port = get_available_udp_port();
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-    let upstreams = vec!["8.8.8.8:53".to_string()];
+    let upstreams = vec![upstream.to_string()];
     let security = test_dns_security_config();
     let cache_config = test_dns_cache_config();
     let failover_config = test_dns_failover_config();
@@ -503,68 +586,28 @@ async fn test_proxy_blocked_ipv6_private() {
 
 #[tokio::test]
 async fn test_dns_query_forwarding() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    // Query for google.com
-    let query = build_dns_query("google.com", 0x1234);
-    socket.send_to(&query, dns_addr).unwrap();
-
-    let mut response = [0u8; 512];
-    match socket.recv_from(&mut response) {
-        Ok((len, _)) => {
-            assert!(len > 12, "Response should be larger than header");
-            // Transaction ID should match
-            assert_eq!(response[0], 0x12);
-            assert_eq!(response[1], 0x34);
-            // QR bit should be set (response)
-            assert!(response[2] & 0x80 != 0, "Should be a response");
-        }
-        Err(e) => {
-            // Network issues are expected in some environments
-            println!("DNS query failed (expected if no network): {}", e);
-        }
-    }
+    let reply = dns_reply(dns_addr, &build_dns_query("google.com", 0x1234)).await;
+    assert_eq!(rcode(&reply), NOERROR);
+    assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 1, "one answer");
+    assert!(reply.ends_with(&FAKE_ANSWER), "answer from the upstream");
+    assert_eq!(upstream.queries(), 1);
 }
 
 #[tokio::test]
 async fn test_dns_any_query_blocked() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-
-    // Query with ANY type (should be blocked)
-    let query = build_any_dns_query("example.com", 0x5678);
-    socket.send_to(&query, dns_addr).unwrap();
-
-    let mut response = [0u8; 512];
-    match socket.recv_from(&mut response) {
-        Ok((len, _)) => {
-            assert!(len > 12, "Response should be larger than header");
-            // Transaction ID should match
-            assert_eq!(response[0], 0x56);
-            assert_eq!(response[1], 0x78);
-            // Should get REFUSED or similar error response
-            // RCODE is in the lower 4 bits of byte 3
-            let rcode = response[3] & 0x0F;
-            // REFUSED = 5, NOTIMP = 4, SERVFAIL = 2
-            assert!(
-                rcode == 5 || rcode == 4 || rcode == 2,
-                "Expected REFUSED/NOTIMP/SERVFAIL, got rcode {}",
-                rcode
-            );
-        }
-        Err(e) => {
-            println!("DNS query failed: {}", e);
-        }
-    }
+    let reply = dns_reply(dns_addr, &build_any_dns_query("example.com", 0x5678)).await;
+    assert_eq!(rcode(&reply), REFUSED);
+    assert_eq!(
+        upstream.queries(),
+        0,
+        "a blocked query must not be forwarded"
+    );
 }
 
 /// Regression: a receive error must not end the DNS serve loop. On Windows an
@@ -591,95 +634,52 @@ async fn test_dns_server_survives_receive_errors() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 3. The server must still answer. ANY is refused locally, so this needs
-    //    no upstream and is a hard assertion. Async socket: a blocking recv
-    //    would stall the single-threaded test runtime the server runs on.
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    socket
-        .send_to(&build_any_dns_query("example.com", 0x4242), dns_addr)
-        .await
-        .unwrap();
-
-    let mut response = [0u8; 512];
-    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut response))
-        .await
-        .expect("DNS server stopped answering after a receive error")
-        .unwrap();
-    assert!(len >= 12);
-    assert_eq!(&response[..2], &[0x42, 0x42]);
-    assert!(response[2] & 0x80 != 0, "Should be a response");
+    //    no upstream.
+    let reply = dns_reply(dns_addr, &build_any_dns_query("example.com", 0x4242)).await;
+    assert_eq!(rcode(&reply), REFUSED);
 }
 
 #[tokio::test]
 async fn test_dns_multiple_queries() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
-
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
     let domains = ["example.com", "google.com", "cloudflare.com"];
-    let mut successful = 0;
-
     for (i, domain) in domains.iter().enumerate() {
-        let query = build_dns_query(domain, (0x1000 + i) as u16);
-        socket.send_to(&query, dns_addr).unwrap();
-
-        let mut response = [0u8; 512];
-        if socket.recv_from(&mut response).is_ok() {
-            successful += 1;
-        }
+        let reply = dns_reply(dns_addr, &build_dns_query(domain, (0x1000 + i) as u16)).await;
+        assert_eq!(rcode(&reply), NOERROR, "{domain}");
+        assert!(reply.ends_with(&FAKE_ANSWER), "{domain}");
     }
-
-    // At least some queries should succeed (unless no network)
-    println!("Successful DNS queries: {}/{}", successful, domains.len());
+    assert_eq!(upstream.queries(), domains.len());
 }
 
 #[tokio::test]
 async fn test_dns_cache_hit() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    let first = dns_reply(dns_addr, &build_dns_query("example.com", 0x1111)).await;
+    assert_eq!(upstream.queries(), 1);
 
-    // First query
-    let query1 = build_dns_query("example.com", 0x1111);
-    socket.send_to(&query1, dns_addr).unwrap();
+    // Same name again: answered from the cache, under the new transaction ID
+    // (checked by `dns_reply`), without asking the upstream.
+    let second = dns_reply(dns_addr, &build_dns_query("example.com", 0x2222)).await;
+    assert_eq!(
+        upstream.queries(),
+        1,
+        "second query must come from the cache"
+    );
+    assert_eq!(first[2..], second[2..], "same answer apart from the ID");
 
-    let mut response1 = [0u8; 512];
-    if socket.recv_from(&mut response1).is_err() {
-        println!("First query failed - network issue, skipping cache test");
-        return;
-    }
-
-    // Second query (should hit cache)
-    let query2 = build_dns_query("example.com", 0x2222);
-    socket.send_to(&query2, dns_addr).unwrap();
-
-    let mut response2 = [0u8; 512];
-    match socket.recv_from(&mut response2) {
-        Ok((len, _)) => {
-            // Transaction ID should be updated to the new query ID
-            assert_eq!(response2[0], 0x22);
-            assert_eq!(response2[1], 0x22);
-            println!("Cache test: Got response of {} bytes", len);
-        }
-        Err(e) => {
-            println!("Second query failed: {}", e);
-        }
-    }
+    // A different name is not a cache hit.
+    dns_reply(dns_addr, &build_dns_query("example.org", 0x3333)).await;
+    assert_eq!(upstream.queries(), 2);
 }
 
 #[tokio::test]
 async fn test_dns_axfr_blocked() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
-
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
     // Build AXFR query (zone transfer - should be blocked)
     let mut query = build_dns_query("example.com", 0xABCD);
@@ -688,42 +688,30 @@ async fn test_dns_axfr_blocked() {
     query[type_offset] = 0x00;
     query[type_offset + 1] = 0xFC; // AXFR = 252
 
-    socket.send_to(&query, dns_addr).unwrap();
-
-    let mut response = [0u8; 512];
-    match socket.recv_from(&mut response) {
-        Ok((len, _)) => {
-            assert!(len >= 12, "Response should have header");
-            // Should get REFUSED
-            let rcode = response[3] & 0x0F;
-            assert!(
-                rcode == 5 || rcode == 4 || rcode == 2,
-                "Expected REFUSED/NOTIMP/SERVFAIL for AXFR, got rcode {}",
-                rcode
-            );
-        }
-        Err(_) => {
-            // Timeout is also acceptable (server might just drop it)
-        }
-    }
+    let reply = dns_reply(dns_addr, &query).await;
+    assert_eq!(rcode(&reply), REFUSED);
+    assert_eq!(
+        upstream.queries(),
+        0,
+        "a blocked query must not be forwarded"
+    );
 }
 
 #[tokio::test]
 async fn test_dns_malformed_query() {
-    let (dns_addr, _handle) = start_test_dns_server().await;
+    let upstream = FakeUpstream::start().await;
+    let (dns_addr, _handle) = start_test_dns_server_with(upstream.addr).await;
 
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    // Too short to be a DNS message: just a transaction ID. There is nothing
+    // to answer, so the server drops it without forwarding anything.
+    let malformed = [0x12, 0x34];
+    let reply = dns_exchange(dns_addr, &malformed, Duration::from_millis(300)).await;
+    assert_eq!(reply, None, "a 2-byte datagram must not be answered");
+    assert_eq!(upstream.queries(), 0);
 
-    // Send malformed DNS query (too short)
-    let malformed = vec![0x12, 0x34]; // Just transaction ID, nothing else
-    socket.send_to(&malformed, dns_addr).unwrap();
-
-    let mut response = [0u8; 512];
-    // Should either get error response or timeout
-    let _ = socket.recv_from(&mut response);
+    // And it keeps serving afterwards.
+    let reply = dns_reply(dns_addr, &build_dns_query("example.com", 0x4321)).await;
+    assert_eq!(rcode(&reply), NOERROR);
 }
 
 // ============== Edge Case Tests ==============
