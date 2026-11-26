@@ -1,5 +1,5 @@
 {
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "A lightweight HTTP/HTTPS and DNS proxy",
   "homepage": "https://github.com/wj1918/bunker",
   "license": "Apache-2.0",
@@ -11,8 +11,8 @@
   ],
   "architecture": {
     "64bit": {
-      "url": "https://github.com/wj1918/bunker/releases/download/v0.1.4/bunker-v0.1.4-x86_64-pc-windows-msvc.zip",
-      "hash": "94607c3292ca7ee00282664a560823a07b0c60a8c8f7b9455ed08922ac67785c"
+      "url": "https://github.com/wj1918/bunker/releases/download/v0.1.5/bunker-v0.1.5-x86_64-pc-windows-msvc.zip",
+      "hash": "99703dd6dd3b03483176af7cd904fa040dd6c4bc3cc24dfff71b82dd5e5e4695"
     }
   },
   "bin": "bunker.exe",
