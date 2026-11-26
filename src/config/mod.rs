@@ -523,6 +523,7 @@ pub struct SecurityConfig {
     /// response, so long downloads and event streams that keep sending are
     /// unaffected; an origin that goes silent gets a 504 or a closed
     /// connection instead of holding one forever. Engine path only.
+    #[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
     #[serde(default = "default_upstream_read_timeout_seconds")]
     pub upstream_read_timeout_seconds: u64,
     /// Longest wait, in seconds, for the client to send more of a request
@@ -533,6 +534,7 @@ pub struct SecurityConfig {
     /// forever. Does not apply to CONNECT tunnels, which may legitimately sit
     /// idle; dead tunnel peers are detected by `tcp_keepalive`. Engine path
     /// only.
+    #[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
     #[serde(default = "default_client_idle_timeout_seconds")]
     pub client_idle_timeout_seconds: u64,
     /// Maximum requests per connection (0 = unlimited, default 100).
