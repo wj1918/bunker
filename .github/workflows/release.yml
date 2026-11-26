@@ -18,9 +18,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  guard:
+    name: Refuse to overwrite existing release
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fail if release already exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $GITHUB_REF_NAME already exists. Published assets must not be replaced; bump the version and push a new tag instead."
+            exit 1
+          fi
+          echo "No existing release for $GITHUB_REF_NAME"
+
   build:
     name: Build Windows
     if: ${{ github.event_name == 'push' }}
+    needs: guard
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,7 +171,7 @@ jobs:
   winget:
     name: Publish to winget
     needs: release
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-')) }}
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || (needs.release.result == 'success' && !contains(github.ref_name, '-'))) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
