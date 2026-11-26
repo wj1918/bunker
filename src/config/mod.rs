@@ -525,6 +525,16 @@ pub struct SecurityConfig {
     /// connection instead of holding one forever. Engine path only.
     #[serde(default = "default_upstream_read_timeout_seconds")]
     pub upstream_read_timeout_seconds: u64,
+    /// Longest wait, in seconds, for the client to send more of a request
+    /// body or to accept more of a response (0 = unlimited, default 120s).
+    /// Applies to each wait, not to the whole transfer, so a slow but moving
+    /// upload or download is unaffected; a client that stops altogether is
+    /// disconnected instead of holding its connection (and an upstream one)
+    /// forever. Does not apply to CONNECT tunnels, which may legitimately sit
+    /// idle; dead tunnel peers are detected by `tcp_keepalive`. Engine path
+    /// only.
+    #[serde(default = "default_client_idle_timeout_seconds")]
+    pub client_idle_timeout_seconds: u64,
     /// Maximum requests per connection (0 = unlimited, default 100).
     /// This caps how many keep-alive requests ride on a single TCP socket
     /// before bunker forces a reconnect — which is where the per-IP rate
@@ -546,6 +556,10 @@ fn default_header_read_timeout_seconds() -> u64 {
 }
 
 fn default_upstream_read_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_client_idle_timeout_seconds() -> u64 {
     120
 }
 
@@ -573,6 +587,7 @@ impl Default for SecurityConfig {
             max_request_body_bytes: default_max_request_body_bytes(),
             header_read_timeout_seconds: default_header_read_timeout_seconds(),
             upstream_read_timeout_seconds: default_upstream_read_timeout_seconds(),
+            client_idle_timeout_seconds: default_client_idle_timeout_seconds(),
             max_requests_per_connection: default_max_requests_per_connection(),
         }
     }

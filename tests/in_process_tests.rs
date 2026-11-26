@@ -52,6 +52,7 @@ fn test_security_config() -> SecurityConfig {
         max_request_body_bytes: 0,      // Unlimited for tests
         header_read_timeout_seconds: 0, // No timeout for tests
         upstream_read_timeout_seconds: 0,
+        client_idle_timeout_seconds: 0,
         max_requests_per_connection: 0, // Unlimited for tests
     }
 }

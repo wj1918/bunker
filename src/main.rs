@@ -414,6 +414,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 upstream_read_timeout: std::time::Duration::from_secs(
                     sec.upstream_read_timeout_seconds,
                 ),
+                client_idle_timeout: std::time::Duration::from_secs(
+                    sec.client_idle_timeout_seconds,
+                ),
+                tcp_keepalive: config.proxy.tcp_keepalive.clone(),
                 max_request_body_bytes: sec.max_request_body_bytes,
                 max_requests_per_conn: sec.max_requests_per_connection,
                 max_connections: sec.max_connections,

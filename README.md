@@ -155,6 +155,9 @@ proxy:
     # Longest wait for the origin to send more of a response. An idle limit,
     # not a total, so long downloads and event streams are unaffected.
     upstream_read_timeout_seconds: 120
+    # Longest wait for the client to send more of an upload or accept more of
+    # a download. CONNECT tunnels are exempt (see tcp_keepalive).
+    client_idle_timeout_seconds: 120
 
   connection_pool:
     enabled: true

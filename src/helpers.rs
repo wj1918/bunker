@@ -24,11 +24,20 @@ pub fn create_tls_connector() -> Result<TlsConnector, Box<dyn std::error::Error 
 
 /// Apply TCP keep-alive settings to a socket
 pub fn apply_tcp_keepalive(stream: &TcpStream, config: &TcpKeepaliveConfig) -> std::io::Result<()> {
+    apply_tcp_keepalive_to(SockRef::from(stream), config)
+}
+
+/// Apply TCP keep-alive settings to any socket (whatever runtime owns it).
+/// Keep-alive is what detects a peer that vanished without closing — a
+/// sleeping laptop, a dropped Wi-Fi link — on a connection that is otherwise
+/// allowed to sit idle, such as a CONNECT tunnel.
+pub fn apply_tcp_keepalive_to(
+    socket: SockRef<'_>,
+    config: &TcpKeepaliveConfig,
+) -> std::io::Result<()> {
     if !config.enabled {
         return Ok(());
     }
-
-    let socket = SockRef::from(stream);
 
     #[allow(unused_mut)]
     let mut keepalive = TcpKeepalive::new()

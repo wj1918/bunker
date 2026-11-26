@@ -55,6 +55,12 @@ pub struct EngineConfig {
     /// body); zero = no limit. An idle limit, not a total: a slow but steady
     /// download is never cut off.
     pub upstream_read_timeout: Duration,
+    /// Longest wait for the client to send more of a request body or accept
+    /// more of a response; zero = no limit. Idle limit, like the one above.
+    pub client_idle_timeout: Duration,
+    /// TCP keep-alive for client and upstream sockets. This is what notices a
+    /// peer that vanished without closing on an idle CONNECT tunnel.
+    pub tcp_keepalive: crate::config::TcpKeepaliveConfig,
     /// Max request body in bytes; 0 = unlimited.
     pub max_request_body_bytes: u64,
     /// Max requests per client connection; 0 = unlimited.
@@ -95,6 +101,12 @@ pub trait ProxyIo {
         }
         Ok(())
     }
+    /// Run `fut`, giving up after `dur`; `None` means it timed out. This is
+    /// the runtime's timer, exposed so the runtime-agnostic core can bound any
+    /// operation (writes in particular). The default never times out.
+    async fn timeout<F: std::future::Future>(_dur: Duration, fut: F) -> Option<F::Output> {
+        Some(fut.await)
+    }
     /// Like `read_append`, but fails with a TimedOut error if no read completes
     /// within `dur` (used to bound the header read — slowloris defense). The
     /// default ignores the timeout; runtime backends override it with their
@@ -126,7 +138,8 @@ pub enum RelayErr {
 /// bytes and leaving any trailing (pipelined) bytes in `acc`. Runtime-agnostic.
 ///
 /// `head_timeout` (when Some) bounds the *total* time to receive a complete head
-/// (CRLFCRLF) — slowloris defense; it does NOT bound body transfer. `max_body`
+/// (CRLFCRLF) — slowloris defense; it does NOT bound body transfer (the metadata
+/// variant takes a separate idle limit for that). `max_body`
 /// (>0) rejects an oversized declared Content-Length up front (-> TooLarge).
 pub async fn relay_once<C: ProxyIo>(
     src: &mut C,
@@ -137,7 +150,7 @@ pub async fn relay_once<C: ProxyIo>(
 ) -> Result<Bytes, RelayErr> {
     // Backward-compat wrapper: tests and the response path call this; only
     // proxy_forward needs the metadata variant.
-    relay_once_with_metadata(src, acc, is_request, head_timeout, max_body)
+    relay_once_with_metadata(src, acc, is_request, head_timeout, None, max_body)
         .await
         .map(|(b, _)| b)
 }
@@ -150,6 +163,7 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
     acc: &mut BytesMut,
     is_request: bool,
     head_timeout: Option<Duration>,
+    body_idle_timeout: Option<Duration>,
     max_body: u64,
 ) -> Result<(Bytes, Option<MessageMetadata>), RelayErr> {
     let start = std::time::Instant::now();
@@ -192,6 +206,15 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
                         match src.read_append_timeout(acc, t - elapsed).await {
                             Ok(n) => n,
                             Err(_) => return Err(RelayErr::Closed),
+                        }
+                    }
+                    // Body: no limit on the total (a large upload takes as
+                    // long as it takes), only on each wait for more of it.
+                    _ if head_done && body_idle_timeout.is_some() => {
+                        let t = body_idle_timeout.unwrap_or_default();
+                        match src.read_append_timeout(acc, t).await {
+                            Ok(n) => n,
+                            Err(_) => return Err(RelayErr::Closed), // stalled upload
                         }
                     }
                     _ => match src.read_append(acc).await {
@@ -548,21 +571,28 @@ pub async fn proxy_forward<K: Connect>(
     let head_timeout = (!cfg.header_read_timeout.is_zero()).then_some(cfg.header_read_timeout);
     let max_body = cfg.max_request_body_bytes;
     let read_timeout = (!cfg.upstream_read_timeout.is_zero()).then_some(cfg.upstream_read_timeout);
+    let client_timeout = (!cfg.client_idle_timeout.is_zero()).then_some(cfg.client_idle_timeout);
 
     loop {
         // Parse-once: pull metadata out of the framing pass and hand it to
         // rewrite_forward_with_metadata, which then skips its own httparse call.
-        let (req, meta) =
-            match relay_once_with_metadata(&mut client, &mut req_acc, true, head_timeout, max_body)
-                .await
-            {
-                Ok(x) => x,
-                Err(RelayErr::TooLarge) => {
-                    let _ = client.write_all(RESP_413).await;
-                    break;
-                }
-                Err(RelayErr::Closed) => break, // EOF / bad head / slowloris timeout
-            };
+        let (req, meta) = match relay_once_with_metadata(
+            &mut client,
+            &mut req_acc,
+            true,
+            head_timeout,
+            client_timeout,
+            max_body,
+        )
+        .await
+        {
+            Ok(x) => x,
+            Err(RelayErr::TooLarge) => {
+                let _ = client.write_all(RESP_413).await;
+                break;
+            }
+            Err(RelayErr::Closed) => break, // EOF / bad head / slowloris timeout
+        };
         // Per-connection request cap.
         served += 1;
         if cfg.max_requests_per_conn > 0 && served > cfg.max_requests_per_conn {
@@ -730,7 +760,14 @@ pub async fn proxy_forward<K: Connect>(
         // Relay the response as it arrives. From here on the client has (or is
         // about to have) part of the response, so a failure can only be
         // signalled by closing its connection.
-        let relayed = relay_response(&mut client, &mut conn, started, read_timeout).await;
+        let relayed = relay_response(
+            &mut client,
+            &mut conn,
+            started,
+            read_timeout,
+            client_timeout,
+        )
+        .await;
 
         // Keep the upstream for the next request (fast path) only if it can
         // carry one; otherwise it is dropped (closed) here.
@@ -813,6 +850,23 @@ const MAX_INTERIM_RESPONSES: usize = 16;
 /// not the size of the response, is what bounds the proxy's memory use.
 const RELAY_READ_BYTES: usize = 64 * 1024;
 
+/// Write to the client, giving up if it accepts nothing for `limit`. Each call
+/// carries at most about one read's worth of data, so this is an idle limit:
+/// a client that keeps reading, however slowly, is not cut off for the size of
+/// the response.
+async fn write_client<C: ProxyIo>(
+    client: &mut C,
+    data: &[u8],
+    limit: Option<Duration>,
+) -> std::io::Result<()> {
+    match limit {
+        Some(t) => C::timeout(t, client.write_all(data))
+            .await
+            .unwrap_or_else(|| Err(std::io::ErrorKind::TimedOut.into())),
+        None => client.write_all(data).await,
+    }
+}
+
 /// One read from the upstream, bounded by the idle timeout when one is set.
 async fn read_upstream<C: ProxyIo>(
     conn: &mut C,
@@ -843,11 +897,26 @@ async fn begin_roundtrip<C: ProxyIo>(
     forward_interim: bool,
     read_timeout: Option<Duration>,
 ) -> Result<ResponseStarted, RoundtripFailed> {
-    if conn.write_all_vectored(head, body).await.is_err() {
-        return Err(RoundtripFailed {
-            retryable: true,
-            timed_out: false,
-        });
+    // An upstream that accepts the connection but stops taking the request is
+    // as stuck as one that never answers, so the same limit covers the send.
+    let sent = match read_timeout {
+        Some(t) => C::timeout(t, conn.write_all_vectored(head, body)).await,
+        None => Some(conn.write_all_vectored(head, body).await),
+    };
+    match sent {
+        Some(Ok(())) => {}
+        Some(Err(_)) => {
+            return Err(RoundtripFailed {
+                retryable: true,
+                timed_out: false,
+            })
+        }
+        None => {
+            return Err(RoundtripFailed {
+                retryable: false,
+                timed_out: true,
+            })
+        }
     }
     let mut acc: BytesMut = BytesMut::with_capacity(4096);
     let mut interim: Option<BytesMut> = None; // forwarded 1xx bytes, if any
@@ -935,12 +1004,14 @@ impl Relayed {
 /// Each piece is written to the client before the next is read from the
 /// upstream, so memory use stays at about one read however large the body is
 /// (a download of any size, or a stream that never ends), and a slow client
-/// slows the upstream down instead of filling the proxy.
+/// slows the upstream down instead of filling the proxy. A client that stops
+/// reading altogether is dropped after `client_timeout`.
 async fn relay_response<C: ProxyIo>(
     client: &mut C,
     conn: &mut C,
     started: ResponseStarted,
     read_timeout: Option<Duration>,
+    client_timeout: Option<Duration>,
 ) -> Relayed {
     let ResponseStarted {
         interim,
@@ -950,7 +1021,7 @@ async fn relay_response<C: ProxyIo>(
         keep_alive,
     } = started;
     if let Some(pre) = interim {
-        if client.write_all(&pre).await.is_err() {
+        if write_client(client, &pre, client_timeout).await.is_err() {
             return Relayed::ABORTED;
         }
     }
@@ -964,7 +1035,10 @@ async fn relay_response<C: ProxyIo>(
 
     match body {
         ResponseBody::None => {
-            if client.write_all(&buf[..head]).await.is_err() {
+            if write_client(client, &buf[..head], client_timeout)
+                .await
+                .is_err()
+            {
                 return Relayed::ABORTED;
             }
             // Bytes after the response mean the upstream is out of step with
@@ -982,7 +1056,10 @@ async fn relay_response<C: ProxyIo>(
                 let available = (buf.len() - offset) as u64;
                 let take = available.min(remaining) as usize;
                 surplus |= available > remaining;
-                if client.write_all(&buf[..offset + take]).await.is_err() {
+                if write_client(client, &buf[..offset + take], client_timeout)
+                    .await
+                    .is_err()
+                {
                     return Relayed::ABORTED;
                 }
                 remaining -= take as u64;
@@ -1008,7 +1085,10 @@ async fn relay_response<C: ProxyIo>(
             loop {
                 match tracker.advance(&buf[offset..]) {
                     ChunkProgress::Done(n) => {
-                        if client.write_all(&buf[..offset + n]).await.is_err() {
+                        if write_client(client, &buf[..offset + n], client_timeout)
+                            .await
+                            .is_err()
+                        {
                             return Relayed::ABORTED;
                         }
                         return Relayed {
@@ -1019,7 +1099,10 @@ async fn relay_response<C: ProxyIo>(
                     ChunkProgress::More(n) => {
                         let ready = offset + n;
                         if ready > 0 {
-                            if client.write_all(&buf[..ready]).await.is_err() {
+                            if write_client(client, &buf[..ready], client_timeout)
+                                .await
+                                .is_err()
+                            {
                                 return Relayed::ABORTED;
                             }
                             // Keep only the unfinished line, if any.
@@ -1038,7 +1121,7 @@ async fn relay_response<C: ProxyIo>(
         }
         ResponseBody::UntilClose => {
             loop {
-                if !buf.is_empty() && client.write_all(&buf).await.is_err() {
+                if !buf.is_empty() && write_client(client, &buf, client_timeout).await.is_err() {
                     return Relayed::ABORTED;
                 }
                 buf.clear();
@@ -1144,9 +1227,13 @@ mod tokio_backend {
         ) -> std::io::Result<usize> {
             tokio::time::timeout(dur, self.0.read_buf(acc))
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "header read timeout")
-                })?
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))?
+        }
+        async fn timeout<F: std::future::Future>(
+            dur: std::time::Duration,
+            fut: F,
+        ) -> Option<F::Output> {
+            tokio::time::timeout(dur, fut).await.ok()
         }
     }
 
@@ -1155,6 +1242,7 @@ mod tokio_backend {
     /// with already-resolved addresses.
     pub struct TokioConnector {
         pub connect_timeout: std::time::Duration,
+        pub tcp_keepalive: crate::config::TcpKeepaliveConfig,
     }
     impl Connect for TokioConnector {
         type Conn = TokioConn;
@@ -1170,6 +1258,7 @@ mod tokio_backend {
                     })??
             };
             let _ = stream.set_nodelay(true);
+            let _ = crate::helpers::apply_tcp_keepalive(&stream, &self.tcp_keepalive);
             Ok(TokioConn(stream))
         }
         async fn tunnel(mut client: TokioConn, mut upstream: TokioConn) {
@@ -1246,10 +1335,12 @@ mod tokio_backend {
                         }
                         let guard = ConnGuard::new(Arc::clone(&conns)); // dec on task end
                         let _ = client.set_nodelay(true);
+                        let _ = crate::helpers::apply_tcp_keepalive(&client, &cfg.tcp_keepalive);
                         let cfg = Arc::clone(&cfg);
                         let pool = pool.clone();
                         let connector = TokioConnector {
                             connect_timeout: cfg.connect_timeout,
+                            tcp_keepalive: cfg.tcp_keepalive.clone(),
                         };
                         tokio::task::spawn_local(async move {
                             let _g = guard;
@@ -1341,6 +1432,45 @@ mod tokio_backend {
             i += 1;
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::config::TcpKeepaliveConfig;
+
+        /// Regression: the engine ignored `proxy.tcp_keepalive`, so a peer
+        /// that vanished without closing was never noticed and its CONNECT
+        /// tunnel stayed open for good.
+        #[tokio::test]
+        async fn connector_applies_tcp_keepalive() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let keepalive = |enabled| TcpKeepaliveConfig {
+                enabled,
+                time_seconds: 77,
+                ..TcpKeepaliveConfig::default()
+            };
+
+            let on = TokioConnector {
+                connect_timeout: std::time::Duration::ZERO,
+                tcp_keepalive: keepalive(true),
+            };
+            let conn = on.connect(addr).await.unwrap();
+            let sock = socket2::SockRef::from(&conn.0);
+            assert!(sock.keepalive().unwrap());
+            assert_eq!(
+                sock.tcp_keepalive_time().unwrap(),
+                std::time::Duration::from_secs(77)
+            );
+
+            let off = TokioConnector {
+                connect_timeout: std::time::Duration::ZERO,
+                tcp_keepalive: keepalive(false),
+            };
+            let conn = off.connect(addr).await.unwrap();
+            assert!(!socket2::SockRef::from(&conn.0).keepalive().unwrap());
+        }
+    }
 }
 
 #[allow(unused_imports)] // used by examples (separate crates), not the lib/bin
@@ -1425,10 +1555,25 @@ mod monoio_backend {
                 Ok(r) => r,
                 Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "header read timeout",
+                    "read timeout",
                 )),
             }
         }
+        async fn timeout<F: std::future::Future>(
+            dur: std::time::Duration,
+            fut: F,
+        ) -> Option<F::Output> {
+            monoio::time::timeout(dur, fut).await.ok()
+        }
+    }
+
+    /// Apply the configured TCP keep-alive to a monoio stream.
+    fn apply_keepalive(stream: &TcpStream, config: &crate::config::TcpKeepaliveConfig) {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        // SAFETY: the descriptor belongs to `stream`, which outlives this
+        // borrow; it is only used for the setsockopt calls below.
+        let fd = unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) };
+        let _ = crate::helpers::apply_tcp_keepalive_to(socket2::SockRef::from(&fd), config);
     }
 
     /// Thread-per-core io_uring runner: each worker has its own monoio runtime
@@ -1493,6 +1638,7 @@ mod monoio_backend {
     /// This connector only deals with already-resolved addresses.
     pub struct MonoConnector {
         pub connect_timeout: std::time::Duration,
+        pub tcp_keepalive: crate::config::TcpKeepaliveConfig,
     }
     impl Connect for MonoConnector {
         type Conn = MonoConn;
@@ -1508,6 +1654,7 @@ mod monoio_backend {
                     })??
             };
             let _ = stream.set_nodelay(true);
+            apply_keepalive(&stream, &self.tcp_keepalive);
             Ok(MonoConn::new(stream))
         }
         async fn tunnel(client: MonoConn, upstream: MonoConn) {
@@ -1596,10 +1743,12 @@ mod monoio_backend {
                         }
                         let guard = ConnGuard::new(Arc::clone(&conns));
                         let _ = client.set_nodelay(true);
+                        apply_keepalive(&client, &cfg.tcp_keepalive);
                         let cfg = Arc::clone(&cfg);
                         let pool = pool.clone();
                         let connector = MonoConnector {
                             connect_timeout: cfg.connect_timeout,
+                            tcp_keepalive: cfg.tcp_keepalive.clone(),
                         };
                         monoio::spawn(async move {
                             let _g = guard;
@@ -1921,6 +2070,11 @@ mod tests {
         /// Fail writes once this many bytes have been accepted (a client that
         /// has gone away).
         fail_writes_after: Option<usize>,
+        /// Once this many bytes have been accepted, writes never complete (a
+        /// client that is connected but has stopped reading).
+        stall_writes_after: Option<usize>,
+        /// The limit passed with each read that asked for one.
+        timed_reads: Vec<Duration>,
         /// Another connection to observe: at every read on this one, how many
         /// bytes the watched one had been sent so far is appended to `seen`.
         watch: Option<Rc<std::cell::RefCell<MockConn>>>,
@@ -1947,6 +2101,13 @@ mod tests {
             self.opts.borrow_mut().fail_writes_after = Some(bytes);
             self
         }
+        fn stalling_writes_after(self, bytes: usize) -> Self {
+            self.opts.borrow_mut().stall_writes_after = Some(bytes);
+            self
+        }
+        fn timed_reads(&self) -> Vec<Duration> {
+            self.opts.borrow().timed_reads.clone()
+        }
         fn watching(self, other: &SharedConn) -> Self {
             self.opts.borrow_mut().watch = Some(Rc::clone(&other.conn));
             self
@@ -1971,6 +2132,10 @@ mod tests {
             }
         }
         async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+            let stall = self.opts.borrow().stall_writes_after;
+            if stall.is_some_and(|limit| self.conn.borrow().written.len() >= limit) {
+                return std::future::pending().await;
+            }
             let mut conn = self.conn.borrow_mut();
             if let Some(limit) = self.opts.borrow().fail_writes_after {
                 if conn.written.len() >= limit {
@@ -1979,6 +2144,27 @@ mod tests {
             }
             conn.written.extend_from_slice(data);
             Ok(())
+        }
+        async fn read_append_timeout(
+            &mut self,
+            acc: &mut bytes::BytesMut,
+            dur: Duration,
+        ) -> std::io::Result<usize> {
+            self.opts.borrow_mut().timed_reads.push(dur);
+            self.read_append(acc).await
+        }
+        /// These connections are never "slow": an operation either completes
+        /// at once or never does. So one poll decides — pending means the
+        /// limit would have expired.
+        async fn timeout<F: std::future::Future>(_dur: Duration, fut: F) -> Option<F::Output> {
+            let mut fut = std::pin::pin!(fut);
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(match fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(out) => Some(out),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await
         }
     }
 
@@ -2015,7 +2201,20 @@ mod tests {
     }
 
     fn forward_test_config() -> Arc<EngineConfig> {
+        Arc::new(forward_test_engine_config())
+    }
+
+    /// `forward_test_config` with both idle timeouts switched on.
+    fn forward_test_config_with_timeouts() -> Arc<EngineConfig> {
         Arc::new(EngineConfig {
+            upstream_read_timeout: Duration::from_secs(7),
+            client_idle_timeout: Duration::from_secs(9),
+            ..forward_test_engine_config()
+        })
+    }
+
+    fn forward_test_engine_config() -> EngineConfig {
+        EngineConfig {
             security: Arc::new(SecurityConfig::default()),
             dns_client: panic_client(), // targets are literal IPs: never resolved
             rate_limit: RateLimitConfig::default(),
@@ -2026,11 +2225,13 @@ mod tests {
             connect_timeout: Duration::ZERO,
             header_read_timeout: Duration::ZERO,
             upstream_read_timeout: Duration::ZERO,
+            client_idle_timeout: Duration::ZERO,
+            tcp_keepalive: crate::config::TcpKeepaliveConfig::default(),
             max_request_body_bytes: 0,
             max_requests_per_conn: 0,
             max_connections: 0,
             log_requests: false,
-        })
+        }
     }
 
     /// Run `proxy_forward` for one client connection sending `requests` (one
@@ -2042,12 +2243,20 @@ mod tests {
 
     /// Like `run_forward_test`, for a client connection the test built itself.
     fn run_forward_with(client: SharedConn, upstreams: &[SharedConn]) -> (String, ScriptConnect) {
+        run_forward_cfg(client, upstreams, forward_test_config())
+    }
+
+    fn run_forward_cfg(
+        client: SharedConn,
+        upstreams: &[SharedConn],
+        cfg: Arc<EngineConfig>,
+    ) -> (String, ScriptConnect) {
         let connector = ScriptConnect::new(upstreams);
         let pool = new_pool(4, 16, Duration::ZERO, Duration::ZERO);
         block_on(proxy_forward(
             client.clone(),
             connector.clone(),
-            forward_test_config(),
+            cfg,
             "10.0.0.7".parse().unwrap(),
             pool,
         ));
@@ -2374,6 +2583,99 @@ mod tests {
         let (client, connector) = run_forward_test(vec![GET, GET], &[upstream, spare]);
         assert!(client.ends_with("\r\n\r\nabc"), "{client}");
         assert_eq!(connector.connects(), 1);
+    }
+
+    /// A client that stays connected but stops reading used to block the
+    /// write to it forever, holding its connection and an upstream one. With
+    /// the idle limit on, the transfer is abandoned instead.
+    #[test]
+    fn forward_gives_up_on_a_client_that_stops_reading() {
+        let mut script: Vec<&[u8]> = vec![b"HTTP/1.1 200 OK\r\n\r\n"];
+        script.extend(std::iter::repeat_n(&b"0123456789"[..], 1000));
+        let upstream = SharedConn::new(script);
+        let client = SharedConn::new(vec![GET, GET]).stalling_writes_after(100);
+        let (received, connector) = run_forward_cfg(
+            client.clone(),
+            std::slice::from_ref(&upstream),
+            forward_test_config_with_timeouts(),
+        );
+        assert!(received.len() < 200, "{}", received.len());
+        assert!(upstream.unread() > 900, "{} reads left", upstream.unread());
+        // The connection is dropped: the second request is never read.
+        assert_eq!(client.unread(), 1);
+        assert_eq!(connector.connects(), 1);
+    }
+
+    /// An upstream that connects but never takes the request is a timeout
+    /// (504), and the request is not replayed elsewhere.
+    #[test]
+    fn forward_answers_504_when_the_upstream_stops_accepting_the_request() {
+        let upstream = SharedConn::new(vec![OK_2]).stalling_writes_after(0);
+        let spare = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_cfg(
+            SharedConn::new(vec![GET]),
+            &[upstream, spare.clone()],
+            forward_test_config_with_timeouts(),
+        );
+        assert_eq!(client.as_bytes(), RESP_504);
+        assert_eq!(connector.connects(), 1);
+        assert_eq!(spare.written(), "");
+    }
+
+    /// With the timeouts on, ordinary traffic is unaffected.
+    #[test]
+    fn forward_with_idle_timeouts_serves_normally() {
+        let upstream = SharedConn::new(vec![OK_2, OK_2]);
+        let (client, connector) = run_forward_cfg(
+            SharedConn::new(vec![GET, GET]),
+            std::slice::from_ref(&upstream),
+            forward_test_config_with_timeouts(),
+        );
+        assert_eq!(client.as_bytes(), [OK_2, OK_2].concat());
+        assert_eq!(connector.connects(), 1);
+        // Upstream reads carry the upstream limit, not the client one.
+        assert!(upstream
+            .timed_reads()
+            .iter()
+            .all(|d| *d == Duration::from_secs(7)));
+        assert!(!upstream.timed_reads().is_empty());
+    }
+
+    /// Regression: once the head had arrived, a request body could trickle in
+    /// (or stop) with no limit at all. Body reads now carry the idle limit;
+    /// head reads keep the separate head deadline.
+    #[test]
+    fn stalled_upload_is_dropped_by_the_body_idle_limit() {
+        let head: &[u8] = b"POST http://h/ HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n";
+        let idle = Duration::from_secs(9);
+        let head_limit = Duration::from_secs(30);
+
+        let mut conn = SharedConn::new(vec![&head[..20], &head[20..], b"abc"]).stalling();
+        let mut acc = BytesMut::new();
+        let result = block_on(relay_once_with_metadata(
+            &mut conn,
+            &mut acc,
+            true,
+            Some(head_limit),
+            Some(idle),
+            0,
+        ));
+        assert!(matches!(result, Err(RelayErr::Closed)), "{result:?}");
+        let limits = conn.timed_reads();
+        // Two reads for the head (bounded by what is left of its deadline),
+        // then the body reads, each with the full idle limit.
+        assert_eq!(limits.len(), 4, "{limits:?}");
+        assert!(limits[..2].iter().all(|d| *d <= head_limit && *d > idle));
+        assert_eq!(limits[2..], [idle, idle]);
+
+        // Without the limit the body reads are untimed, as before.
+        let mut conn = SharedConn::new(vec![head, b"abc", b"defghij"]);
+        let mut acc = BytesMut::new();
+        let result = block_on(relay_once_with_metadata(
+            &mut conn, &mut acc, true, None, None, 0,
+        ));
+        assert!(result.is_ok());
+        assert!(conn.timed_reads().is_empty());
     }
 
     /// A response head that never ends is cut off instead of buffered.
