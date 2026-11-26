@@ -369,6 +369,45 @@ impl<C> ConnPool<C> {
         }
         // else per-host cap: drop (close)
     }
+
+    /// Drop (close) every idle connection that is past its idle timeout or
+    /// lifetime, and forget hosts left with none. `checkout` only expires
+    /// entries for the host being asked for, so without this a connection to
+    /// a host that is never visited again would stay open and keep counting
+    /// against `max_total`. Returns how many were closed.
+    fn sweep(&mut self, now: std::time::Instant) -> usize {
+        let (idle_to, life) = (self.idle_timeout, self.max_lifetime);
+        let mut removed = 0usize;
+        self.idle.retain(|_, bucket| {
+            let before = bucket.len();
+            bucket.retain(|p| {
+                let expired = (!idle_to.is_zero() && now.duration_since(p.idle_since) > idle_to)
+                    || (!life.is_zero() && now.duration_since(p.created_at) > life);
+                !expired
+            });
+            removed += before - bucket.len();
+            !bucket.is_empty()
+        });
+        self.total -= removed;
+        removed
+    }
+}
+
+/// How often a worker sweeps its pool: half the shortest configured expiry,
+/// kept between 1 and 30 seconds. `None` when connections never expire.
+fn pool_sweep_interval(idle_timeout: Duration, max_lifetime: Duration) -> Option<Duration> {
+    let shortest = [idle_timeout, max_lifetime]
+        .into_iter()
+        .filter(|d| !d.is_zero())
+        .min()?;
+    Some((shortest / 2).clamp(Duration::from_secs(1), Duration::from_secs(30)))
+}
+
+/// One worker's share of the configured pool-wide connection cap. Each worker
+/// owns its own pool, so handing every worker the full cap would let the
+/// process hold `workers` times the configured total.
+fn per_worker_pool_cap(max_total: usize, workers: usize) -> usize {
+    (max_total / workers.max(1)).max(1)
 }
 
 /// Shared per-worker pool handle.
@@ -982,10 +1021,21 @@ mod tokio_backend {
                 local.block_on(&rt, async move {
                     let pool = super::new_pool::<TokioConn>(
                         cfg.pool_max_per_host,
-                        cfg.pool_max_total,
+                        super::per_worker_pool_cap(cfg.pool_max_total, threads),
                         cfg.pool_idle_timeout,
                         cfg.pool_max_lifetime,
                     );
+                    if let Some(every) =
+                        super::pool_sweep_interval(cfg.pool_idle_timeout, cfg.pool_max_lifetime)
+                    {
+                        let pool = pool.clone();
+                        tokio::task::spawn_local(async move {
+                            loop {
+                                tokio::time::sleep(every).await;
+                                pool.borrow_mut().sweep(std::time::Instant::now());
+                            }
+                        });
+                    }
                     while let Some(std_stream) = rx.recv().await {
                         let _ = std_stream.set_nonblocking(true);
                         let peer = std_stream
@@ -1302,7 +1352,7 @@ mod monoio_backend {
             let limiter = Arc::clone(&limiter);
             let conns = Arc::clone(&conns);
             handles.push(std::thread::spawn(move || {
-                worker_forward(listen, cfg, limiter, conns)
+                worker_forward(listen, cfg, limiter, conns, threads)
             }));
         }
         for h in handles {
@@ -1316,6 +1366,7 @@ mod monoio_backend {
         cfg: Arc<EngineConfig>,
         limiter: Arc<Mutex<RateLimiter>>,
         conns: Arc<AtomicUsize>,
+        threads: usize,
     ) {
         let std_listener = reuseport_listener(listen);
         let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
@@ -1326,10 +1377,21 @@ mod monoio_backend {
             let listener = TcpListener::from_std(std_listener).expect("from_std");
             let pool = super::new_pool::<MonoConn>(
                 cfg.pool_max_per_host,
-                cfg.pool_max_total,
+                super::per_worker_pool_cap(cfg.pool_max_total, threads),
                 cfg.pool_idle_timeout,
                 cfg.pool_max_lifetime,
             );
+            if let Some(every) =
+                super::pool_sweep_interval(cfg.pool_idle_timeout, cfg.pool_max_lifetime)
+            {
+                let pool = pool.clone();
+                monoio::spawn(async move {
+                    loop {
+                        monoio::time::sleep(every).await;
+                        pool.borrow_mut().sweep(std::time::Instant::now());
+                    }
+                });
+            }
             loop {
                 match listener.accept().await {
                     Ok((mut client, peer)) => {
@@ -1895,6 +1957,65 @@ mod tests {
     /// Regression: a POST on a reused connection that failed was sent again,
     /// so the origin could execute it twice. A POST now always travels on a
     /// fresh connection and is never replayed.
+    #[test]
+    fn pool_sweep_closes_expired_connections_for_hosts_never_revisited() {
+        let start = std::time::Instant::now();
+        let mut pool: ConnPool<u8> = ConnPool::new(4, 2, Duration::from_secs(10), Duration::ZERO);
+        pool.checkin("a.test".into(), 80, 1, start);
+        pool.checkin("b.test".into(), 80, 2, start);
+        // At the total cap: nothing more can be pooled.
+        pool.checkin("c.test".into(), 80, 3, start);
+        assert_eq!(pool.total, 2);
+
+        // Within the idle timeout nothing is closed.
+        assert_eq!(pool.sweep(start + Duration::from_secs(5)), 0);
+        assert_eq!(pool.total, 2);
+
+        // Past it, both go, the host entries with them, and the cap is free
+        // again even though neither host was asked for.
+        assert_eq!(pool.sweep(start + Duration::from_secs(60)), 2);
+        assert_eq!(pool.total, 0);
+        assert!(pool.idle.is_empty());
+        pool.checkin("c.test".into(), 80, 3, std::time::Instant::now());
+        assert_eq!(pool.total, 1);
+    }
+
+    #[test]
+    fn pool_sweep_honours_max_lifetime_and_keeps_live_connections() {
+        let start = std::time::Instant::now();
+        let mut pool: ConnPool<u8> = ConnPool::new(4, 8, Duration::ZERO, Duration::from_secs(30));
+        // Created long enough ago to expire at the sweep below; the second is
+        // younger and must survive.
+        pool.checkin("a.test".into(), 80, 1, start);
+        pool.checkin("a.test".into(), 80, 2, start + Duration::from_secs(20));
+        assert_eq!(pool.total, 2);
+
+        assert_eq!(pool.sweep(start + Duration::from_secs(40)), 1);
+        assert_eq!(pool.total, 1);
+        assert_eq!(pool.checkout("a.test", 80).map(|(c, _)| c), Some(2));
+    }
+
+    #[test]
+    fn pool_sweep_interval_follows_the_shortest_expiry() {
+        let secs = Duration::from_secs;
+        assert_eq!(pool_sweep_interval(Duration::ZERO, Duration::ZERO), None);
+        assert_eq!(pool_sweep_interval(secs(60), secs(300)), Some(secs(30)));
+        assert_eq!(
+            pool_sweep_interval(secs(20), Duration::ZERO),
+            Some(secs(10))
+        );
+        assert_eq!(pool_sweep_interval(Duration::ZERO, secs(1)), Some(secs(1)));
+        assert_eq!(pool_sweep_interval(secs(3600), secs(7200)), Some(secs(30)));
+    }
+
+    #[test]
+    fn pool_cap_is_split_between_workers() {
+        assert_eq!(per_worker_pool_cap(1000, 8), 125);
+        assert_eq!(per_worker_pool_cap(1000, 1), 1000);
+        assert_eq!(per_worker_pool_cap(4, 8), 1);
+        assert_eq!(per_worker_pool_cap(1000, 0), 1000);
+    }
+
     #[test]
     fn forward_never_replays_a_post() {
         const POST: &[u8] = b"POST http://93.184.216.34/charge HTTP/1.1\r\n\
