@@ -2,6 +2,7 @@
 name = "bunker"
 version = "0.1.5"
 edition = "2021"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "A lightweight HTTP/HTTPS and DNS proxy"
 repository = "https://github.com/wj1918/bunker"

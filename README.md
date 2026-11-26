@@ -52,7 +52,7 @@ scoop bucket add bunker https://github.com/wj1918/bunker
 scoop install bunker
 ```
 
-Scoop places `bunker.exe` in its app directory. The release zip ships only the binary — config lives at `%USERPROFILE%\.bunker\config.yaml` and survives `scoop update`. Bootstrap it with:
+Scoop places `bunker.exe` in its app directory. The release zip ships the binary and this README, no config — config lives at `%USERPROFILE%\.bunker\config.yaml` and survives `scoop update`. Bootstrap it with:
 
 ```powershell
 bunker --init
@@ -119,7 +119,7 @@ Run `bunker --init [mode]` once to create `%USERPROFILE%\.bunker\config.yaml` fr
 - **`lan`** — other LAN clients connect. Requires exactly one RFC 1918 Ethernet interface; errors out on multi-NIC or Wi-Fi-only hosts. Use `custom` instead.
 - **`custom`** — any non-trivial deployment: Wi-Fi-only host, multiple NICs, Tailscale/VPN clients, or wildcard bind (`0.0.0.0`). All three flags are required.
 
-**Allowlist derivation for `--init custom`** (from `src/main.rs:618`):
+**Allowlist derivation for `--init custom`** (implemented in `src/main.rs`):
 - `--listen 0.0.0.0:8080` → union of every detected LAN subnet (loopback excluded).
 - `--listen 127.0.0.1:8080` → loopback-only allowlist.
 - `--listen <ip>` matches an interface → that interface's CIDR.
@@ -184,6 +184,9 @@ dns:
 # Logging (cross-cutting)
 logging:
   log_requests: true
+  # Per-request lines are written at DEBUG; the default level (info) hides
+  # them. Use "debug" to record every request.
+  level: info
   format: text
   redact_sensitive_headers: true
   # Create the log_dir before first run: New-Item -ItemType Directory C:\Bunker\logs -Force
@@ -369,13 +372,15 @@ dig @192.168.1.1 google.com
 
 | Feature | Description |
 |---------|-------------|
-| SSRF Protection | Blocks requests to private IPs (127.x, 10.x, 172.16-31.x, 192.168.x) |
+| SSRF Protection | Blocks requests to private IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x) |
 | DNS Rebinding Protection | Validates all resolved IPs before connecting |
 | Rate Limiting | Per-IP request limits with IPv6 /64 subnet support |
 | Connection Limits | Configurable max concurrent connections |
 | IP Allowlist | Restrict proxy access to specific IPs/CIDRs |
 | Header Sanitization | Redacts sensitive headers in logs |
 | Slowloris Protection | Header read timeout |
+| Idle Timeouts | Drops origins that stop sending and clients that stop reading or uploading |
+| Dead Peer Detection | TCP keep-alive closes tunnels whose peer vanished |
 | Request Size Limits | Configurable max request body size |
 
 > **Note**: Bunker does not implement proxy authentication. Access control is managed via IP allowlists and network-level security.
@@ -539,7 +544,7 @@ The isolated zone is a separate broadcast domain: a dedicated unmanaged switch, 
 **Why this layout:**
 - **Lab / IoT containment** — noisy or untrusted devices can still reach package mirrors, Git, container registries, and DNS, but only via Bunker, which logs every request and enforces the allowlist plus rate limit.
 - **No accidental WAN exposure** — devices without a default route can't be reached by, and can't reach, anything off the isolated subnet directly. The only listener that talks to both sides is Bunker.
-- **Auditable egress** — with `logging.log_requests: true`, every CONNECT and HTTP request from the zone lands in `C:\Bunker\logs\`.
+- **Auditable egress** — with `logging.log_requests: true` and `logging.level: debug`, every CONNECT and HTTP request from the zone lands in `C:\Bunker\logs\`. Per-request lines are written at DEBUG, so the default `info` level does not show them.
 
 **Bunker `~/.bunker/config.yaml` (excerpt):**
 
@@ -568,7 +573,7 @@ Same warning as above: **do not enable Windows IP forwarding** on the Bunker hos
 
 ### Requirements
 
-- Rust 1.70+
+- Rust 1.88+
 - Windows: MSVC toolchain
 
 ### Commands
