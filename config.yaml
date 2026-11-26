@@ -22,6 +22,10 @@ proxy:
   # safe when your backends honor case-insensitive headers (RFC 7230).
   preserve_header_case: true
 
+  # Add "X-Forwarded-For: <client address>" to forwarded HTTP requests. Set to
+  # false to keep clients' internal addresses from the sites they visit.
+  forwarded_for: true
+
   # ---- access control & SSRF protection ----
   security:
     # Block CONNECT to private/internal IPs (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x)

@@ -172,8 +172,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    if let Err(problem) = config.validate() {
+        eprintln!("Error: invalid configuration: {problem}");
+        std::process::exit(1);
+    }
+
     // Initialize logging system
     let _log_guard = logging::init_logging(&config.logging);
+
+    for warning in config.warnings() {
+        eprintln!("WARNING: {warning}");
+        warn!("{warning}");
+    }
 
     // Spawn log cleanup task if file logging enabled
     logging::spawn_log_cleanup_task(Arc::new(config.logging.clone()));
@@ -421,6 +431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     sec.client_idle_timeout_seconds,
                 ),
                 tcp_keepalive: config.proxy.tcp_keepalive.clone(),
+                forwarded_for: config.proxy.forwarded_for,
                 max_request_body_bytes: sec.max_request_body_bytes,
                 max_requests_per_conn: sec.max_requests_per_connection,
                 max_connections: sec.max_connections,

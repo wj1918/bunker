@@ -187,6 +187,94 @@ pub struct Config {
     pub app: AppConfig,
 }
 
+/// Check one `allowed_source_ips` entry: an IP address, or a CIDR block whose
+/// prefix length fits the address family.
+fn check_allowlist_entry(entry: &str) -> Result<(), String> {
+    let bad = |why: &str| Err(format!("allowed_source_ips entry {entry:?} {why}"));
+    match entry.split_once('/') {
+        None => match entry.parse::<std::net::IpAddr>() {
+            Ok(_) => Ok(()),
+            Err(_) => bad("is not an IP address"),
+        },
+        Some((network, prefix)) => {
+            let Ok(network) = network.parse::<std::net::IpAddr>() else {
+                return bad("does not start with an IP address");
+            };
+            let max = if network.is_ipv4() { 32 } else { 128 };
+            match prefix.parse::<u8>() {
+                Ok(len) if len <= max => Ok(()),
+                _ => bad(&format!("has a prefix length that is not 0-{max}")),
+            }
+        }
+    }
+}
+
+impl Config {
+    /// Reject settings that cannot work, at startup. Each of these used to be
+    /// accepted and then quietly ignored at run time — an allowlist entry with
+    /// a typo simply never matched, leaving its clients locked out (or, for
+    /// the operator, an allowlist that was not the one they wrote).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.proxy.enabled {
+            self.proxy
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| format!("proxy.listen {:?} is not ip:port", self.proxy.listen))?;
+        }
+        for entry in &self.proxy.security.allowed_source_ips {
+            check_allowlist_entry(entry)?;
+        }
+        if let Some(dns) = self.dns.as_ref().filter(|d| d.enabled) {
+            dns.listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| format!("dns.listen {:?} is not ip:port", dns.listen))?;
+            for upstream in dns.get_upstreams() {
+                upstream.parse::<std::net::SocketAddr>().map_err(|_| {
+                    format!(
+                        "dns upstream {upstream:?} is not ip:port (hostnames are not supported)"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Settings that are legal but probably not what the operator meant.
+    /// Shown at startup; they do not stop the proxy.
+    ///
+    /// An empty `allowed_source_ips` means "anyone". Combined with a listener
+    /// that is reachable from other machines, that is an open proxy, or an
+    /// open DNS resolver (usable for traffic amplification).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.proxy.security.allowed_source_ips.is_empty() {
+            return out;
+        }
+        let reachable = |listen: &str| {
+            listen
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|addr| !addr.ip().is_loopback())
+        };
+        if self.proxy.enabled && reachable(&self.proxy.listen) {
+            out.push(format!(
+                "proxy listens on {} with an empty proxy.security.allowed_source_ips: \
+                 any host that can reach it can use it as an open proxy",
+                self.proxy.listen
+            ));
+        }
+        if let Some(dns) = self.dns.as_ref().filter(|d| d.enabled) {
+            if reachable(&dns.listen) {
+                out.push(format!(
+                    "DNS server listens on {} with an empty proxy.security.allowed_source_ips: \
+                     any host that can reach it can use it as an open resolver",
+                    dns.listen
+                ));
+            }
+        }
+        out
+    }
+}
+
 // ============== Proxy Config ==============
 
 #[derive(Debug, Deserialize, Clone)]
@@ -209,6 +297,13 @@ pub struct ProxyConfig {
     /// per RFC 7230); headers are then forwarded lowercase.
     #[serde(default = "default_preserve_header_case")]
     pub preserve_header_case: bool,
+    /// Add `X-Forwarded-For: <client address>` to forwarded HTTP requests
+    /// (default true). Set to false to keep clients' internal addresses from
+    /// being sent to the sites they visit. Either way a client-supplied
+    /// `X-Forwarded-For` is never passed on. Engine path only.
+    #[cfg_attr(not(feature = "engine"), allow(dead_code))]
+    #[serde(default = "default_forwarded_for")]
+    pub forwarded_for: bool,
     /// Use the experimental thread-per-core engine instead of the default hyper
     /// proxy path. Defaults to ON when the binary is built with the `engine`
     /// feature, and OFF otherwise — so a feature build runs the engine by default
@@ -233,6 +328,10 @@ fn default_engine() -> bool {
     cfg!(feature = "engine")
 }
 
+fn default_forwarded_for() -> bool {
+    true
+}
+
 pub fn default_proxy_listen() -> String {
     "127.0.0.1:8080".to_string()
 }
@@ -246,6 +345,7 @@ impl Default for ProxyConfig {
             connection_pool: ConnectionPoolConfig::default(),
             tcp_keepalive: TcpKeepaliveConfig::default(),
             preserve_header_case: default_preserve_header_case(),
+            forwarded_for: default_forwarded_for(),
             engine: default_engine(),
         }
     }
@@ -1862,5 +1962,79 @@ app:
         let dns = cfg.dns.expect("dns section preserved");
         assert_eq!(dns.listen, "192.168.5.42:53");
         assert_eq!(dns.upstreams, vec!["9.9.9.9:53".to_string()]);
+    }
+
+    fn config_from(yaml: &str) -> Config {
+        serde_yaml_ng::from_str(yaml).unwrap()
+    }
+
+    /// Regression: an allowlist entry with a typo was accepted and then never
+    /// matched; an unparseable DNS upstream was silently dropped.
+    #[test]
+    fn validate_rejects_entries_that_were_silently_ignored() {
+        let allow = |entries: &str| {
+            config_from(&format!(
+                "proxy:\n  security:\n    allowed_source_ips: [{entries}]\n"
+            ))
+            .validate()
+        };
+        assert!(
+            allow(r#""127.0.0.1", "::1", "192.168.1.0/24", "2001:db8::/32", "0.0.0.0/0""#).is_ok()
+        );
+        for bad in [
+            r#""127.0.0.l""#,
+            r#""10.0.0.0/33""#,
+            r#""2001:db8::/129""#,
+            r#""192.168.1.0/""#,
+            r#""lan""#,
+            r#""192.168.1.0/24 ""#,
+        ] {
+            let err = allow(bad).unwrap_err();
+            assert!(err.contains("allowed_source_ips"), "{bad}: {err}");
+        }
+
+        assert!(config_from("proxy:\n  listen: \"localhost:8080\"\n")
+            .validate()
+            .is_err());
+        assert!(config_from(
+            "dns:\n  listen: \"127.0.0.1:53\"\n  upstreams: [\"dns.google:53\"]\n"
+        )
+        .validate()
+        .unwrap_err()
+        .contains("dns upstream"));
+        // A disabled DNS block is not checked.
+        assert!(
+            config_from("dns:\n  enabled: false\n  upstreams: [\"nonsense\"]\n")
+                .validate()
+                .is_ok()
+        );
+        assert!(Config::default_for_tests().validate().is_ok());
+    }
+
+    #[test]
+    fn warnings_flag_a_reachable_listener_without_an_allowlist() {
+        // The built-in defaults: loopback proxy, no DNS block.
+        assert!(Config::default_for_tests().warnings().is_empty());
+
+        let open = config_from("proxy:\n  listen: \"0.0.0.0:8080\"\ndns: {}\n");
+        let warnings = open.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("open proxy"));
+        assert!(warnings[1].contains("open resolver"));
+
+        // An allowlist, or loopback-only listeners, silence it.
+        let restricted = config_from(
+            "proxy:\n  listen: \"0.0.0.0:8080\"\n  security:\n    allowed_source_ips: [\"192.168.1.0/24\"]\ndns: {}\n",
+        );
+        assert!(restricted.warnings().is_empty());
+        let local =
+            config_from("proxy:\n  listen: \"127.0.0.1:8080\"\ndns:\n  listen: \"[::1]:53\"\n");
+        assert!(local.warnings().is_empty());
+    }
+
+    impl Config {
+        fn default_for_tests() -> Config {
+            config_from("{}")
+        }
     }
 }

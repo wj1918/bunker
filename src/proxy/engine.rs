@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Runtime + security knobs for the forward engine, wired from the YAML config.
 /// Bundled so the runner/core signatures stay small.
@@ -61,6 +61,8 @@ pub struct EngineConfig {
     /// TCP keep-alive for client and upstream sockets. This is what notices a
     /// peer that vanished without closing on an idle CONNECT tunnel.
     pub tcp_keepalive: crate::config::TcpKeepaliveConfig,
+    /// Add `X-Forwarded-For: <client address>` to forwarded requests.
+    pub forwarded_for: bool,
     /// Max request body in bytes; 0 = unlimited.
     pub max_request_body_bytes: u64,
     /// Max requests per client connection; 0 = unlimited.
@@ -254,12 +256,17 @@ pub trait Connect {
 enum AcquireErr {
     /// Blocked by SSRF (resolved to a private/internal IP — rebinding).
     Blocked,
-    /// DNS failure or connect failure.
-    Failed,
+    /// DNS failure or connect failure (which one, for the log).
+    Failed(&'static str),
 }
 
-/// Resolve a target to a single connectable address, applying DNS-rebinding
-/// validation to ALL resolved IPs. Literal-IP targets skip the resolver (and
+/// At most this many resolved addresses are tried for one connection, so a
+/// host with many dead addresses cannot multiply the connect timeout without
+/// bound.
+const MAX_CONNECT_ATTEMPTS: usize = 3;
+
+/// Resolve a target to its connectable addresses, applying DNS-rebinding
+/// validation to ALL resolved IPs (one private address blocks the lot). Literal-IP targets skip the resolver (and
 /// were already vetted by `is_blocked_target` upstream); hostnames go through
 /// the shared `DnsClient` (Mode 1 upstream forwarder or Mode 2/3 OS-resolver
 /// wrapper) and every returned IP is checked.
@@ -268,7 +275,7 @@ async fn resolve_target(
     port: u16,
     security: &SecurityConfig,
     dns_client: &Arc<crate::dns::DnsClient>,
-) -> Result<SocketAddr, AcquireErr> {
+) -> Result<Vec<SocketAddr>, AcquireErr> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         // Defense in depth: run the literal IP through the same SSRF gate as
         // resolved hostnames. Callers do gate via `is_blocked_target` first,
@@ -279,15 +286,15 @@ async fn resolve_target(
         if resolved_addrs_blocked(&[addr], security).is_some() {
             return Err(AcquireErr::Blocked);
         }
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     // `resolve_anywhere`, not `resolve`: io_uring workers are not tokio threads.
     let ips = dns_client
         .resolve_anywhere(host)
         .await
-        .map_err(|_| AcquireErr::Failed)?;
+        .map_err(|_| AcquireErr::Failed("DNS lookup failed"))?;
     if ips.is_empty() {
-        return Err(AcquireErr::Failed);
+        return Err(AcquireErr::Failed("DNS lookup returned no addresses"));
     }
     let addrs: Vec<SocketAddr> = ips
         .into_iter()
@@ -296,7 +303,7 @@ async fn resolve_target(
     if resolved_addrs_blocked(&addrs, security).is_some() {
         return Err(AcquireErr::Blocked);
     }
-    Ok(addrs[0])
+    Ok(addrs)
 }
 
 /// Resolve + validate + connect a fresh upstream for a target. The returned
@@ -307,12 +314,26 @@ async fn connect_fresh<K: Connect>(
     security: &SecurityConfig,
     dns_client: &Arc<crate::dns::DnsClient>,
 ) -> Result<(K::Conn, std::time::Instant), AcquireErr> {
-    let addr = resolve_target(&target.host, target.port, security, dns_client).await?;
-    let conn = connector
-        .connect(addr)
-        .await
-        .map_err(|_| AcquireErr::Failed)?;
-    Ok((conn, std::time::Instant::now()))
+    // The addresses were validated as a set, and it is these addresses that
+    // are connected to — no second resolution a rebinding answer could exploit.
+    // If the first is unreachable the next is tried: a host that publishes
+    // several addresses stays reachable when one of them is down.
+    let addrs = resolve_target(&target.host, target.port, security, dns_client).await?;
+    connect_first_reachable(connector, addrs).await
+}
+
+/// Connect to the first of `addrs` that accepts, trying at most
+/// `MAX_CONNECT_ATTEMPTS` of them.
+async fn connect_first_reachable<K: Connect>(
+    connector: &K,
+    addrs: Vec<SocketAddr>,
+) -> Result<(K::Conn, std::time::Instant), AcquireErr> {
+    for addr in addrs.into_iter().take(MAX_CONNECT_ATTEMPTS) {
+        if let Ok(conn) = connector.connect(addr).await {
+            return Ok((conn, std::time::Instant::now()));
+        }
+    }
+    Err(AcquireErr::Failed("connect failed"))
 }
 
 // Minimal fixed error responses (the proxy never builds arbitrary responses).
@@ -324,8 +345,6 @@ const RESP_502: &[u8] =
 const RESP_504: &[u8] =
     b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-const RESP_429: &[u8] =
-    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const RESP_413: &[u8] =
     b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -500,6 +519,7 @@ fn admit(
 ) -> AdmitDecision {
     let allow = &cfg.security.allowed_source_ips;
     if !allow.is_empty() && !is_source_ip_allowed(&peer, allow) {
+        info!(client = %peer, "Connection dropped: source address not in allowed_source_ips");
         return AdmitDecision::SilentDrop;
     }
     // Reserve a connection slot atomically. Previously a Relaxed load + later
@@ -512,6 +532,7 @@ fn admit(
         let mut cur = conns.load(Ordering::Acquire);
         loop {
             if cur >= cfg.max_connections {
+                warn!(client = %peer, limit = cfg.max_connections, "Connection refused: max_connections reached");
                 return AdmitDecision::Reject(crate::helpers::ACCEPT_CAPACITY_RESP);
             }
             match conns.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
@@ -529,6 +550,7 @@ fn admit(
     // limiter keeps capacity rejection cheaper than per-IP lookup.)
     if !limiter.lock().unwrap().is_allowed(peer) {
         conns.fetch_sub(1, Ordering::AcqRel);
+        warn!(client = %peer, "Connection refused: rate limit exceeded");
         return AdmitDecision::Reject(crate::helpers::ACCEPT_RATELIMIT_RESP);
     }
     AdmitDecision::Allowed
@@ -589,27 +611,33 @@ pub async fn proxy_forward<K: Connect>(
         {
             Ok(x) => x,
             Err(RelayErr::TooLarge) => {
+                warn!(client = %client_ip, limit = max_body, "Request body over the size limit");
                 let _ = client.write_all(RESP_413).await;
                 break;
             }
             Err(RelayErr::Closed) => break, // EOF / bad head / slowloris timeout
         };
-        // Per-connection request cap.
+        // Per-connection request cap: the request that reaches it is still
+        // served, and the connection is closed after its response. (Answering
+        // the next request with an error instead would fail a request from a
+        // client that did nothing wrong but reuse its connection.)
         served += 1;
-        if cfg.max_requests_per_conn > 0 && served > cfg.max_requests_per_conn {
-            let _ = client.write_all(RESP_429).await;
-            break;
-        }
+        let last_request = cfg.max_requests_per_conn > 0 && served >= cfg.max_requests_per_conn;
+        let forwarded_for = cfg.forwarded_for.then_some(client_ip);
         let (target, head, body) =
-            match rewrite_forward_with_metadata(&req, client_ip, meta.as_ref()) {
+            match rewrite_forward_with_metadata(&req, forwarded_for, meta.as_ref()) {
                 Ok(x) => x,
                 Err(ForwardError::IsConnect) => {
                     // CONNECT tunnel: validate target, connect, 200, then pump bytes.
                     let Some(target) = parse_connect_target(&req) else {
+                        warn!(client = %client_ip, "CONNECT without a valid host:port");
                         let _ = client.write_all(RESP_400).await;
                         break;
                     };
-                    if is_blocked_target(&target.host, Some(target.port), security).is_some() {
+                    if let Some(reason) =
+                        is_blocked_target(&target.host, Some(target.port), security)
+                    {
+                        log_blocked(client_ip, &target, reason);
                         let _ = client.write_all(RESP_403).await;
                         break;
                     }
@@ -630,10 +658,12 @@ pub async fn proxy_forward<K: Connect>(
                         match connect_fresh(&connector, &target, security, dns_client).await {
                             Ok((c, _)) => c, // tunnel conn isn't pooled; created_at unused
                             Err(AcquireErr::Blocked) => {
+                                log_blocked(client_ip, &target, REBINDING);
                                 let _ = client.write_all(RESP_403).await;
                                 break;
                             }
-                            Err(AcquireErr::Failed) => {
+                            Err(AcquireErr::Failed(why)) => {
+                                log_upstream_failure(client_ip, &target, why);
                                 let _ = client.write_all(RESP_502).await;
                                 break;
                             }
@@ -649,13 +679,22 @@ pub async fn proxy_forward<K: Connect>(
                     K::tunnel(client, upstream).await; // consumes both; runs to close
                     return;
                 }
-                Err(_) => {
+                Err(e) => {
+                    let reason = match e {
+                        ForwardError::HttpsNotTunnelled => {
+                            "https:// URL in a plain request (HTTPS needs CONNECT)"
+                        }
+                        ForwardError::NoTarget => "no target host",
+                        _ => "malformed request",
+                    };
+                    warn!(client = %client_ip, reason, "Request rejected");
                     let _ = client.write_all(RESP_400).await;
                     break;
                 }
             };
         // SSRF: blocklist / port allowlist / literal private-IP.
-        if is_blocked_target(&target.host, Some(target.port), security).is_some() {
+        if let Some(reason) = is_blocked_target(&target.host, Some(target.port), security) {
+            log_blocked(client_ip, &target, reason);
             let _ = client.write_all(RESP_403).await;
             break;
         }
@@ -703,10 +742,12 @@ pub async fn proxy_forward<K: Connect>(
         let (mut conn, mut created_at, reused) = match acquired {
             Ok(triple) => triple,
             Err(AcquireErr::Blocked) => {
-                let _ = client.write_all(RESP_403).await; // rebinding
+                log_blocked(client_ip, &target, REBINDING);
+                let _ = client.write_all(RESP_403).await;
                 break;
             }
-            Err(AcquireErr::Failed) => {
+            Err(AcquireErr::Failed(why)) => {
+                log_upstream_failure(client_ip, &target, why);
                 let _ = client.write_all(RESP_502).await;
                 break;
             }
@@ -752,7 +793,12 @@ pub async fn proxy_forward<K: Connect>(
         let started = match started {
             Ok(r) => r,
             Err(failed) => {
-                let status = if failed.timed_out { RESP_504 } else { RESP_502 };
+                let (status, why) = if failed.timed_out {
+                    (RESP_504, "no response within the read timeout")
+                } else {
+                    (RESP_502, "no valid response")
+                };
+                log_upstream_failure(client_ip, &target, why);
                 let _ = client.write_all(status).await;
                 break;
             }
@@ -767,6 +813,7 @@ pub async fn proxy_forward<K: Connect>(
             started,
             read_timeout,
             client_timeout,
+            last_request,
         )
         .await;
 
@@ -775,7 +822,7 @@ pub async fn proxy_forward<K: Connect>(
         if relayed.upstream_reusable {
             current = Some((target, conn, created_at));
         }
-        if !relayed.client_open {
+        if !relayed.client_open || last_request {
             break;
         }
     }
@@ -784,6 +831,30 @@ pub async fn proxy_forward<K: Connect>(
     if let Some((t, c, ca)) = current {
         pool.borrow_mut().checkin(t.host, t.port, c, ca);
     }
+}
+
+/// Reason logged when a hostname resolved to a private/internal address.
+const REBINDING: &str = "resolved to a private/internal address";
+
+/// A request the security policy refused. Always logged, whatever
+/// `log_requests` says: refusals are the audit trail of an egress proxy.
+fn log_blocked(client: IpAddr, target: &Target, reason: &str) {
+    warn!(
+        client = %client,
+        target = %format_args!("{}:{}", target.host, target.port),
+        reason,
+        "Request blocked"
+    );
+}
+
+/// A request that was allowed but could not be served by the upstream.
+fn log_upstream_failure(client: IpAddr, target: &Target, reason: &str) {
+    warn!(
+        client = %client,
+        target = %format_args!("{}:{}", target.host, target.port),
+        reason,
+        "Upstream request failed"
+    );
 }
 
 /// Get a connection for `target`: pooled if available (reused=true), else
@@ -982,6 +1053,25 @@ async fn begin_roundtrip<C: ProxyIo>(
     }
 }
 
+/// A copy of a response head that tells the client the connection will close:
+/// any `Connection` header is replaced by `Connection: close`. `head` is a
+/// complete, already-validated head ending in an empty line.
+fn head_with_connection_close(head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len() + 24);
+    let lines = head.strip_suffix(b"\r\n\r\n").unwrap_or(head);
+    for line in lines.split_inclusive(|&b| b == b'\n') {
+        let name = line.split(|&b| b == b':').next().unwrap_or(&[]);
+        if !name.eq_ignore_ascii_case(b"connection") {
+            out.extend_from_slice(line);
+        }
+    }
+    if !out.ends_with(b"\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
+}
+
 /// What relaying a response left behind.
 struct Relayed {
     /// The upstream connection can carry another request.
@@ -1013,11 +1103,12 @@ async fn relay_response<C: ProxyIo>(
     started: ResponseStarted,
     read_timeout: Option<Duration>,
     client_timeout: Option<Duration>,
+    announce_close: bool,
 ) -> Relayed {
     let ResponseStarted {
         interim,
         mut buf,
-        head,
+        mut head,
         body,
         keep_alive,
     } = started;
@@ -1025,6 +1116,20 @@ async fn relay_response<C: ProxyIo>(
         if write_client(client, &pre, client_timeout).await.is_err() {
             return Relayed::ABORTED;
         }
+    }
+    // The proxy is about to close the client connection (request cap): say so
+    // in this response, so the client opens a new connection for its next
+    // request instead of sending it into a closed one.
+    if announce_close {
+        let rewritten = head_with_connection_close(&buf[..head]);
+        if write_client(client, &rewritten, client_timeout)
+            .await
+            .is_err()
+        {
+            return Relayed::ABORTED;
+        }
+        buf.advance(head);
+        head = 0;
     }
     // Make room for the next read. `buf` is emptied after every write, so this
     // reuses one allocation rather than growing.
@@ -2231,6 +2336,7 @@ mod tests {
             upstream_read_timeout: Duration::ZERO,
             client_idle_timeout: Duration::ZERO,
             tcp_keepalive: crate::config::TcpKeepaliveConfig::default(),
+            forwarded_for: true,
             max_request_body_bytes: 0,
             max_requests_per_conn: 0,
             max_connections: 0,
@@ -2680,6 +2786,133 @@ mod tests {
         ));
         assert!(result.is_ok());
         assert!(conn.timed_reads().is_empty());
+    }
+
+    /// Regression: with a cap of N requests per connection, request N+1 was
+    /// answered with a 429. The cap now ends the connection after the Nth
+    /// response; no request is failed for it.
+    #[test]
+    fn forward_request_cap_closes_after_the_last_response_without_an_error() {
+        let upstream = SharedConn::new(vec![OK_2, OK_2, OK_2]);
+        let client = SharedConn::new(vec![GET, GET, GET]);
+        let cfg = Arc::new(EngineConfig {
+            max_requests_per_conn: 2,
+            ..forward_test_engine_config()
+        });
+        let (received, _) = run_forward_cfg(client.clone(), std::slice::from_ref(&upstream), cfg);
+        // The last response says the connection is closing; the first doesn't.
+        assert_eq!(
+            received,
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK\
+             HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        );
+        assert!(!received.contains("429"), "{received}");
+        // The third request was never read: the connection closed first.
+        assert_eq!(client.unread(), 1);
+        assert_eq!(upstream.written().matches("GET /a").count(), 2);
+    }
+
+    #[test]
+    fn connection_close_replaces_any_existing_connection_header() {
+        let close = |head: &[u8]| String::from_utf8(head_with_connection_close(head)).unwrap();
+        assert_eq!(
+            close(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            close(b"HTTP/1.1 200 OK\r\nconnection: keep-alive\r\nX: 1\r\nConnection: x\r\n\r\n"),
+            "HTTP/1.1 200 OK\r\nX: 1\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            close(b"HTTP/1.1 204 No Content\r\n\r\n"),
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    /// The closing announcement must not disturb how the body is relayed.
+    #[test]
+    fn forward_last_request_announces_close_for_every_body_kind() {
+        let bodies: [(&[u8], &str); 3] = [
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nhi\r\n0\r\n\r\n",
+            ),
+            (
+                b"HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\n\r\n",
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                b"HTTP/1.0 200 OK\r\n\r\nuntil close",
+                "HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nuntil close",
+            ),
+        ];
+        for (response, expected) in bodies {
+            let cfg = Arc::new(EngineConfig {
+                max_requests_per_conn: 1,
+                ..forward_test_engine_config()
+            });
+            let upstream = SharedConn::new(vec![response]);
+            let (received, _) = run_forward_cfg(
+                SharedConn::new(vec![GET]),
+                std::slice::from_ref(&upstream),
+                cfg,
+            );
+            assert_eq!(received, expected);
+        }
+    }
+
+    /// Regression: only the first resolved address was tried, so a host with
+    /// one dead address was unreachable even though another was up.
+    #[test]
+    fn connect_fresh_falls_back_to_the_next_address() {
+        // Fails the first `failures` connects, then hands out the script.
+        struct Flaky {
+            failures: std::cell::Cell<usize>,
+            attempts: std::cell::Cell<usize>,
+        }
+        impl Connect for Flaky {
+            type Conn = SharedConn;
+            async fn connect(&self, _: SocketAddr) -> std::io::Result<SharedConn> {
+                self.attempts.set(self.attempts.get() + 1);
+                if self.failures.get() > 0 {
+                    self.failures.set(self.failures.get() - 1);
+                    return Err(std::io::ErrorKind::ConnectionRefused.into());
+                }
+                Ok(SharedConn::new(vec![]))
+            }
+            async fn tunnel(_: SharedConn, _: SharedConn) {}
+        }
+        let flaky = |failures| Flaky {
+            failures: std::cell::Cell::new(failures),
+            attempts: std::cell::Cell::new(0),
+        };
+        let addrs = |n: u8| -> Vec<SocketAddr> {
+            (1..=n)
+                .map(|i| SocketAddr::from(([93, 184, 216, i], 80)))
+                .collect()
+        };
+
+        let c = flaky(1);
+        assert!(block_on(connect_first_reachable(&c, addrs(2))).is_ok());
+        assert_eq!(c.attempts.get(), 2);
+
+        // Bounded: a long list of dead addresses is not walked to the end.
+        let c = flaky(usize::MAX);
+        assert!(block_on(connect_first_reachable(&c, addrs(10))).is_err());
+        assert_eq!(c.attempts.get(), MAX_CONNECT_ATTEMPTS);
+    }
+
+    /// Regression: `GET https://...` on the proxy port went out in clear text.
+    #[test]
+    fn forward_refuses_https_urls_without_contacting_the_origin() {
+        let upstream = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(
+            vec![b"GET https://93.184.216.34/a HTTP/1.1\r\nCookie: s=secret\r\n\r\n"],
+            std::slice::from_ref(&upstream),
+        );
+        assert_eq!(client.as_bytes(), RESP_400);
+        assert_eq!(connector.connects(), 0);
+        assert_eq!(upstream.written(), "");
     }
 
     /// A response head that never ends is cut off instead of buffered.
