@@ -321,7 +321,7 @@ pub async fn proxy_request(
             {
                 Ok(s) => (s, created_at, false),
                 Err(e) => {
-                    return Ok(e);
+                    return Ok(*e);
                 }
             }
         };
@@ -445,20 +445,23 @@ async fn create_sender(
     tls_connector: &TlsConnector,
     connect_timeout: Duration,
     tcp_keepalive: &TcpKeepaliveConfig,
-) -> Result<SendRequest<Incoming>, Response<BoxBody<Bytes, hyper::Error>>> {
+) -> Result<SendRequest<Incoming>, Box<Response<BoxBody<Bytes, hyper::Error>>>> {
     // Connect with timeout
     let tcp_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             error!(addr = %addr, error = %e, "Failed to connect to target");
-            return Err(error_response(
+            return Err(Box::new(error_response(
                 502,
                 "Bad Gateway: Failed to connect to target",
-            ));
+            )));
         }
         Err(_) => {
             error!(addr = %addr, "Connection timeout");
-            return Err(error_response(504, "Gateway Timeout: Connection timed out"));
+            return Err(Box::new(error_response(
+                504,
+                "Gateway Timeout: Connection timed out",
+            )));
         }
     };
 
@@ -476,7 +479,10 @@ async fn create_sender(
             Ok(name) => name,
             Err(_) => {
                 error!(host = %host, "Invalid server name");
-                return Err(error_response(502, "Bad Gateway: Invalid server name"));
+                return Err(Box::new(error_response(
+                    502,
+                    "Bad Gateway: Invalid server name",
+                )));
             }
         };
 
@@ -484,7 +490,10 @@ async fn create_sender(
             Ok(s) => s,
             Err(e) => {
                 error!(host = %host, error = %e, "TLS connection failed");
-                return Err(error_response(502, "Bad Gateway: TLS connection failed"));
+                return Err(Box::new(error_response(
+                    502,
+                    "Bad Gateway: TLS connection failed",
+                )));
             }
         };
 
@@ -493,7 +502,10 @@ async fn create_sender(
             Ok(h) => h,
             Err(e) => {
                 error!(host = %host, error = %e, "TLS HTTP handshake failed");
-                return Err(error_response(502, "Bad Gateway: Handshake failed"));
+                return Err(Box::new(error_response(
+                    502,
+                    "Bad Gateway: Handshake failed",
+                )));
             }
         };
 
@@ -512,7 +524,10 @@ async fn create_sender(
             Ok(h) => h,
             Err(e) => {
                 error!(addr = %addr, error = %e, "HTTP handshake failed");
-                return Err(error_response(502, "Bad Gateway: Handshake failed"));
+                return Err(Box::new(error_response(
+                    502,
+                    "Bad Gateway: Handshake failed",
+                )));
             }
         };
 
