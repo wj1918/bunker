@@ -16,8 +16,9 @@ use crate::proxy::forward::{
     parse_connect_target, rewrite_forward_with_metadata, ForwardError, Target,
 };
 use crate::proxy::framing::{
-    scan_message_with_metadata, scan_response_head, ChunkProgress, ChunkedTracker, MessageError,
-    MessageMetadata, MessageScan, ResponseBody, ResponseHead,
+    request_body_framing, scan_message_with_metadata, scan_response_head, BodyFraming,
+    ChunkProgress, ChunkedTracker, MessageError, MessageMetadata, MessageScan, ResponseBody,
+    ResponseHead,
 };
 use crate::security::{
     is_blocked_target, is_source_ip_allowed, resolved_addrs_blocked, RateLimiter,
@@ -134,6 +135,9 @@ pub enum RelayErr {
     Closed,
     /// A request whose declared Content-Length exceeds the limit (-> 413).
     TooLarge,
+    /// A head or body framing the proxy refuses to interpret (-> 400). These
+    /// are the shapes request smuggling is made of, so they are logged.
+    Malformed,
 }
 
 /// Read exactly one complete HTTP/1 message from `src` into `acc`, returning its
@@ -157,6 +161,58 @@ pub async fn relay_once<C: ProxyIo>(
         .map(|(b, _)| b)
 }
 
+/// What is still missing of a request whose head has arrived, tracked so that
+/// each read costs work in proportion to the bytes it brought.
+///
+/// Without it the whole message was scanned from the first byte after every
+/// read — the head re-parsed, every chunk walked again — so an upload sent in
+/// small pieces cost CPU in proportion to the square of its size.
+enum BodyWait {
+    /// Complete once the buffer holds this many bytes.
+    Length { total: usize },
+    /// Chunked: `scanned` bytes are already accounted for by `tracker`.
+    Chunked {
+        tracker: ChunkedTracker,
+        scanned: usize,
+    },
+}
+
+impl BodyWait {
+    fn for_request_head(head: &[u8]) -> Option<Self> {
+        match request_body_framing(head)? {
+            BodyFraming::None => None,
+            BodyFraming::ContentLength(n) => Some(BodyWait::Length {
+                total: head.len().checked_add(usize::try_from(n).ok()?)?,
+            }),
+            BodyFraming::Chunked => Some(BodyWait::Chunked {
+                tracker: ChunkedTracker::new(),
+                scanned: head.len(),
+            }),
+        }
+    }
+
+    /// False while the body is certainly still incomplete. True means "scan
+    /// the message now": it is complete, or malformed (the scan says which).
+    fn worth_scanning(&mut self, acc: &[u8]) -> bool {
+        match self {
+            BodyWait::Length { total } => acc.len() >= *total,
+            BodyWait::Chunked { tracker, scanned } => match tracker.advance(&acc[*scanned..]) {
+                ChunkProgress::More(n) => {
+                    *scanned += n;
+                    false
+                }
+                ChunkProgress::Done(_) | ChunkProgress::Malformed => true,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full-message scans performed by `relay_once_with_metadata` on this thread.
+    static FULL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Like `relay_once`, but also returns the routing metadata extracted in the
 /// same httparse pass `scan_message_with_metadata` performs internally. Used by
 /// the engine's request loop so `rewrite_forward` can skip a second parse.
@@ -171,8 +227,17 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
     let start = std::time::Instant::now();
     let mut head_done = false;
     let mut head_len = 0usize;
+    let mut body_wait: Option<BodyWait> = None;
     loop {
-        let (scan, meta) = scan_message_with_metadata(acc, is_request, max_body);
+        // Once the head is in and we know how the body is framed, skip the
+        // scan until enough has arrived for the message to be complete.
+        let (scan, meta) = if body_wait.as_mut().is_some_and(|w| !w.worth_scanning(acc)) {
+            (MessageScan::Incomplete, None)
+        } else {
+            #[cfg(test)]
+            FULL_SCANS.with(|n| n.set(n.get() + 1));
+            scan_message_with_metadata(acc, is_request, max_body)
+        };
         match scan {
             MessageScan::Complete { total, .. } => {
                 // Zero-copy: split_to + freeze hands the caller a Bytes view
@@ -181,7 +246,7 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
                 return Ok((acc.split_to(total).freeze(), meta));
             }
             MessageScan::Error(MessageError::BodyTooLarge) => return Err(RelayErr::TooLarge),
-            MessageScan::Error(_) => return Err(RelayErr::Closed),
+            MessageScan::Error(_) => return Err(RelayErr::Malformed),
             MessageScan::Incomplete => {
                 // Latch once the head is fully received; after that, body reads
                 // are untimed (a large upload mustn't trip the header timeout).
@@ -189,6 +254,9 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
                     if let Some(i) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
                         head_done = true;
                         head_len = i + 4;
+                        if is_request {
+                            body_wait = BodyWait::for_request_head(&acc[..head_len]);
+                        }
                     } else if acc.len() > MAX_HEAD_BYTES {
                         return Err(RelayErr::Closed); // head never ends
                     }
@@ -556,6 +624,22 @@ fn admit(
     AdmitDecision::Allowed
 }
 
+/// Pause before the next accept after `consecutive` failed ones. Accept can
+/// fail persistently — most often when the process is out of file
+/// descriptors — and retrying at once turned that into a loop burning a whole
+/// CPU core. Grows to half a second, which is short enough not to matter when
+/// the condition clears.
+fn accept_error_backoff(consecutive: u32) -> Duration {
+    Duration::from_millis((u64::from(consecutive) * 10).min(500))
+}
+
+/// Report an accept failure: the first of a run, then every hundredth.
+fn log_accept_error(error: &std::io::Error, consecutive: u32) {
+    if consecutive == 1 || consecutive.is_multiple_of(100) {
+        warn!(error = %error, consecutive, "Accepting a connection failed");
+    }
+}
+
 /// Releases a reserved connection slot when the connection task ends.
 struct ConnGuard(Arc<AtomicUsize>);
 impl ConnGuard {
@@ -615,7 +699,12 @@ pub async fn proxy_forward<K: Connect>(
                 let _ = client.write_all(RESP_413).await;
                 break;
             }
-            Err(RelayErr::Closed) => break, // EOF / bad head / slowloris timeout
+            Err(RelayErr::Malformed) => {
+                warn!(client = %client_ip, "Malformed request rejected (bad head or body framing)");
+                let _ = client.write_all(RESP_400).await;
+                break;
+            }
+            Err(RelayErr::Closed) => break, // EOF / slowloris timeout / stalled upload
         };
         // Per-connection request cap: the request that reaches it is still
         // served, and the connection is closed after its response. (Answering
@@ -1527,10 +1616,19 @@ mod tokio_backend {
         threads: usize,
     ) {
         let mut i = 0usize;
+        let mut failures = 0u32;
         for stream in listener.incoming() {
             let stream = match stream {
-                Ok(s) => s,
-                Err(_) => continue,
+                Ok(s) => {
+                    failures = 0;
+                    s
+                }
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    super::log_accept_error(&e, failures);
+                    std::thread::sleep(super::accept_error_backoff(failures));
+                    continue;
+                }
             };
             if senders[i % threads].send(stream).is_err() {
                 break;
@@ -1772,10 +1870,22 @@ mod monoio_backend {
             use monoio::io::Splitable;
             let (mut cr, mut cw) = client.stream.into_split();
             let (mut ur, mut uw) = upstream.stream.into_split();
-            let _ = monoio::join!(
-                monoio::io::copy(&mut cr, &mut uw), // client -> upstream
-                monoio::io::copy(&mut ur, &mut cw), // upstream -> client
-            );
+            // When one direction reaches end-of-stream, pass that on by
+            // shutting down the write side it was feeding. Without it a peer
+            // that finishes sending and waits for the other to close (an
+            // ordinary half-close) left the tunnel open for good, since the
+            // other side never learned the stream had ended. tokio's
+            // copy_bidirectional does the same.
+            use monoio::io::AsyncWriteRent;
+            let client_to_upstream = async {
+                let _ = monoio::io::copy(&mut cr, &mut uw).await;
+                let _ = uw.shutdown().await;
+            };
+            let upstream_to_client = async {
+                let _ = monoio::io::copy(&mut ur, &mut cw).await;
+                let _ = cw.shutdown().await;
+            };
+            monoio::join!(client_to_upstream, upstream_to_client);
         }
     }
 
@@ -1836,9 +1946,11 @@ mod monoio_backend {
                     }
                 });
             }
+            let mut failures = 0u32;
             loop {
                 match listener.accept().await {
                     Ok((mut client, peer)) => {
+                        failures = 0;
                         let peer_ip = peer.ip();
                         match super::admit(&cfg, &limiter, &conns, peer_ip) {
                             super::AdmitDecision::Allowed => {}
@@ -1865,7 +1977,12 @@ mod monoio_backend {
                                 .await;
                         });
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        failures = failures.saturating_add(1);
+                        super::log_accept_error(&e, failures);
+                        monoio::time::sleep(super::accept_error_backoff(failures)).await;
+                        continue;
+                    }
                 }
             }
         });
@@ -2915,6 +3032,22 @@ mod tests {
         assert_eq!(upstream.written(), "");
     }
 
+    /// A request with framing the proxy refuses (here, a bare LF hidden in a
+    /// chunk extension) gets a 400 and never reaches the origin.
+    #[test]
+    fn forward_answers_400_to_malformed_framing() {
+        let upstream = SharedConn::new(vec![OK_2]);
+        let (client, connector) = run_forward_test(
+            vec![
+                b"POST http://93.184.216.34/x HTTP/1.1\r\nHost: h\r\n\
+                   Transfer-Encoding: chunked\r\n\r\n5;a=b\nfoo\r\nhello\r\n0\r\n\r\n",
+            ],
+            std::slice::from_ref(&upstream),
+        );
+        assert_eq!(client.as_bytes(), RESP_400);
+        assert_eq!(connector.connects(), 0);
+    }
+
     /// A response head that never ends is cut off instead of buffered.
     #[test]
     fn forward_rejects_an_endless_response_head() {
@@ -2948,6 +3081,78 @@ mod tests {
         ]);
         let mut acc = BytesMut::new();
         assert!(block_on(relay_once(&mut ok, &mut acc, true, None, 100)).is_ok());
+    }
+
+    /// Regression: every read re-scanned the whole request, so an upload sent
+    /// in small pieces cost work in proportion to the square of its size.
+    /// However many reads it takes, the message is now scanned a fixed number
+    /// of times.
+    #[test]
+    fn upload_arriving_in_many_reads_is_not_rescanned_each_time() {
+        let scans_for = |script: Vec<&[u8]>| {
+            FULL_SCANS.with(|n| n.set(0));
+            let mut conn = MockConn::new(script);
+            let mut acc = BytesMut::new();
+            let msg = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).unwrap();
+            (FULL_SCANS.with(|n| n.get()), msg.len())
+        };
+
+        let head: &[u8] =
+            b"POST http://h/ HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut chunked: Vec<&[u8]> = vec![head];
+        // Chunks split across reads at awkward places.
+        chunked.extend(
+            std::iter::repeat_n(&b"8\r\n0123"[..], 2000).flat_map(|a| [a, &b"4567\r\n"[..]]),
+        );
+        chunked.push(b"0\r\n\r\n");
+        let (scans, len) = scans_for(chunked);
+        assert_eq!(len, head.len() + 2000 * 13 + 5);
+        assert!(scans <= 3, "{scans} scans for a 4001-read chunked upload");
+
+        let head: &[u8] = b"POST http://h/ HTTP/1.1\r\nHost: h\r\nContent-Length: 4000\r\n\r\n";
+        let mut sized: Vec<&[u8]> = vec![head];
+        sized.extend(std::iter::repeat_n(&b"ab"[..], 2000));
+        let (scans, len) = scans_for(sized);
+        assert_eq!(len, head.len() + 4000);
+        assert!(scans <= 3, "{scans} scans for a 2001-read sized upload");
+
+        // The head itself arriving in pieces still works.
+        let pieces: Vec<&[u8]> = vec![
+            b"POST http://h/ HTTP/1.1\r\nHost: h\r\nContent-Le",
+            b"ngth: 3\r\n\r",
+            b"\nab",
+            b"c",
+        ];
+        let expected: usize = pieces.iter().map(|p| p.len()).sum();
+        let (_, len) = scans_for(pieces);
+        assert_eq!(len, expected);
+    }
+
+    /// A malformed chunked upload is still rejected when the shortcut is in use.
+    #[test]
+    fn malformed_chunked_upload_is_rejected_mid_stream() {
+        let mut conn = MockConn::new(vec![
+            b"POST http://h/ HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"3\r\nabc\r\n",
+            b"zz\r\nabc\r\n",
+            b"0\r\n\r\n",
+        ]);
+        let mut acc = BytesMut::new();
+        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 0));
+        assert!(matches!(result, Err(RelayErr::Malformed)), "{result:?}");
+        assert_eq!(
+            conn.reads.len(),
+            1,
+            "rejected as soon as the bad chunk arrived"
+        );
+    }
+
+    #[test]
+    fn accept_error_backoff_grows_and_is_capped() {
+        assert_eq!(accept_error_backoff(1), Duration::from_millis(10));
+        assert_eq!(accept_error_backoff(20), Duration::from_millis(200));
+        assert_eq!(accept_error_backoff(50), Duration::from_millis(500));
+        assert_eq!(accept_error_backoff(u32::MAX), Duration::from_millis(500));
     }
 
     /// A request head that never ends is cut off instead of buffered.

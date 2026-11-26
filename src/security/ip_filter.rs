@@ -95,26 +95,65 @@ pub fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
 /// (which matches only `::1`). Without this, the SSRF check is bypassable via
 /// the mapped form in `is_blocked_target`, `resolve_and_validate_host`, and
 /// `resolved_addrs_blocked` — all of which feed `is_private_ip` raw IPs.
+///
+/// "Private" here means "not a public unicast address": besides the RFC 1918
+/// ranges it covers every special-purpose block a proxy has no business
+/// reaching on a client's behalf, and IPv6 forms that carry an IPv4 address
+/// inside them (NAT64, 6to4, IPv4-compatible), which are judged by that
+/// inner address.
 pub fn is_private_ip(ip: &IpAddr) -> bool {
     let ip = normalize_ip(ip);
     match &ip {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_loopback()          // 127.0.0.0/8
-            || ipv4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || ipv4.is_link_local()     // 169.254.0.0/16 (cloud metadata!)
-            || ipv4.is_broadcast()      // 255.255.255.255
-            || ipv4.is_unspecified()    // 0.0.0.0
-            || ipv4.is_documentation()  // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-            || (ipv4.octets()[0] == 100
-                && (ipv4.octets()[1] >= 64 && ipv4.octets()[1] <= 127)) // 100.64.0.0/10 (CGNAT)
-        }
+        IpAddr::V4(ipv4) => is_special_ipv4(ipv4),
         IpAddr::V6(ipv6) => {
+            if let Some(inner) = embedded_ipv4(ipv6) {
+                return is_special_ipv4(&inner);
+            }
+            let first = ipv6.segments()[0];
             ipv6.is_loopback()              // ::1
             || ipv6.is_unspecified()        // ::
             || is_ipv6_unique_local(ipv6)   // fc00::/7 (unique local addresses)
-            || is_ipv6_link_local(ipv6) // fe80::/10 (link-local addresses)
+            || is_ipv6_link_local(ipv6)     // fe80::/10 (link-local addresses)
+            || (first & 0xffc0) == 0xfec0   // fec0::/10 (site-local, deprecated)
+            || (first & 0xff00) == 0xff00   // ff00::/8 (multicast)
+            || (first == 0x2001 && ipv6.segments()[1] == 0x0db8) // 2001:db8::/32 (documentation)
         }
     }
+}
+
+/// IPv4 addresses that are not public unicast.
+fn is_special_ipv4(ipv4: &std::net::Ipv4Addr) -> bool {
+    let o = ipv4.octets();
+    ipv4.is_loopback()          // 127.0.0.0/8
+    || ipv4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    || ipv4.is_link_local()     // 169.254.0.0/16 (cloud metadata!)
+    || ipv4.is_documentation()  // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+    || o[0] == 0                // 0.0.0.0/8 ("this network", incl. 0.0.0.0)
+    || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64.0.0/10 (CGNAT)
+    || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // 192.0.0.0/24 (IETF protocol assignments)
+    || (o[0] == 198 && (18..=19).contains(&o[1]))  // 198.18.0.0/15 (benchmarking)
+    || o[0] >= 224 // 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved), broadcast
+}
+
+/// The IPv4 address carried inside an IPv6 address of a translation or
+/// tunnelling scheme, if `ipv6` is one. A request to such an address ends up
+/// at the inner IPv4 address, so that is what the policy must be applied to.
+fn embedded_ipv4(ipv6: &Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = ipv6.segments();
+    let from = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        return Some(from(s[6], s[7])); // 64:ff9b::/96 (NAT64)
+    }
+    if s[0] == 0x2002 {
+        return Some(from(s[1], s[2])); // 2002::/16 (6to4)
+    }
+    // ::a.b.c.d (IPv4-compatible, deprecated). `::` and `::1` are not this.
+    if s[..6] == [0, 0, 0, 0, 0, 0] && (s[6] != 0 || s[7] > 1) {
+        return Some(from(s[6], s[7]));
+    }
+    None
 }
 
 /// Check if IPv6 address is unique local (fc00::/7)
@@ -963,5 +1002,57 @@ mod tests {
         sec.blocked_hosts = vec![String::new(), "*.".to_string(), ".".to_string()];
         assert!(is_blocked_target("example.com", Some(80), &sec).is_none());
         assert!(is_blocked_target("example.com.", Some(80), &sec).is_none());
+    }
+
+    /// Regression: only the best-known private ranges were blocked. Requests
+    /// to other special-purpose addresses, and to IPv6 forms that wrap an
+    /// IPv4 address, were attempted.
+    #[test]
+    fn special_purpose_and_ipv4_embedding_addresses_are_private() {
+        let private = [
+            "0.1.2.3",
+            "192.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "224.0.0.1",
+            "239.255.255.250",
+            "240.0.0.1",
+            "255.255.255.255",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "64:ff9b::7f00:1",  // NAT64 -> 127.0.0.1
+            "64:ff9b::a00:1",   // NAT64 -> 10.0.0.1
+            "2002:7f00:1::1",   // 6to4 -> 127.0.0.1
+            "2002:c0a8:101::1", // 6to4 -> 192.168.1.1
+            "::127.0.0.1",      // IPv4-compatible
+            "::ffff:169.254.169.254",
+        ];
+        for ip in private {
+            assert!(
+                is_private_ip(&ip.parse().unwrap()),
+                "{ip} should be blocked"
+            );
+        }
+        let public = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "192.0.1.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "223.255.255.255",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "64:ff9b::808:808", // NAT64 -> 8.8.8.8 (how IPv6-only networks reach IPv4)
+            "2002:808:808::1",  // 6to4 -> 8.8.8.8
+        ];
+        for ip in public {
+            assert!(
+                !is_private_ip(&ip.parse().unwrap()),
+                "{ip} should be allowed"
+            );
+        }
     }
 }

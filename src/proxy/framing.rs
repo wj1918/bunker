@@ -195,6 +195,9 @@ pub fn scan_chunked(buf: &[u8]) -> ChunkScan {
         };
         let size_field = {
             let line = &buf[pos..pos + line_len];
+            if !is_clean_chunk_line(line) {
+                return ChunkScan::Malformed;
+            }
             // strip chunk extensions after ';'
             line.split(|&c| c == b';').next().unwrap_or(line)
         };
@@ -238,9 +241,25 @@ fn scan_trailers(buf: &[u8], mut pos: usize) -> ChunkScan {
             // Blank line: end of trailers (and of the chunked body).
             return ChunkScan::Complete(pos + 2);
         }
+        if !is_clean_chunk_line(&buf[pos..pos + line_len]) {
+            return ChunkScan::Malformed;
+        }
         // A trailer line — consume it and continue.
         pos += line_len + 2;
     }
+}
+
+/// A chunk-size line (size + extensions) or trailer line may hold visible
+/// characters, spaces and tabs only.
+///
+/// These lines are relayed exactly as received, and we split them at CRLF. A
+/// peer that also accepts a bare LF (or CR) as a line ending would split
+/// `5;a=b\nfoo` into two lines where we saw one, and from there disagree with
+/// us about where every later chunk — and so the message — ends. That
+/// disagreement is what request smuggling is built on, so such a line is
+/// rejected rather than passed on.
+fn is_clean_chunk_line(line: &[u8]) -> bool {
+    line.iter().all(|&c| c == b'\t' || (c >= 0x20 && c != 0x7f))
 }
 
 fn parse_hex_strict(b: &[u8]) -> Option<u64> {
@@ -500,6 +519,25 @@ pub fn scan_message_with_metadata(
     (scan, metadata)
 }
 
+/// How the body of the request whose complete head is `head` is framed, or
+/// `None` if the head does not parse or its framing is rejected (the full
+/// scanner reports why). Lets a reader wait for the rest of a body by length,
+/// without parsing the head again on every read.
+pub fn request_body_framing(head: &[u8]) -> Option<BodyFraming> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(head) {
+        Ok(httparse::Status::Complete(_)) => {}
+        _ => return None,
+    }
+    let pairs: Vec<(&[u8], &[u8])> = req
+        .headers
+        .iter()
+        .map(|h| (h.name.as_bytes(), h.value))
+        .collect();
+    analyze_framing(&pairs).ok()
+}
+
 /// How the body of a response is delimited (RFC 7230 §3.3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseBody {
@@ -692,6 +730,9 @@ impl ChunkedTracker {
                         return ChunkProgress::More(pos);
                     };
                     let line = &rest[..line_len];
+                    if !is_clean_chunk_line(line) {
+                        return ChunkProgress::Malformed;
+                    }
                     let size_field = line.split(|&c| c == b';').next().unwrap_or(line);
                     let Some(size) = parse_hex_strict(trim_ows(size_field)) else {
                         return ChunkProgress::Malformed;
@@ -735,6 +776,9 @@ impl ChunkedTracker {
                         }
                         return ChunkProgress::More(pos);
                     };
+                    if !is_clean_chunk_line(&rest[..line_len]) {
+                        return ChunkProgress::Malformed;
+                    }
                     pos += line_len + 2;
                     if line_len == 0 {
                         self.state = ChunkState::Done;
@@ -1593,6 +1637,36 @@ mod tests {
                 assert_eq!(track_in_steps(body, step), Err(()), "step {step}");
             }
         }
+    }
+
+    /// Regression: a bare LF or CR inside a chunk-size line or trailer was
+    /// relayed as part of one line. A peer that treats it as a line ending
+    /// would frame the body differently (request smuggling). Both scanners
+    /// reject it, at every way the bytes can be split across reads.
+    #[test]
+    fn control_characters_in_chunk_lines_are_rejected() {
+        let bad: [&[u8]; 6] = [
+            b"5;a=b\nfoo\r\nhello\r\n0\r\n\r\n", // bare LF in an extension
+            b"5;a=b\rfoo\r\nhello\r\n0\r\n\r\n", // bare CR in an extension
+            b"5\n\r\nhello\r\n0\r\n\r\n",        // bare LF after the size
+            b"5;a=\x00\r\nhello\r\n0\r\n\r\n",   // NUL
+            b"0\r\nX-T: a\nInjected: 1\r\n\r\n", // bare LF in a trailer
+            b"0\r\nX-T: a\x7f\r\n\r\n",          // DEL in a trailer
+        ];
+        for body in bad {
+            assert_eq!(scan_chunked(body), ChunkScan::Malformed, "{body:?}");
+            for step in 1..=body.len() {
+                assert_eq!(
+                    track_in_steps(body, step),
+                    Err(()),
+                    "step {step} of {body:?}"
+                );
+            }
+        }
+        // Ordinary extensions and trailers, tabs included, still pass.
+        let good: &[u8] = b"5;name=\"a b\";\tflag\r\nhello\r\n0\r\nX-T: a\tb\r\n\r\n";
+        assert_eq!(scan_chunked(good), ChunkScan::Complete(good.len()));
+        assert_eq!(track_in_steps(good, 3), Ok(Some(good.len())));
     }
 
     #[test]
