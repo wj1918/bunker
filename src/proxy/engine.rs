@@ -281,8 +281,9 @@ async fn resolve_target(
         }
         return Ok(addr);
     }
+    // `resolve_anywhere`, not `resolve`: io_uring workers are not tokio threads.
     let ips = dns_client
-        .resolve(host)
+        .resolve_anywhere(host)
         .await
         .map_err(|_| AcquireErr::Failed)?;
     if ips.is_empty() {

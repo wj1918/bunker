@@ -47,7 +47,9 @@ embed-resource = "2"
 # `engine-uring` feature is enabled. The default build links neither this nor the
 # engine module, so the shipped binary is unchanged unless a feature is set.
 [target.'cfg(target_os = "linux")'.dependencies]
-monoio = { version = "0.2", optional = true }
+# `sync`: lets a task be woken from another thread. Hostname lookups run on
+# the tokio runtime and wake the io_uring worker that asked.
+monoio = { version = "0.2", optional = true, features = ["sync"] }
 
 [features]
 # `engine` is on by default — plain `cargo build` and the released binary use

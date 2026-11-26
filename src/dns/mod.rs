@@ -9,7 +9,7 @@ pub mod wire;
 
 #[allow(unused_imports)] // run_dns_server is the legacy wrapper for external callers
 pub use cache::DnsCache;
-pub use client::DnsClient;
+pub use client::{set_resolver_runtime, DnsClient};
 #[allow(unused_imports)]
 pub use server::{bind_dns_socket, run_dns_server, run_dns_server_on};
 

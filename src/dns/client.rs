@@ -17,7 +17,7 @@
 //! by the DNS server's own per-query cache check at the server-loop level).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -102,6 +102,52 @@ impl DnsClient {
                 .map_err(|e| DnsError::ParseError(e.to_string())),
         }
     }
+}
+
+/// The tokio runtime that resolution is sent to when the caller is not on one.
+static RESOLVER_RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Name the tokio runtime that hostname resolution may be handed to. Called
+/// once at startup, from that runtime.
+pub fn set_resolver_runtime(handle: tokio::runtime::Handle) {
+    let _ = RESOLVER_RUNTIME.set(handle);
+}
+
+impl DnsClient {
+    /// `resolve`, callable from any thread.
+    ///
+    /// Both backends of `resolve` need tokio: the OS resolver runs on tokio's
+    /// blocking pool and the upstream forwarder uses tokio UDP sockets. The
+    /// io_uring engine's workers run monoio instead, and calling `resolve`
+    /// there panicked ("there is no reactor running"), killing the worker.
+    /// From such a thread the lookup is run on the runtime registered with
+    /// `set_resolver_runtime` and only the result is awaited here.
+    pub async fn resolve_anywhere(self: &Arc<Self>, host: &str) -> Result<Vec<IpAddr>, DnsError> {
+        resolve_on(RESOLVER_RUNTIME.get(), self, host).await
+    }
+}
+
+async fn resolve_on(
+    home: Option<&tokio::runtime::Handle>,
+    client: &Arc<DnsClient>,
+    host: &str,
+) -> Result<Vec<IpAddr>, DnsError> {
+    // Literal IPs need no resolver, and a tokio thread can resolve in place.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return client.resolve(host).await;
+    }
+    // Not on tokio and nowhere to send the work: fail the lookup, don't panic.
+    let home = home.ok_or(DnsError::UpstreamFailed)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let client = Arc::clone(client);
+    let host = host.to_string();
+    home.spawn(async move {
+        let _ = tx.send(client.resolve(&host).await);
+    });
+    rx.await.unwrap_or(Err(DnsError::UpstreamFailed))
 }
 
 /// An unpredictable DNS transaction ID from the OS CSPRNG.
@@ -573,6 +619,56 @@ mod tests {
                 assert!(result.is_err());
             }
         }
+    }
+
+    /// Drive a future on the current thread with no async runtime at all,
+    /// the situation of an io_uring engine worker.
+    fn block_on_plain_thread<F: std::future::Future>(fut: F) -> F::Output {
+        struct ThreadWaker(std::thread::Thread);
+        impl std::task::Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Arc::new(ThreadWaker(std::thread::current())).into();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(out) => return out,
+                std::task::Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    /// Regression: resolving a hostname from a thread without a tokio runtime
+    /// (every io_uring worker) panicked and took the worker down.
+    #[test]
+    fn resolves_hostnames_from_a_thread_without_tokio() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let outcome = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let client = Arc::new(DnsClient::new_os(None));
+            let resolved = block_on_plain_thread(resolve_on(Some(&handle), &client, "localhost"));
+            let literal = block_on_plain_thread(resolve_on(None, &client, "192.0.2.7"));
+            // With nowhere to run the lookup it fails; it must not panic.
+            let stranded = block_on_plain_thread(resolve_on(None, &client, "localhost"));
+            (resolved, literal, stranded)
+        })
+        .join()
+        .expect("resolving off-runtime must not panic");
+        let (resolved, literal, stranded) = outcome;
+        assert!(resolved.unwrap().iter().all(|ip| ip.is_loopback()));
+        assert_eq!(
+            literal.unwrap(),
+            vec!["192.0.2.7".parse::<IpAddr>().unwrap()]
+        );
+        assert!(stranded.is_err());
     }
 
     #[test]

@@ -250,6 +250,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .dns
         .as_ref()
         .is_some_and(|d| d.enabled && !d.get_upstreams().is_empty());
+    // Engine workers that are not tokio threads (the io_uring backend) hand
+    // hostname lookups to this runtime.
+    dns::set_resolver_runtime(tokio::runtime::Handle::current());
     let dns_client: Arc<DnsClient> = Arc::new(if bunker_dns_active {
         let dns_config = config.dns.as_ref().unwrap();
         let upstream_strs = dns_config.get_upstreams();
