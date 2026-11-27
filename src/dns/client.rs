@@ -153,7 +153,7 @@ async fn resolve_on(
 }
 
 /// An unpredictable DNS transaction ID from the OS CSPRNG.
-fn random_query_id() -> u16 {
+pub(crate) fn random_query_id() -> u16 {
     let mut bytes = [0u8; 2];
     if getrandom::getrandom(&mut bytes).is_ok() {
         return u16::from_ne_bytes(bytes);

@@ -3,11 +3,14 @@
 use crate::config::DnsSecurityConfig;
 use crate::dns::wire::{is_truncated, DnsQuery};
 use crate::error::DnsError;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 /// DNS header size in octets (RFC 1035 §4.1.1).
@@ -80,13 +83,172 @@ pub(crate) const MAX_UDP_PAYLOAD: usize = 65535;
 /// How long an upstream that failed to answer is tried last instead of first.
 const DOWN_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Datagrams queued for one waiting query. More than one, because a datagram
+/// that carries the right transaction ID can still fail the checks, and the
+/// genuine answer may be behind it. Beyond this many unread, extras are dropped.
+const WAITER_QUEUE: usize = 8;
+
+/// Attempts at picking a transaction ID no other in-flight query is using.
+const ID_ATTEMPTS: usize = 16;
+
+/// A candidate answer and the address it came from.
+type Datagram = (Vec<u8>, SocketAddr);
+
+/// Queries awaiting an answer on one socket, by the transaction ID sent.
+type Inflight = Arc<Mutex<HashMap<u16, mpsc::Sender<Datagram>>>>;
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The one socket all queries to an upstream share.
+///
+/// It is bound on the first query and then kept for as long as the resolver
+/// lives, whatever happens on it. Opening and closing a socket per query is
+/// what this replaces: at a few thousand lookups a second on Windows that
+/// crashes the machine (a use-after-free in `afd.sys`, seen as bugchecks
+/// 0xD1, 0xA and 0xC5). So nothing here may close the socket in response to
+/// load or errors — a failing upstream would turn that back into the same
+/// churn.
+struct UpstreamSocket {
+    socket: Arc<UdpSocket>,
+    /// Connected to the upstream, so the OS drops datagrams from anyone else.
+    connected: bool,
+    inflight: Inflight,
+    receiver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UpstreamSocket {
+    fn drop(&mut self) {
+        self.receiver.abort();
+    }
+}
+
+impl UpstreamSocket {
+    async fn open(upstream: SocketAddr, connect: bool) -> std::io::Result<Self> {
+        let bind_addr = if upstream.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).await?;
+        if connect {
+            socket.connect(upstream).await?;
+        }
+        let socket = Arc::new(socket);
+        let inflight = Inflight::default();
+        let receiver = tokio::spawn(receive_datagrams(
+            Arc::clone(&socket),
+            Arc::clone(&inflight),
+        ));
+        Ok(Self {
+            socket,
+            connected: connect,
+            inflight,
+            receiver,
+        })
+    }
+
+    async fn send(&self, wire: &[u8], upstream: SocketAddr) -> std::io::Result<()> {
+        let mut retried = false;
+        loop {
+            let sent = if self.connected {
+                self.socket.send(wire).await
+            } else {
+                self.socket.send_to(wire, upstream).await
+            };
+            match sent {
+                Ok(_) => return Ok(()),
+                // An ICMP "port unreachable" for an earlier query is reported
+                // on the next call. It says nothing about this one: try again.
+                Err(e) if !retried && is_icmp_report(&e) => retried = true,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Reserve an unused transaction ID and the queue its answers arrive on.
+    fn register(&self) -> Option<(Registration, mpsc::Receiver<Datagram>)> {
+        let (tx, rx) = mpsc::channel(WAITER_QUEUE);
+        let mut inflight = lock(&self.inflight);
+        for _ in 0..ID_ATTEMPTS {
+            let id = crate::dns::client::random_query_id();
+            if let std::collections::hash_map::Entry::Vacant(slot) = inflight.entry(id) {
+                slot.insert(tx);
+                let registration = Registration {
+                    inflight: Arc::clone(&self.inflight),
+                    id,
+                };
+                return Some((registration, rx));
+            }
+        }
+        None
+    }
+}
+
+/// A query's claim on its transaction ID, released when the query ends —
+/// including when its future is dropped mid-wait.
+struct Registration {
+    inflight: Inflight,
+    id: u16,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        lock(&self.inflight).remove(&self.id);
+    }
+}
+
+fn is_icmp_report(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Hand each datagram arriving on a shared socket to the query whose
+/// transaction ID it carries. One without a waiting query — a late answer to
+/// a query that timed out, or junk — is dropped.
+async fn receive_datagrams(socket: Arc<UdpSocket>, inflight: Inflight) {
+    // Room for the largest possible UDP payload. Client queries are forwarded
+    // verbatim, including an EDNS0 OPT record that tells the upstream it may
+    // answer with up to 1232 / 4096 / ... bytes; a 512-byte buffer silently
+    // cut such answers short on Linux (and was then cached corrupted) and
+    // failed the read outright on Windows.
+    let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
+    loop {
+        let (len, from) = match socket.recv_from(&mut buf).await {
+            Ok(datagram) => datagram,
+            Err(e) if is_icmp_report(&e) => continue,
+            Err(_) => {
+                // Never give up on the socket (see `UpstreamSocket`), but do
+                // not spin on an error that repeats.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if len < 2 {
+            continue;
+        }
+        let id = u16::from_be_bytes([buf[0], buf[1]]);
+        let waiter = lock(&inflight).get(&id).cloned();
+        if let Some(waiter) = waiter {
+            // Copy out just the datagram: the result is long-lived (it is
+            // cached), so it must not keep the 64 KiB allocation.
+            let _ = waiter.try_send((buf[..len].to_vec(), from));
+        }
+    }
+}
+
 /// UDP-based DNS resolver implementation
 pub struct UdpDnsResolver {
     security: DnsSecurityConfig,
     /// Fetch the full answer over TCP when the UDP one comes back truncated.
     tcp_fallback: bool,
     /// Upstreams that recently failed to answer, and when.
-    down: std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>,
+    down: Mutex<HashMap<SocketAddr, std::time::Instant>>,
+    /// The socket for each upstream asked so far.
+    sockets: Mutex<HashMap<SocketAddr, Arc<UpstreamSocket>>>,
 }
 
 impl UdpDnsResolver {
@@ -95,7 +257,22 @@ impl UdpDnsResolver {
             security,
             tcp_fallback: false,
             down: Default::default(),
+            sockets: Default::default(),
         }
+    }
+
+    async fn socket_for(&self, upstream: SocketAddr) -> std::io::Result<Arc<UpstreamSocket>> {
+        if let Some(existing) = lock(&self.sockets).get(&upstream) {
+            return Ok(Arc::clone(existing));
+        }
+        let opened = Arc::new(
+            UpstreamSocket::open(upstream, self.security.verify_upstream_source).await?,
+        );
+        // Two first queries can both get here; the second one's socket is
+        // dropped and both use the first.
+        Ok(Arc::clone(
+            lock(&self.sockets).entry(upstream).or_insert(opened),
+        ))
     }
 
     /// When an upstream's UDP answer is truncated (TC bit), ask it again over
@@ -148,59 +325,57 @@ impl DnsResolver for UdpDnsResolver {
         timeout: Duration,
         enable_logging: bool,
     ) -> Result<Vec<u8>, DnsError> {
-        // Bind to appropriate address family based on upstream (IPv4 or IPv6)
-        let bind_addr = if upstream.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-
-        let socket = UdpSocket::bind(bind_addr)
+        if query.len() < DNS_HEADER_SIZE {
+            return Err(DnsError::ParseError(
+                "query shorter than a DNS header".into(),
+            ));
+        }
+        let socket = self
+            .socket_for(upstream)
             .await
             .map_err(|e| DnsError::ParseError(e.to_string()))?;
+
+        // Queries to this upstream share one socket, so answers are told apart
+        // by transaction ID alone. The caller's ID may collide with another
+        // caller's; the query goes out under an ID unique among those in
+        // flight (and unpredictable), and the answer gets the caller's back.
+        let (registration, mut answers) = socket.register().ok_or(DnsError::UpstreamFailed)?;
+        let mut wire = query.to_vec();
+        wire[..2].copy_from_slice(&registration.id.to_be_bytes());
 
         socket
-            .send_to(query, upstream)
+            .send(&wire, upstream)
             .await
             .map_err(|e| DnsError::ParseError(e.to_string()))?;
 
-        // Room for the largest possible UDP payload. Client queries are
-        // forwarded verbatim, including an EDNS0 OPT record that tells the
-        // upstream it may answer with up to 1232 / 4096 / ... bytes; a 512-byte
-        // buffer silently cut such answers short on Linux (and was then cached
-        // corrupted) and failed the read outright on Windows.
-        let mut recv_buf = vec![0u8; MAX_UDP_PAYLOAD];
         let deadline = tokio::time::Instant::now() + timeout;
         let mut warned = false;
 
         // Wait for the upstream's answer until the deadline. A datagram that
-        // is not that answer — wrong source, wrong transaction ID, wrong
-        // question — is dropped and the wait continues. Giving up on the first
-        // such datagram (as this used to) let anyone who could reach the
-        // socket fail a lookup with a single junk packet, before the genuine
-        // answer had a chance to arrive.
+        // is not that answer — wrong source, wrong question — is dropped and
+        // the wait continues. Giving up on the first such datagram (as this
+        // used to) let anyone who could reach the socket fail a lookup with a
+        // single junk packet, before the genuine answer had a chance to
+        // arrive. (One with another transaction ID never gets this far.)
         loop {
-            let received = tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await;
-            let (len, from) = match received {
-                Ok(Ok(datagram)) => datagram,
-                Ok(Err(e)) => return Err(DnsError::ParseError(e.to_string())),
-                Err(_) => return Err(DnsError::Timeout),
+            let (mut answer, from) = match tokio::time::timeout_at(deadline, answers.recv()).await
+            {
+                Ok(Some(datagram)) => datagram,
+                Ok(None) | Err(_) => return Err(DnsError::Timeout),
             };
             // Source check (anti-spoofing), then transaction-ID and
             // question-section echo. The latter run unconditionally — they
             // also cover an on-path attacker who spoofs the upstream's address.
             let problem = if self.security.verify_upstream_source && from != upstream {
                 Some("unexpected source")
-            } else if validate_upstream_response(query, &recv_buf[..len]).is_err() {
+            } else if validate_upstream_response(&wire, &answer).is_err() {
                 Some("ID or question mismatch")
             } else {
                 None
             };
             match problem {
                 None => {
-                    // Copy out just the datagram: the result is long-lived (it
-                    // is cached), so it must not keep the 64 KiB allocation.
-                    let answer = recv_buf[..len].to_vec();
+                    answer[..2].copy_from_slice(&query[..2]);
                     if self.tcp_fallback && is_truncated(&answer) {
                         // Too big for UDP. If TCP fails too, the truncated
                         // answer is still the best we have.
@@ -227,18 +402,13 @@ impl DnsResolver for UdpDnsResolver {
     }
 
     fn is_down(&self, upstream: SocketAddr) -> bool {
-        self.down
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock(&self.down)
             .get(&upstream)
             .is_some_and(|since| since.elapsed() < DOWN_COOLDOWN)
     }
 
     fn report(&self, upstream: SocketAddr, answered: bool) {
-        let mut down = self
-            .down
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut down = lock(&self.down);
         if answered {
             down.remove(&upstream);
         } else {
@@ -536,7 +706,7 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (_, from) = upstream.recv_from(&mut buf).await.unwrap();
-            upstream.send_to(&big, from).await.unwrap();
+            upstream.send_to(&with_id_of(&buf, &big), from).await.unwrap();
         });
 
         let resolver = UdpDnsResolver::new(DnsSecurityConfig::default());
@@ -554,6 +724,23 @@ mod tests {
 
     fn udp_resolver() -> UdpDnsResolver {
         UdpDnsResolver::new(DnsSecurityConfig::default())
+    }
+
+    /// `reply` under the transaction ID of the query the upstream received,
+    /// as a real server answers. (The resolver sends its own ID, not the
+    /// caller's.)
+    fn with_id_of(received_query: &[u8], reply: &[u8]) -> Vec<u8> {
+        let mut reply = reply.to_vec();
+        reply[..2].copy_from_slice(&received_query[..2]);
+        reply
+    }
+
+    /// `reply` under an ID that is not the received query's.
+    fn with_other_id(received_query: &[u8], reply: &[u8]) -> Vec<u8> {
+        let mut reply = reply.to_vec();
+        reply[0] = !received_query[0];
+        reply[1] = received_query[1];
+        reply
     }
 
     /// Regression: the first datagram that was not the upstream's answer
@@ -585,6 +772,9 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (_, resolver_addr) = upstream.recv_from(&mut buf).await.unwrap();
+            let answer = with_id_of(&buf, &answer);
+            let wrong_name = with_id_of(&buf, &wrong_name);
+            let wrong_id = with_other_id(&buf, &wrong_id);
             // From an unrelated address, with a perfectly valid-looking answer.
             stranger.send_to(&wrong_name, resolver_addr).await.unwrap();
             stranger.send_to(&answer, resolver_addr).await.unwrap();
@@ -613,8 +803,14 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (_, resolver_addr) = upstream.recv_from(&mut buf).await.unwrap();
+            let wrong_id = with_other_id(&buf, &wrong_id);
+            let wrong_name = with_id_of(
+                &buf,
+                &builder::build_response("evil.example", "6.6.6.6", 0, 300, ResponseCode::NoError),
+            );
             for _ in 0..5 {
                 upstream.send_to(&wrong_id, resolver_addr).await.unwrap();
+                upstream.send_to(&wrong_name, resolver_addr).await.unwrap();
             }
         });
         let got = udp_resolver()
@@ -777,6 +973,145 @@ mod tests {
         assert!(resolver.is_down(upstream));
         resolver.report(upstream, true);
         assert!(!resolver.is_down(upstream));
+    }
+
+    // ---------- one shared socket per upstream ----------
+
+    /// An upstream that answers every query with one A record under the ID
+    /// it was asked with, and records the address each query came from.
+    async fn echoing_upstream() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let sources = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&sources);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                seen.lock().unwrap().push(from);
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+                let reply =
+                    builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
+                let _ = socket.send_to(&reply, from).await;
+            }
+        });
+        (addr, sources)
+    }
+
+    /// Regression: every query opened and closed its own socket. At a few
+    /// thousand lookups a second that crashes Windows (a use-after-free in
+    /// afd.sys). Queries to an upstream must all leave from one socket, and
+    /// each caller must still get its own answer, under its own ID.
+    #[tokio::test]
+    async fn concurrent_queries_share_one_socket_and_get_their_own_answers() {
+        let (upstream, sources) = echoing_upstream().await;
+        let resolver = Arc::new(udp_resolver());
+
+        const QUERIES: usize = 128;
+        let mut lookups = Vec::new();
+        for i in 0..QUERIES {
+            let resolver = Arc::clone(&resolver);
+            lookups.push(tokio::spawn(async move {
+                // Every caller uses the same ID: they must not get mixed up.
+                let query = builder::build_query(&format!("q{i}.test"), RecordType::A, 0x1234);
+                let answer = resolver
+                    .resolve(&query, upstream, Duration::from_secs(5), false)
+                    .await
+                    .unwrap_or_else(|e| panic!("query {i}: {e:?}"));
+                assert_eq!(answer[..2], query[..2], "query {i}: caller's ID");
+                assert_eq!(
+                    answer[DNS_HEADER_SIZE..query.len()],
+                    query[DNS_HEADER_SIZE..],
+                    "query {i}: someone else's answer"
+                );
+            }));
+        }
+        for lookup in lookups {
+            lookup.await.unwrap();
+        }
+
+        let sources = sources.lock().unwrap();
+        assert_eq!(sources.len(), QUERIES);
+        let distinct: std::collections::HashSet<_> = sources.iter().collect();
+        assert_eq!(distinct.len(), 1, "queries left from {distinct:?}");
+        // Nothing is left registered once every query has its answer.
+        let sockets = lock(&resolver.sockets);
+        assert_eq!(sockets.len(), 1);
+        assert!(lock(&sockets[&upstream].inflight).is_empty());
+    }
+
+    /// A query that times out, or is dropped while waiting, gives its
+    /// transaction ID back, and the socket keeps working afterwards.
+    #[tokio::test]
+    async fn abandoned_queries_release_their_ids() {
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let resolver = udp_resolver();
+        let query = builder::build_query("example.com", RecordType::A, 7);
+
+        let timed_out = resolver
+            .resolve(&query, silent_addr, Duration::from_millis(50), false)
+            .await;
+        assert!(matches!(timed_out, Err(DnsError::Timeout)), "{timed_out:?}");
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            resolver.resolve(&query, silent_addr, Duration::from_secs(30), false),
+        )
+        .await;
+        assert!(dropped.is_err());
+        assert!(lock(&lock(&resolver.sockets)[&silent_addr].inflight).is_empty());
+
+        // The same socket then carries a query that is answered.
+        let mut buf = [0u8; 512];
+        let answering = async {
+            // Skip the two queries nobody is waiting for any more.
+            for _ in 0..2 {
+                silent.recv_from(&mut buf).await.unwrap();
+            }
+            let (len, from) = silent.recv_from(&mut buf).await.unwrap();
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+            let reply = builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
+            silent.send_to(&reply, from).await.unwrap();
+        };
+        let (answer, ()) = tokio::join!(
+            resolver.resolve(&query, silent_addr, Duration::from_secs(3), false),
+            answering
+        );
+        assert_eq!(answer.unwrap()[..2], query[..2]);
+    }
+
+    /// An upstream that is not listening makes the OS report an error on the
+    /// shared socket. That must not break it for later queries.
+    #[tokio::test]
+    async fn socket_survives_an_unreachable_upstream() {
+        let port = {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.local_addr().unwrap()
+        };
+        let resolver = udp_resolver();
+        let query = builder::build_query("example.com", RecordType::A, 7);
+        for _ in 0..3 {
+            let got = resolver
+                .resolve(&query, port, Duration::from_millis(100), false)
+                .await;
+            assert!(got.is_err(), "{got:?}");
+        }
+
+        // Something starts listening there: the same socket reaches it.
+        let upstream = UdpSocket::bind(port).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, from)) = upstream.recv_from(&mut buf).await {
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+                let reply =
+                    builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
+                let _ = upstream.send_to(&reply, from).await;
+            }
+        });
+        let got = resolver
+            .resolve(&query, port, Duration::from_secs(3), false)
+            .await;
+        assert_eq!(got.unwrap()[..2], query[..2]);
+        assert_eq!(lock(&resolver.sockets).len(), 1);
     }
 
     // ---------- TCP fallback for truncated answers ----------
