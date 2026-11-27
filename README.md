@@ -29,9 +29,7 @@ The config in `%USERPROFILE%\.bunker\` lives outside any package-managed directo
 bunker --config C:\path\to\config.yaml
 ```
 
-At runtime, all configuration comes from the YAML file — there are no CLI overrides. To change the bind address, allowlist, or DNS settings, edit the file (or regenerate it with `bunker --init [mode] ...`) and restart.
-
-`bunker` loads config from `--config <path>` if given, otherwise from `%USERPROFILE%\.bunker\config.yaml`. If neither is present, bunker prints an error and exits — run `bunker --init` to create one.
+At runtime, all configuration comes from the YAML file — there are no CLI overrides. To change the bind address, allowlist, or DNS settings, edit the file (or regenerate it with `bunker --init [mode] ...`) and restart. If no config file exists at either location, bunker prints an error and exits — run `bunker --init` to create one.
 
 ---
 
@@ -52,7 +50,7 @@ scoop bucket add bunker https://github.com/wj1918/bunker
 scoop install bunker
 ```
 
-Scoop places `bunker.exe` in its app directory. The release zip ships the binary and this README, no config — config lives at `%USERPROFILE%\.bunker\config.yaml` and survives `scoop update`. Bootstrap it with:
+Scoop places `bunker.exe` in its app directory. The release zip ships only the binary and this README; your config lives separately at `%USERPROFILE%\.bunker\config.yaml`, so it survives `scoop update`. Bootstrap it with:
 
 ```powershell
 bunker --init
@@ -119,13 +117,13 @@ Run `bunker --init [mode]` once to create `%USERPROFILE%\.bunker\config.yaml` fr
 - **`lan`** — other LAN clients connect. Requires exactly one RFC 1918 Ethernet interface; errors out on multi-NIC or Wi-Fi-only hosts. Use `custom` instead.
 - **`custom`** — any non-trivial deployment: Wi-Fi-only host, multiple NICs, Tailscale/VPN clients, or wildcard bind (`0.0.0.0`). All three flags are required.
 
-**Allowlist derivation for `--init custom`** (implemented in `src/main.rs`):
+**Allowlist derivation for `--init custom`:**
 - `--listen 0.0.0.0:8080` → union of every detected LAN subnet (loopback excluded).
 - `--listen 127.0.0.1:8080` → loopback-only allowlist.
 - `--listen <ip>` matches an interface → that interface's CIDR.
 - `--listen <ip>` doesn't match → assumed `/24` around that IP; **narrow or widen by hand** before serving traffic.
 
-**`--init` refuses to overwrite an existing file.** Delete or move `~/.bunker/config.yaml` first if you want to re-run it.
+**`--init` refuses to overwrite an existing file.** Delete or move `%USERPROFILE%\.bunker\config.yaml` first if you want to re-run it.
 
 After `--init`, open the file and review/edit. A typical LAN deployment ends up looking like:
 
@@ -230,6 +228,13 @@ Verify: `Get-NetFirewallRule -DisplayName "Bunker*" | Select-Object DisplayName,
 
 Remove: `Get-NetFirewallRule -DisplayName "Bunker*" | Remove-NetFirewallRule`
 
+These rules cover **inbound** connections from your clients. Windows allows outbound traffic by default, but if your host uses a default-outbound-**block** policy, also add outbound TCP and UDP allow rules for `bunker.exe` — otherwise bunker starts normally but every upstream connection and DNS query fails:
+
+```powershell
+New-NetFirewallRule -DisplayName "Bunker outbound" `
+    -Direction Outbound -Program "C:\Bunker\bunker.exe" -Action Allow
+```
+
 ### Step 4: Run Bunker
 
 Run from anywhere — Bunker picks up `%USERPROFILE%\.bunker\config.yaml` automatically:
@@ -244,7 +249,6 @@ To use a different config explicitly:
 bunker --config C:\path\to\config.yaml
 ```
 
-Lookup: `--config <path>` if given, otherwise `%USERPROFILE%\.bunker\config.yaml`. If neither is present, bunker errors out — run `bunker --init` to create one.
 
 To run headless on Windows, set `app.tray_enabled: false` in your config file. There is no `--no-tray` runtime flag; runtime behavior is sourced from the YAML file only.
 
@@ -532,7 +536,7 @@ The client gets a static IP in the back-to-back subnet, points its proxy and DNS
 
 **Why no default gateway:** if the client had a `0.0.0.0/0` route via Bunker, traffic could leak out by IP without ever touching the proxy. With no gateway, the only reachable host is `192.168.50.1` itself, and the only useful ports on it are `8080` (HTTP/HTTPS/CONNECT) and `53` (DNS).
 
-**Bunker `~/.bunker/config.yaml` (excerpt):**
+**Bunker `%USERPROFILE%\.bunker\config.yaml` (excerpt):**
 
 ```yaml
 proxy:
@@ -577,7 +581,7 @@ The isolated zone is a separate broadcast domain: a dedicated unmanaged switch, 
 - **No accidental WAN exposure** — devices without a default route can't be reached by, and can't reach, anything off the isolated subnet directly. The only listener that talks to both sides is Bunker.
 - **Auditable egress** — everything Bunker refuses or fails to deliver (blocked targets, rate limiting, malformed requests, unreachable upstreams) is logged at the default level in `C:\Bunker\logs\`. To record every request, allowed ones included, set `logging.log_requests: true` and `logging.level: debug`; per-request lines are written at DEBUG.
 
-**Bunker `~/.bunker/config.yaml` (excerpt):**
+**Bunker `%USERPROFILE%\.bunker\config.yaml` (excerpt):**
 
 ```yaml
 proxy:
