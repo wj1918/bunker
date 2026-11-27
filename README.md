@@ -395,7 +395,7 @@ dig @192.168.1.1 google.com
 | Refusal Logging | Blocked targets, rate-limit and capacity rejections, malformed requests and upstream failures are logged at the default level |
 | Idle Timeouts | Drops origins that stop sending and clients that stop reading or uploading |
 | Dead Peer Detection | TCP keep-alive closes tunnels whose peer vanished |
-| Request Size Limits | Configurable max request body size |
+| Request Size Limits | Configurable max request body size (a policy limit: uploads are forwarded as they arrive, not held in memory) |
 
 > **Note**: Bunker does not implement proxy authentication. Access control is managed via IP allowlists and network-level security.
 

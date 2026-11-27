@@ -16,9 +16,8 @@ use crate::proxy::forward::{
     parse_connect_target, rewrite_forward_with_metadata, ForwardError, Target,
 };
 use crate::proxy::framing::{
-    request_body_framing, scan_message_with_metadata, scan_response_head, BodyFraming,
-    ChunkProgress, ChunkedTracker, MessageError, MessageMetadata, MessageScan, ResponseBody,
-    ResponseHead,
+    scan_message_with_metadata, scan_response_head, BodyFraming, ChunkProgress, ChunkedTracker,
+    MessageError, MessageMetadata, MessageScan, ResponseBody, ResponseHead,
 };
 use crate::security::{
     is_blocked_target, is_source_ip_allowed, resolved_addrs_blocked, RateLimiter,
@@ -161,61 +160,205 @@ pub async fn relay_once<C: ProxyIo>(
         .map(|(b, _)| b)
 }
 
-/// What is still missing of a request whose head has arrived, tracked so that
-/// each read costs work in proportion to the bytes it brought.
-///
-/// Without it the whole message was scanned from the first byte after every
-/// read — the head re-parsed, every chunk walked again — so an upload sent in
-/// small pieces cost CPU in proportion to the square of its size.
-enum BodyWait {
-    /// Complete once the buffer holds this many bytes.
-    Length { total: usize },
-    /// Chunked: `scanned` bytes are already accounted for by `tracker`.
-    Chunked {
-        tracker: ChunkedTracker,
-        scanned: usize,
-    },
-}
-
-impl BodyWait {
-    fn for_request_head(head: &[u8]) -> Option<Self> {
-        match request_body_framing(head)? {
-            BodyFraming::None => None,
-            BodyFraming::ContentLength(n) => Some(BodyWait::Length {
-                total: head.len().checked_add(usize::try_from(n).ok()?)?,
-            }),
-            BodyFraming::Chunked => Some(BodyWait::Chunked {
-                tracker: ChunkedTracker::new(),
-                scanned: head.len(),
-            }),
-        }
-    }
-
-    /// False while the body is certainly still incomplete. True means "scan
-    /// the message now": it is complete, or malformed (the scan says which).
-    fn worth_scanning(&mut self, acc: &[u8]) -> bool {
-        match self {
-            BodyWait::Length { total } => acc.len() >= *total,
-            BodyWait::Chunked { tracker, scanned } => match tracker.advance(&acc[*scanned..]) {
-                ChunkProgress::More(n) => {
-                    *scanned += n;
-                    false
-                }
-                ChunkProgress::Done(_) | ChunkProgress::Malformed => true,
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 thread_local! {
-    /// Full-message scans performed by `relay_once_with_metadata` on this thread.
-    static FULL_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times `read_request` parsed a request head on this thread.
+    static HEAD_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Like `relay_once`, but also returns the routing metadata extracted in the
-/// same httparse pass `scan_message_with_metadata` performs internally. Used by
-/// the engine's request loop so `rewrite_forward` can skip a second parse.
+/// A request body at or under this size is read whole before the request is
+/// forwarded: it goes upstream in one write, and can be sent again if a reused
+/// connection turns out to be stale. A larger one is forwarded as it arrives.
+const STREAM_BODY_ABOVE: usize = 64 * 1024;
+
+/// What `read_request` returns: the request head plus as much of the body as
+/// is in hand, and what (if anything) is still to come.
+pub struct RequestRead {
+    /// The head, followed by the part of the body already received.
+    pub bytes: Bytes,
+    /// Byte ranges of method, target and headers within `bytes`.
+    pub meta: MessageMetadata,
+    /// The rest of the body, still unread on the connection.
+    pub rest: BodyRest,
+}
+
+/// The part of a request body that `read_request` left on the connection.
+pub enum BodyRest {
+    /// Nothing: `bytes` holds the whole message.
+    Complete,
+    /// This many more bytes.
+    Length(u64),
+    /// More chunks. `tracker` knows where in the chunk framing the stream is;
+    /// `seen` is how many body bytes have been accounted for so far (for the
+    /// size limit).
+    Chunked { tracker: ChunkedTracker, seen: u64 },
+}
+
+/// Read one request from `src`: all of its head, and its body up to the point
+/// where it is either complete or larger than `stream_above` — in which case
+/// the caller forwards the rest as it arrives (`BodyRest`).
+///
+/// Bytes after the returned part stay in `acc`: the rest of this body, or a
+/// pipelined next request.
+///
+/// * `head_timeout` bounds the *total* time to receive the head (slowloris).
+/// * `body_idle_timeout` bounds each wait for more of the body, not the whole.
+/// * `max_body` (> 0) rejects a larger body: up front when it is declared, and
+///   as soon as it is exceeded when it is chunked.
+///
+/// A client that sent `Expect: 100-continue` is told to go ahead as soon as
+/// its head has been accepted; without that it would sit waiting for the
+/// origin's go-ahead while the proxy waited for its body.
+///
+/// The head is parsed once and the body followed incrementally, so the work
+/// is proportional to the bytes received however many reads they arrive in.
+pub async fn read_request<C: ProxyIo>(
+    src: &mut C,
+    acc: &mut BytesMut,
+    head_timeout: Option<Duration>,
+    body_idle_timeout: Option<Duration>,
+    max_body: u64,
+    stream_above: usize,
+) -> Result<RequestRead, RelayErr> {
+    use crate::proxy::framing::{parse_request_head, RequestHead};
+
+    // ---- head ----
+    let start = std::time::Instant::now();
+    let (meta, framing, expects_continue) = loop {
+        #[cfg(test)]
+        HEAD_PARSES.with(|n| n.set(n.get() + 1));
+        match parse_request_head(acc, max_body) {
+            RequestHead::Complete {
+                meta,
+                framing,
+                expects_continue,
+            } => break (meta, framing, expects_continue),
+            RequestHead::Error(MessageError::BodyTooLarge) => return Err(RelayErr::TooLarge),
+            RequestHead::Error(_) => return Err(RelayErr::Malformed),
+            RequestHead::Incomplete => {
+                if acc.len() > MAX_HEAD_BYTES {
+                    return Err(RelayErr::Closed); // head never ends
+                }
+                let read = match head_timeout {
+                    Some(t) => {
+                        let elapsed = start.elapsed();
+                        if elapsed >= t {
+                            return Err(RelayErr::Closed); // slowloris: head too slow
+                        }
+                        src.read_append_timeout(acc, t - elapsed).await
+                    }
+                    None => src.read_append(acc).await,
+                };
+                match read {
+                    Ok(n) if n > 0 => {}
+                    _ => return Err(RelayErr::Closed), // EOF, error or timeout
+                }
+            }
+        }
+    };
+    let head_end = meta.head_end;
+
+    // ---- body ----
+    // One more read of the body, bounded by the idle limit if there is one.
+    async fn more<C: ProxyIo>(
+        src: &mut C,
+        acc: &mut BytesMut,
+        idle: Option<Duration>,
+    ) -> Result<(), RelayErr> {
+        let read = match idle {
+            Some(t) => src.read_append_timeout(acc, t).await,
+            None => src.read_append(acc).await,
+        };
+        match read {
+            Ok(n) if n > 0 => Ok(()),
+            _ => Err(RelayErr::Closed), // EOF, error or stalled upload
+        }
+    }
+    let mut go_ahead_due = expects_continue && meta.version != 0;
+    let whole = |acc: &mut BytesMut, total: usize, meta: MessageMetadata| RequestRead {
+        // Zero-copy: split_to + freeze hands the caller a Bytes view sharing
+        // the allocation; whatever follows the message stays in `acc`.
+        bytes: acc.split_to(total).freeze(),
+        meta,
+        rest: BodyRest::Complete,
+    };
+
+    match framing {
+        BodyFraming::None => Ok(whole(acc, head_end, meta)),
+        BodyFraming::ContentLength(len) => {
+            let Some(total) = usize::try_from(len)
+                .ok()
+                .and_then(|len| head_end.checked_add(len))
+            else {
+                return Err(RelayErr::Malformed);
+            };
+            if acc.len() < total && go_ahead_due {
+                if src.write_all(CONTINUE_100).await.is_err() {
+                    return Err(RelayErr::Closed);
+                }
+                go_ahead_due = false;
+            }
+            let _ = go_ahead_due;
+            if total - head_end > stream_above {
+                // Hand over what is here; the caller streams the rest.
+                let have = acc.len().min(total);
+                return Ok(RequestRead {
+                    bytes: acc.split_to(have).freeze(),
+                    meta,
+                    rest: match (total - have) as u64 {
+                        0 => BodyRest::Complete,
+                        left => BodyRest::Length(left),
+                    },
+                });
+            }
+            while acc.len() < total {
+                more(src, acc, body_idle_timeout).await?;
+            }
+            Ok(whole(acc, total, meta))
+        }
+        BodyFraming::Chunked => {
+            let mut tracker = ChunkedTracker::new();
+            let mut scanned = head_end; // bytes of `acc` the tracker has accepted
+            loop {
+                match tracker.advance(&acc[scanned..]) {
+                    ChunkProgress::Malformed => return Err(RelayErr::Malformed),
+                    ChunkProgress::Done(n) => {
+                        let total = scanned + n;
+                        if max_body > 0 && (total - head_end) as u64 > max_body {
+                            return Err(RelayErr::TooLarge);
+                        }
+                        return Ok(whole(acc, total, meta));
+                    }
+                    ChunkProgress::More(n) => scanned += n,
+                }
+                let seen = (scanned - head_end) as u64;
+                // A chunked body declares no length, so the limit is applied
+                // while it arrives.
+                if max_body > 0 && seen > max_body {
+                    return Err(RelayErr::TooLarge);
+                }
+                if scanned - head_end > stream_above {
+                    return Ok(RequestRead {
+                        bytes: acc.split_to(scanned).freeze(),
+                        meta,
+                        rest: BodyRest::Chunked { tracker, seen },
+                    });
+                }
+                if go_ahead_due {
+                    if src.write_all(CONTINUE_100).await.is_err() {
+                        return Err(RelayErr::Closed);
+                    }
+                    go_ahead_due = false;
+                }
+                more(src, acc, body_idle_timeout).await?;
+            }
+        }
+    }
+}
+
+/// Like `relay_once`, but also returns the routing metadata extracted while
+/// framing the message. A request is always read whole here; the engine's
+/// request loop uses `read_request` directly so it can stream large bodies.
 pub async fn relay_once_with_metadata<C: ProxyIo>(
     src: &mut C,
     acc: &mut BytesMut,
@@ -224,78 +367,31 @@ pub async fn relay_once_with_metadata<C: ProxyIo>(
     body_idle_timeout: Option<Duration>,
     max_body: u64,
 ) -> Result<(Bytes, Option<MessageMetadata>), RelayErr> {
-    let start = std::time::Instant::now();
-    let mut head_done = false;
-    let mut head_len = 0usize;
-    let mut body_wait: Option<BodyWait> = None;
+    if is_request {
+        let request = read_request(
+            src,
+            acc,
+            head_timeout,
+            body_idle_timeout,
+            max_body,
+            usize::MAX, // never hand back a partial body
+        )
+        .await?;
+        return Ok((request.bytes, Some(request.meta)));
+    }
+    // Responses (only the fixed-upstream `proxy_pair` runner reads them this
+    // way; the forward engine frames responses with `scan_response_head`).
     loop {
-        // Once the head is in and we know how the body is framed, skip the
-        // scan until enough has arrived for the message to be complete.
-        let (scan, meta) = if body_wait.as_mut().is_some_and(|w| !w.worth_scanning(acc)) {
-            (MessageScan::Incomplete, None)
-        } else {
-            #[cfg(test)]
-            FULL_SCANS.with(|n| n.set(n.get() + 1));
-            scan_message_with_metadata(acc, is_request, max_body)
-        };
-        match scan {
+        match scan_message_with_metadata(acc, false, max_body).0 {
             MessageScan::Complete { total, .. } => {
-                // Zero-copy: split_to + freeze hands the caller a Bytes view
-                // that shares the underlying allocation. No memcpy, no drain.
-                // The remaining tail (pipelined bytes, if any) stays in `acc`.
-                return Ok((acc.split_to(total).freeze(), meta));
+                return Ok((acc.split_to(total).freeze(), None));
             }
             MessageScan::Error(MessageError::BodyTooLarge) => return Err(RelayErr::TooLarge),
             MessageScan::Error(_) => return Err(RelayErr::Malformed),
-            MessageScan::Incomplete => {
-                // Latch once the head is fully received; after that, body reads
-                // are untimed (a large upload mustn't trip the header timeout).
-                if !head_done {
-                    if let Some(i) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
-                        head_done = true;
-                        head_len = i + 4;
-                        if is_request {
-                            body_wait = BodyWait::for_request_head(&acc[..head_len]);
-                        }
-                    } else if acc.len() > MAX_HEAD_BYTES {
-                        return Err(RelayErr::Closed); // head never ends
-                    }
-                }
-                // A chunked body declares no length up front, so the limit has
-                // to be applied while it is still arriving. Without this an
-                // endless chunked upload would be buffered until memory ran out.
-                if head_done && max_body > 0 && (acc.len() - head_len) as u64 > max_body {
-                    return Err(RelayErr::TooLarge);
-                }
-                let n = match head_timeout {
-                    Some(t) if !head_done => {
-                        let elapsed = start.elapsed();
-                        if elapsed >= t {
-                            return Err(RelayErr::Closed); // slowloris: head too slow
-                        }
-                        match src.read_append_timeout(acc, t - elapsed).await {
-                            Ok(n) => n,
-                            Err(_) => return Err(RelayErr::Closed),
-                        }
-                    }
-                    // Body: no limit on the total (a large upload takes as
-                    // long as it takes), only on each wait for more of it.
-                    _ if head_done && body_idle_timeout.is_some() => {
-                        let t = body_idle_timeout.unwrap_or_default();
-                        match src.read_append_timeout(acc, t).await {
-                            Ok(n) => n,
-                            Err(_) => return Err(RelayErr::Closed), // stalled upload
-                        }
-                    }
-                    _ => match src.read_append(acc).await {
-                        Ok(n) => n,
-                        Err(_) => return Err(RelayErr::Closed),
-                    },
-                };
-                if n == 0 {
-                    return Err(RelayErr::Closed); // EOF
-                }
-            }
+            MessageScan::Incomplete => match src.read_append(acc).await {
+                Ok(n) if n > 0 => {}
+                _ => return Err(RelayErr::Closed),
+            },
         }
     }
 }
@@ -413,6 +509,7 @@ const RESP_502: &[u8] =
 const RESP_504: &[u8] =
     b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+const CONTINUE_100: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 const RESP_413: &[u8] =
     b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -681,15 +778,20 @@ pub async fn proxy_forward<K: Connect>(
     let client_timeout = (!cfg.client_idle_timeout.is_zero()).then_some(cfg.client_idle_timeout);
 
     loop {
-        // Parse-once: pull metadata out of the framing pass and hand it to
+        // Read the head and — unless the body is large — the whole request.
+        // Parse-once: the head's metadata is handed to
         // rewrite_forward_with_metadata, which then skips its own httparse call.
-        let (req, meta) = match relay_once_with_metadata(
+        let RequestRead {
+            bytes: req,
+            meta,
+            rest,
+        } = match read_request(
             &mut client,
             &mut req_acc,
-            true,
             head_timeout,
             client_timeout,
             max_body,
+            STREAM_BODY_ABOVE,
         )
         .await
         {
@@ -714,8 +816,14 @@ pub async fn proxy_forward<K: Connect>(
         let last_request = cfg.max_requests_per_conn > 0 && served >= cfg.max_requests_per_conn;
         let forwarded_for = cfg.forwarded_for.then_some(client_ip);
         let (target, head, body) =
-            match rewrite_forward_with_metadata(&req, forwarded_for, meta.as_ref()) {
+            match rewrite_forward_with_metadata(&req, forwarded_for, Some(&meta)) {
                 Ok(x) => x,
+                Err(ForwardError::IsConnect) if !matches!(rest, BodyRest::Complete) => {
+                    // A CONNECT announcing a large body is not a tunnel request.
+                    warn!(client = %client_ip, "CONNECT with a request body rejected");
+                    let _ = client.write_all(RESP_400).await;
+                    break;
+                }
                 Err(ForwardError::IsConnect) => {
                     // CONNECT tunnel: validate target, connect, 200, then pump bytes.
                     let Some(target) = parse_connect_target(&req) else {
@@ -804,7 +912,12 @@ pub async fn proxy_forward<K: Connect>(
         let idempotent = is_idempotent_method(method);
         // 1xx interim responses are forwarded, except to HTTP/1.0 clients,
         // which don't know them (RFC 7231 §6.2).
-        let forward_interim = meta.as_ref().is_none_or(|m| m.version != 0);
+        let forward_interim = meta.version != 0;
+        // A body still on its way from the client can be sent only once, so
+        // such a request is treated like a non-idempotent one below: it gets
+        // a fresh connection and is never replayed.
+        let streaming = !matches!(rest, BodyRest::Complete);
+        let idempotent = idempotent && !streaming;
 
         // Acquire an upstream for this target: fast 1-slot, else pool, else
         // resolve+validate+connect. `reused` => might be a stale keep-alive.
@@ -848,36 +961,79 @@ pub async fn proxy_forward<K: Connect>(
         // without sending a single response byte (the signature of a stale
         // idle connection). Anything else — a reset mid-head, an unparseable
         // response, a timeout — is an error response, never a replay.
-        let started = match begin_roundtrip(
-            &mut conn,
-            &head,
-            &body,
-            head_request,
-            forward_interim,
-            read_timeout,
-        )
-        .await
-        {
-            Ok(r) => Ok(r),
-            Err(failed) if reused && idempotent && failed.retryable => {
-                match connect_fresh(&connector, &target, security, dns_client).await {
-                    Ok((fresh, fresh_ca)) => {
-                        conn = fresh;
-                        created_at = fresh_ca;
-                        begin_roundtrip(
-                            &mut conn,
-                            &head,
-                            &body,
-                            head_request,
-                            forward_interim,
-                            read_timeout,
-                        )
-                        .await
-                    }
-                    Err(_) => Err(failed),
+        let started = if streaming {
+            // Head and the part of the body in hand, then the rest of the
+            // body as the client sends it, then the response head.
+            let sent = match send_request(&mut conn, &head, &body, read_timeout).await {
+                Ok(()) => {
+                    pump_request_body(
+                        &mut client,
+                        &mut conn,
+                        &mut req_acc,
+                        rest,
+                        max_body,
+                        client_timeout,
+                        read_timeout,
+                    )
+                    .await
                 }
+                Err(failed) => Err(PumpErr::Upstream {
+                    timed_out: failed.timed_out,
+                }),
+            };
+            match sent {
+                Ok(()) => {
+                    read_response_head(&mut conn, head_request, forward_interim, read_timeout).await
+                }
+                Err(PumpErr::Upstream { timed_out }) => Err(RoundtripFailed {
+                    retryable: false,
+                    timed_out,
+                }),
+                Err(PumpErr::TooLarge) => {
+                    warn!(client = %client_ip, limit = max_body, "Request body over the size limit");
+                    let _ = client.write_all(RESP_413).await;
+                    break;
+                }
+                Err(PumpErr::Malformed) => {
+                    warn!(client = %client_ip, "Malformed request rejected (bad body framing)");
+                    let _ = client.write_all(RESP_400).await;
+                    break;
+                }
+                // The client went away or stalled mid-upload: nobody to answer.
+                Err(PumpErr::ClientGone) => break,
             }
-            Err(failed) => Err(failed),
+        } else {
+            match begin_roundtrip(
+                &mut conn,
+                &head,
+                &body,
+                head_request,
+                forward_interim,
+                read_timeout,
+            )
+            .await
+            {
+                Ok(r) => Ok(r),
+                Err(failed) if reused && idempotent && failed.retryable => {
+                    match connect_fresh(&connector, &target, security, dns_client).await {
+                        Ok((fresh, fresh_ca)) => {
+                            conn = fresh;
+                            created_at = fresh_ca;
+                            begin_roundtrip(
+                                &mut conn,
+                                &head,
+                                &body,
+                                head_request,
+                                forward_interim,
+                                read_timeout,
+                            )
+                            .await
+                        }
+                        Err(_) => Err(failed),
+                    }
+                }
+                Err(failed) => Err(failed),
+            }
         };
         let started = match started {
             Ok(r) => r,
@@ -1058,6 +1214,17 @@ async fn begin_roundtrip<C: ProxyIo>(
     forward_interim: bool,
     read_timeout: Option<Duration>,
 ) -> Result<ResponseStarted, RoundtripFailed> {
+    send_request(conn, head, body, read_timeout).await?;
+    read_response_head(conn, head_request, forward_interim, read_timeout).await
+}
+
+/// Write a request head and the body bytes in hand to the upstream.
+async fn send_request<C: ProxyIo>(
+    conn: &mut C,
+    head: &Bytes,
+    body: &Bytes,
+    read_timeout: Option<Duration>,
+) -> Result<(), RoundtripFailed> {
     // An upstream that accepts the connection but stops taking the request is
     // as stuck as one that never answers, so the same limit covers the send.
     let sent = match read_timeout {
@@ -1065,20 +1232,104 @@ async fn begin_roundtrip<C: ProxyIo>(
         None => Some(conn.write_all_vectored(head, body).await),
     };
     match sent {
-        Some(Ok(())) => {}
-        Some(Err(_)) => {
-            return Err(RoundtripFailed {
-                retryable: true,
-                timed_out: false,
-            })
+        Some(Ok(())) => Ok(()),
+        Some(Err(_)) => Err(RoundtripFailed {
+            retryable: true,
+            timed_out: false,
+        }),
+        None => Err(RoundtripFailed {
+            retryable: false,
+            timed_out: true,
+        }),
+    }
+}
+
+/// Why forwarding the rest of a request body stopped.
+enum PumpErr {
+    /// The client closed, failed or stalled before the body was complete.
+    ClientGone,
+    /// The body grew past `max_request_body_bytes` (chunked: no length was
+    /// declared, so this is only known once it happens).
+    TooLarge,
+    /// Bad chunk framing.
+    Malformed,
+    /// The upstream stopped accepting the body.
+    Upstream { timed_out: bool },
+}
+
+/// Forward the rest of a request body from the client to the upstream as it
+/// arrives. Each piece is written upstream before the next is read, so a body
+/// of any size passes through in about one read's worth of memory, and a slow
+/// origin slows the client down instead of filling the proxy.
+///
+/// `acc` is the client's read buffer: it may already hold the next part of
+/// the body, and bytes after the body's end (a pipelined request) stay in it.
+async fn pump_request_body<C: ProxyIo>(
+    client: &mut C,
+    upstream: &mut C,
+    acc: &mut BytesMut,
+    mut rest: BodyRest,
+    max_body: u64,
+    client_timeout: Option<Duration>,
+    upstream_timeout: Option<Duration>,
+) -> Result<(), PumpErr> {
+    loop {
+        // How much of what is buffered belongs to this body, and is it the end?
+        let (ready, done) = match &mut rest {
+            BodyRest::Complete => return Ok(()),
+            BodyRest::Length(left) => {
+                let take = (acc.len() as u64).min(*left);
+                *left -= take;
+                (take as usize, *left == 0)
+            }
+            BodyRest::Chunked { tracker, seen } => match tracker.advance(acc) {
+                ChunkProgress::Malformed => return Err(PumpErr::Malformed),
+                ChunkProgress::Done(n) => (n, true),
+                ChunkProgress::More(n) => {
+                    *seen += n as u64;
+                    if max_body > 0 && *seen > max_body {
+                        return Err(PumpErr::TooLarge);
+                    }
+                    (n, false)
+                }
+            },
+        };
+        if ready > 0 {
+            let written = match upstream_timeout {
+                Some(t) => C::timeout(t, upstream.write_all(&acc[..ready])).await,
+                None => Some(upstream.write_all(&acc[..ready]).await),
+            };
+            match written {
+                Some(Ok(())) => {}
+                Some(Err(_)) => return Err(PumpErr::Upstream { timed_out: false }),
+                None => return Err(PumpErr::Upstream { timed_out: true }),
+            }
+            acc.advance(ready);
         }
-        None => {
-            return Err(RoundtripFailed {
-                retryable: false,
-                timed_out: true,
-            })
+        if done {
+            return Ok(());
+        }
+        if acc.capacity() - acc.len() < RELAY_READ_BYTES / 4 {
+            acc.reserve(RELAY_READ_BYTES);
+        }
+        let read = match client_timeout {
+            Some(t) => client.read_append_timeout(acc, t).await,
+            None => client.read_append(acc).await,
+        };
+        match read {
+            Ok(n) if n > 0 => {}
+            _ => return Err(PumpErr::ClientGone),
         }
     }
+}
+
+/// Read from the upstream until the final response head is in.
+async fn read_response_head<C: ProxyIo>(
+    conn: &mut C,
+    head_request: bool,
+    forward_interim: bool,
+    read_timeout: Option<Duration>,
+) -> Result<ResponseStarted, RoundtripFailed> {
     let mut acc: BytesMut = BytesMut::with_capacity(4096);
     let mut interim: Option<BytesMut> = None; // forwarded 1xx bytes, if any
     let mut interim_count = 0usize;
@@ -3048,6 +3299,212 @@ mod tests {
         assert_eq!(connector.connects(), 0);
     }
 
+    // ---- request bodies forwarded as they arrive ----
+
+    const UPLOAD_HEAD: &[u8] =
+        b"PUT http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nContent-Length: 200000\r\n\r\n";
+
+    /// Regression: an upload was read into memory whole before the origin saw
+    /// any of it. A large one now goes upstream piece by piece: by the time
+    /// the client's later pieces are read, the earlier ones have been written.
+    #[test]
+    fn large_upload_is_forwarded_while_it_arrives() {
+        let piece = vec![b'x'; 50_000];
+        let upstream = SharedConn::new(vec![OK_2]);
+        let client =
+            SharedConn::new(vec![UPLOAD_HEAD, &piece, &piece, &piece, &piece]).watching(&upstream);
+        let (received, connector) =
+            run_forward_with(client.clone(), std::slice::from_ref(&upstream));
+        assert_eq!(received.as_bytes(), OK_2);
+        assert_eq!(connector.connects(), 1);
+
+        let sent = upstream.conn.borrow().written.clone();
+        let body_at = sent.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(sent.starts_with(b"PUT /up HTTP/1.1\r\n"));
+        assert_eq!(sent.len() - body_at, 200_000);
+        assert!(sent[body_at..].iter().all(|&b| b == b'x'));
+
+        // What the upstream had been sent at each of the client's reads: the
+        // head went out before the body was read, and each piece before the
+        // next one.
+        let seen = client.seen();
+        assert_eq!(seen[0], 0, "nothing before the head is read");
+        assert!(
+            seen[1] > 0,
+            "head forwarded before any body was read: {seen:?}"
+        );
+        for pair in seen[1..5].windows(2) {
+            assert_eq!(pair[1] - pair[0], 50_000, "{seen:?}");
+        }
+    }
+
+    /// A large chunked upload is streamed too, and a request pipelined behind
+    /// it is still served: the bytes after the body stay with the client.
+    #[test]
+    fn large_chunked_upload_is_streamed_and_the_next_request_served() {
+        let chunk = {
+            let mut c = b"7530\r\n".to_vec(); // 30000 bytes
+            c.extend(std::iter::repeat_n(b'y', 30_000));
+            c.extend_from_slice(b"\r\n");
+            c
+        };
+        let mut last = b"0\r\n\r\n".to_vec();
+        last.extend_from_slice(GET); // pipelined
+        let upstream = SharedConn::new(vec![OK_2, OK_2]);
+        let client = SharedConn::new(vec![
+            b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &chunk,
+            &chunk,
+            &chunk,
+            &chunk[..1000], // a chunk split across reads
+            &chunk[1000..],
+            &last,
+        ]);
+        let (received, connector) = run_forward_with(client, std::slice::from_ref(&upstream));
+        assert_eq!(received.as_bytes(), [OK_2, OK_2].concat());
+        // The upload opened the connection; the request after it reuses it.
+        assert_eq!(connector.connects(), 1);
+        let sent = upstream.written();
+        assert!(
+            sent.contains("Transfer-Encoding: chunked\r\n"),
+            "{}",
+            &sent[..200]
+        );
+        assert_eq!(sent.matches("7530\r\n").count(), 4);
+        // The body ends exactly at its terminator; the pipelined request
+        // follows as a request of its own, rewritten like any other.
+        assert_eq!(sent.matches("\r\n0\r\n\r\nGET /a HTTP/1.1\r\n").count(), 1);
+        assert_eq!(sent.matches("GET ").count(), 1);
+    }
+
+    /// A request whose body is still arriving can be sent only once: it must
+    /// not ride a reused connection that might be stale, idempotent or not.
+    #[test]
+    fn streamed_upload_gets_a_fresh_connection_and_is_never_replayed() {
+        let piece = vec![b'x'; 100_000];
+        let first = SharedConn::new(vec![OK_2, OK_2]); // would answer again
+        let second = SharedConn::new(vec![]); // closes without answering
+        let third = SharedConn::new(vec![OK_2]);
+        let client = SharedConn::new(vec![GET, UPLOAD_HEAD, &piece, &piece]);
+        let (received, connector) =
+            run_forward_with(client, &[first.clone(), second.clone(), third.clone()]);
+        assert!(
+            received.ends_with(std::str::from_utf8(RESP_502).unwrap()),
+            "{received}"
+        );
+        assert_eq!(
+            connector.connects(),
+            2,
+            "fresh connection for the upload, no retry"
+        );
+        assert!(!first.written().contains("PUT /up"));
+        assert!(second.written().contains("PUT /up"));
+        assert_eq!(third.written(), "");
+    }
+
+    /// The size limit applies to a streamed chunked upload as it goes.
+    #[test]
+    fn streamed_chunked_upload_over_the_limit_gets_413() {
+        let chunk = {
+            let mut c = b"7530\r\n".to_vec();
+            c.extend(std::iter::repeat_n(b'y', 30_000));
+            c.extend_from_slice(b"\r\n");
+            c
+        };
+        let mut script: Vec<&[u8]> = vec![
+            b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ];
+        script.extend(std::iter::repeat_n(&chunk[..], 50));
+        let client = SharedConn::new(script);
+        let upstream = SharedConn::new(vec![OK_2]);
+        let cfg = Arc::new(EngineConfig {
+            max_request_body_bytes: 200_000,
+            ..forward_test_engine_config()
+        });
+        let (received, _) = run_forward_cfg(client.clone(), std::slice::from_ref(&upstream), cfg);
+        assert_eq!(received.as_bytes(), RESP_413);
+        assert!(client.unread() > 30, "stopped reading once over the limit");
+        assert!(upstream.conn.borrow().written.len() < 260_000);
+    }
+
+    /// Bad chunk framing in the streamed part of an upload is still refused.
+    #[test]
+    fn streamed_upload_with_bad_framing_gets_400() {
+        let chunk = {
+            let mut c = b"13880\r\n".to_vec(); // 80000 bytes
+            c.extend(std::iter::repeat_n(b'y', 80_000));
+            c.extend_from_slice(b"\r\n");
+            c
+        };
+        let client = SharedConn::new(vec![
+            b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &chunk,
+            b"5;x=1\nsmuggled\r\nhello\r\n0\r\n\r\n",
+        ]);
+        let upstream = SharedConn::new(vec![OK_2]);
+        let (received, _) = run_forward_with(client, std::slice::from_ref(&upstream));
+        assert_eq!(received.as_bytes(), RESP_400);
+        assert!(!upstream.written().contains("smuggled"));
+    }
+
+    /// A client that disappears mid-upload gets no response, and the origin's
+    /// connection is dropped rather than reused.
+    #[test]
+    fn upload_abandoned_by_the_client_ends_quietly() {
+        let piece = vec![b'x'; 50_000];
+        let upstream = SharedConn::new(vec![OK_2]);
+        let client = SharedConn::new(vec![UPLOAD_HEAD, &piece]); // 150000 bytes short
+        let (received, connector) = run_forward_with(client, std::slice::from_ref(&upstream));
+        assert_eq!(received, "");
+        assert_eq!(connector.connects(), 1);
+        assert_eq!(upstream.unread(), 1, "the response was never read");
+    }
+
+    /// Regression: a client that sent `Expect: 100-continue` waited for a
+    /// go-ahead that the proxy never gave (it was waiting for the body). The
+    /// proxy now answers 100 itself — to HTTP/1.1 clients, for small and
+    /// large bodies alike.
+    #[test]
+    fn expect_100_continue_is_answered_before_the_body_is_read() {
+        let body = vec![b'z'; 100_000];
+        let cases: [(&[u8], &[u8], bool); 3] = [
+            (
+                b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+                b"hello",
+                true,
+            ),
+            (
+                b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nContent-Length: 100000\r\nExpect: 100-continue\r\n\r\n",
+                &body,
+                true,
+            ),
+            (
+                b"POST http://93.184.216.34/up HTTP/1.0\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+                b"hello",
+                false,
+            ),
+        ];
+        for (head, body, go_ahead) in cases {
+            let upstream = SharedConn::new(vec![OK_2]);
+            let client = SharedConn::new(vec![head, body]);
+            let (received, _) = run_forward_with(client, std::slice::from_ref(&upstream));
+            let expected: Vec<u8> = if go_ahead {
+                [CONTINUE_100, OK_2].concat()
+            } else {
+                OK_2.to_vec()
+            };
+            assert_eq!(received.as_bytes(), expected);
+            assert!(upstream.conn.borrow().written.ends_with(body));
+        }
+        // No go-ahead when the body came along with the head anyway.
+        let upstream = SharedConn::new(vec![OK_2]);
+        let (received, _) = run_forward_test(
+            vec![b"POST http://93.184.216.34/up HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello"],
+            std::slice::from_ref(&upstream),
+        );
+        assert_eq!(received.as_bytes(), OK_2);
+    }
+
     /// A response head that never ends is cut off instead of buffered.
     #[test]
     fn forward_rejects_an_endless_response_head() {
@@ -3085,16 +3542,16 @@ mod tests {
 
     /// Regression: every read re-scanned the whole request, so an upload sent
     /// in small pieces cost work in proportion to the square of its size.
-    /// However many reads it takes, the message is now scanned a fixed number
-    /// of times.
+    /// However many reads it takes, the head is parsed only until it is
+    /// complete and the body is followed incrementally after that.
     #[test]
     fn upload_arriving_in_many_reads_is_not_rescanned_each_time() {
         let scans_for = |script: Vec<&[u8]>| {
-            FULL_SCANS.with(|n| n.set(0));
+            HEAD_PARSES.with(|n| n.set(0));
             let mut conn = MockConn::new(script);
             let mut acc = BytesMut::new();
             let msg = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).unwrap();
-            (FULL_SCANS.with(|n| n.get()), msg.len())
+            (HEAD_PARSES.with(|n| n.get()), msg.len())
         };
 
         let head: &[u8] =

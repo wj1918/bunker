@@ -519,23 +519,83 @@ pub fn scan_message_with_metadata(
     (scan, metadata)
 }
 
-/// How the body of the request whose complete head is `head` is framed, or
-/// `None` if the head does not parse or its framing is rejected (the full
-/// scanner reports why). Lets a reader wait for the rest of a body by length,
-/// without parsing the head again on every read.
-pub fn request_body_framing(head: &[u8]) -> Option<BodyFraming> {
+/// Result of parsing a request's head, without waiting for its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestHead {
+    /// The head is complete (`meta.head_end` bytes) and well-formed.
+    Complete {
+        meta: MessageMetadata,
+        /// How the body that follows is delimited.
+        framing: BodyFraming,
+        /// The client sent `Expect: 100-continue` and is waiting for a go-ahead
+        /// before it sends the body.
+        expects_continue: bool,
+    },
+    /// Need more bytes.
+    Incomplete,
+    /// Malformed head, rejected framing, or a declared body over the limit.
+    Error(MessageError),
+}
+
+/// Parse the head of the request at the start of `buf`. `max_body` (> 0)
+/// rejects a declared Content-Length above it.
+///
+/// This is the head half of `scan_message_with_metadata`: it lets a reader act
+/// on a request — route it, start forwarding it — before the body has arrived,
+/// and wait for the body by length instead of re-parsing on every read.
+pub fn parse_request_head(buf: &[u8], max_body: u64) -> RequestHead {
+    let head_end = match find(buf, b"\r\n\r\n") {
+        Some(i) => i + 4,
+        None => return RequestHead::Incomplete,
+    };
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
-    match req.parse(head) {
-        Ok(httparse::Status::Complete(_)) => {}
-        _ => return None,
+    match req.parse(buf) {
+        Ok(httparse::Status::Complete(n)) => debug_assert_eq!(n, head_end),
+        Ok(httparse::Status::Partial) => return RequestHead::Incomplete,
+        Err(httparse::Error::TooManyHeaders) => {
+            return RequestHead::Error(MessageError::TooManyHeaders)
+        }
+        Err(_) => return RequestHead::Error(MessageError::BadHead),
     }
     let pairs: Vec<(&[u8], &[u8])> = req
         .headers
         .iter()
         .map(|h| (h.name.as_bytes(), h.value))
         .collect();
-    analyze_framing(&pairs).ok()
+    let framing = match analyze_framing(&pairs) {
+        Ok(f) => f,
+        Err(e) => return RequestHead::Error(MessageError::Framing(e)),
+    };
+    if let BodyFraming::ContentLength(n) = framing {
+        if max_body > 0 && n > max_body {
+            return RequestHead::Error(MessageError::BodyTooLarge);
+        }
+    }
+    let expects_continue = pairs
+        .iter()
+        .filter(|(name, _)| eq_ignore_ascii_case_bytes(name, b"expect"))
+        .flat_map(|(_, value)| value.split(|&c| c == b','))
+        .any(|token| eq_ignore_ascii_case_bytes(trim_ows(token), b"100-continue"));
+    let meta = MessageMetadata {
+        method: range_of(buf, req.method.unwrap_or("").as_bytes()),
+        path: range_of(buf, req.path.unwrap_or("").as_bytes()),
+        version: req.version.unwrap_or(1),
+        headers: req
+            .headers
+            .iter()
+            .map(|h| HeaderRange {
+                name: range_of(buf, h.name.as_bytes()),
+                value: range_of(buf, h.value),
+            })
+            .collect(),
+        head_end,
+    };
+    RequestHead::Complete {
+        meta,
+        framing,
+        expects_continue,
+    }
 }
 
 /// How the body of a response is delimited (RFC 7230 §3.3.3).
@@ -1701,5 +1761,83 @@ mod tests {
             }
         }
         assert_eq!(outcome, ChunkProgress::Malformed);
+    }
+
+    // ---- parse_request_head ----
+
+    #[test]
+    fn request_head_agrees_with_the_whole_message_scanner() {
+        let requests: [&[u8]; 4] = [
+            b"GET http://example.com/a HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"POST http://h/ HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+            b"POST http://h/ HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        ];
+        for raw in requests {
+            let (scan, whole_meta) = scan_message_with_metadata(raw, true, 0);
+            let MessageScan::Complete { head, framing, .. } = scan else {
+                panic!("{scan:?}")
+            };
+            // The head alone is enough, body bytes present or not.
+            for buf in [raw, &raw[..head]] {
+                match parse_request_head(buf, 0) {
+                    RequestHead::Complete {
+                        meta,
+                        framing: f,
+                        expects_continue,
+                    } => {
+                        assert_eq!(Some(&meta), whole_meta.as_ref());
+                        assert_eq!(f, framing);
+                        assert!(!expects_continue);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            for cut in 0..head {
+                assert_eq!(parse_request_head(&raw[..cut], 0), RequestHead::Incomplete);
+            }
+        }
+    }
+
+    #[test]
+    fn request_head_reports_limits_expectations_and_bad_framing() {
+        let big = b"POST http://h/ HTTP/1.1\r\nContent-Length: 1000\r\n\r\n";
+        assert_eq!(
+            parse_request_head(big, 999),
+            RequestHead::Error(MessageError::BodyTooLarge)
+        );
+        assert!(matches!(
+            parse_request_head(big, 1000),
+            RequestHead::Complete { .. }
+        ));
+
+        for expect in [
+            "Expect: 100-continue",
+            "expect: 100-Continue",
+            "Expect: foo, 100-continue",
+        ] {
+            let raw = format!("POST http://h/ HTTP/1.1\r\nContent-Length: 5\r\n{expect}\r\n\r\n");
+            assert!(
+                matches!(
+                    parse_request_head(raw.as_bytes(), 0),
+                    RequestHead::Complete {
+                        expects_continue: true,
+                        ..
+                    }
+                ),
+                "{expect}"
+            );
+        }
+        assert_eq!(
+            parse_request_head(
+                b"POST http://h/ HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+                0
+            ),
+            RequestHead::Error(MessageError::Framing(FramingError::ClTeConflict))
+        );
+        assert_eq!(
+            parse_request_head(b"NOT A REQUEST\r\n\r\n", 0),
+            RequestHead::Error(MessageError::BadHead)
+        );
     }
 }

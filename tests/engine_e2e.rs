@@ -79,15 +79,53 @@ impl Origin {
                         .then(|| value.trim().parse::<usize>().ok())?
                 })
                 .unwrap_or(0);
-            // Read the body, if any.
-            while buf.len() < head_end + content_length {
-                let mut chunk = [0u8; 64 * 1024];
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            let chunked = head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked");
+            // Read the body, if any, and note how many payload bytes it had.
+            let (consumed, body_bytes) = if chunked {
+                let mut pos = head_end;
+                let mut payload = 0usize;
+                loop {
+                    // Next chunk-size line.
+                    let line_end = loop {
+                        if let Some(i) = find(&buf[pos..], b"\r\n") {
+                            break pos + i;
+                        }
+                        let mut chunk = [0u8; 64 * 1024];
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let size_text = String::from_utf8_lossy(&buf[pos..line_end]).into_owned();
+                    let size = usize::from_str_radix(size_text.split(';').next().unwrap(), 16)
+                        .expect("origin received a bad chunk size");
+                    let chunk_end = line_end + 2 + size + 2;
+                    while buf.len() < chunk_end {
+                        let mut chunk = [0u8; 64 * 1024];
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    pos = chunk_end;
+                    if size == 0 {
+                        break (pos, payload);
+                    }
+                    payload += size;
                 }
-            }
-            buf.drain(..head_end + content_length);
+            } else {
+                while buf.len() < head_end + content_length {
+                    let mut chunk = [0u8; 64 * 1024];
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                (head_end + content_length, content_length)
+            };
+            buf.drain(..consumed);
 
             let sized = |body: &[u8]| {
                 let mut out = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
@@ -96,7 +134,7 @@ impl Origin {
                 out
             };
             let result = if head.starts_with("POST ") {
-                stream.write_all(&sized(content_length.to_string().as_bytes()))
+                stream.write_all(&sized(body_bytes.to_string().as_bytes()))
             } else {
                 match path.as_str() {
                     "/headers" => stream.write_all(&sized(head.as_bytes())),
@@ -380,6 +418,72 @@ fn upload_reaches_the_origin_whole() {
     client.write_all(&body).unwrap();
     let (_, answer) = read_sized_response(&mut client);
     assert_eq!(answer, body.len().to_string().as_bytes());
+}
+
+#[test]
+fn chunked_upload_reaches_the_origin_whole() {
+    let origin = Origin::start();
+    let proxy = Proxy::default().start();
+    let mut client = connect(proxy);
+    client
+        .write_all(
+            format!(
+                "POST http://{}/upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+                origin.addr
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let piece = pattern(50_000);
+    for _ in 0..60 {
+        client
+            .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
+            .unwrap();
+        client.write_all(&piece).unwrap();
+        client.write_all(b"\r\n").unwrap();
+    }
+    client.write_all(b"0\r\n\r\n").unwrap();
+    let (_, answer) = read_sized_response(&mut client);
+    assert_eq!(answer, (60 * 50_000).to_string().as_bytes());
+
+    // The connection carries on after a streamed upload.
+    client.write_all(get(&origin, "/ok").as_bytes()).unwrap();
+    assert_eq!(read_sized_response(&mut client).1, b"OK");
+}
+
+/// A client that asks for a go-ahead (`Expect: 100-continue`) and really
+/// waits for it must get one, or the upload never starts.
+#[test]
+fn expect_100_continue_gets_a_go_ahead() {
+    let origin = Origin::start();
+    let proxy = Proxy::default().start();
+    for size in [1000usize, 500_000] {
+        let mut client = connect(proxy);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = pattern(size);
+        client
+            .write_all(
+                format!(
+                    "POST http://{}/upload HTTP/1.1\r\nHost: x\r\nContent-Length: {size}\r\n\
+                     Expect: 100-continue\r\n\r\n",
+                    origin.addr
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        // Send nothing more until the go-ahead arrives.
+        let mut go_ahead = [0u8; 25];
+        client
+            .read_exact(&mut go_ahead)
+            .expect("no 100 Continue: the client would wait forever");
+        assert_eq!(&go_ahead, b"HTTP/1.1 100 Continue\r\n\r\n", "size {size}");
+        client.write_all(&body).unwrap();
+        let (head, answer) = read_sized_response(&mut client);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "size {size}: {head}");
+        assert_eq!(answer, size.to_string().as_bytes());
+    }
 }
 
 #[test]
