@@ -16,12 +16,6 @@ proxy:
   # to accept from any interface, or a specific LAN IP to bind one NIC.
   listen: "127.0.0.1:8080"
 
-  # Preserve the original case of forwarded header names (Title-Case for
-  # synthesized ones). true = faithful to the client request (some case-sensitive
-  # upstreams need it). false = forward headers lowercase for ~3% more throughput;
-  # safe when your backends honor case-insensitive headers (RFC 7230).
-  preserve_header_case: true
-
   # Add "X-Forwarded-For: <client address>" to forwarded HTTP requests. Set to
   # false to keep clients' internal addresses from the sites they visit.
   forwarded_for: true
@@ -139,14 +133,6 @@ logging:
                                       # Per-request traces (CONNECT/HTTP/DNS) are
                                       # DEBUG; set "debug" to see them at runtime.
                                       # RUST_LOG env var overrides this field.
-  redact_sensitive_headers: true
-  sensitive_headers:                  # Case-insensitive
-    - "authorization"
-    - "proxy-authorization"
-    - "cookie"
-    - "set-cookie"
-    - "x-api-key"
-    - "x-auth-token"
 
   # File logging (uncomment to enable - by default, logs go to stdout/stderr).
   # file:

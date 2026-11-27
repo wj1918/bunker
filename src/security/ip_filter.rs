@@ -1,9 +1,7 @@
 //! IP filtering for SSRF prevention, source IP allowlist, and DNS rebinding protection.
 
 use crate::config::SecurityConfig;
-use crate::dns::DnsClient;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 
 /// Normalize IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to IPv4
 /// This prevents bypass attacks where ::ffff:192.168.1.3 wouldn't match 192.168.1.3
@@ -93,8 +91,8 @@ pub fn ip_in_cidr(ip: &IpAddr, network: &IpAddr, prefix_len: u8) -> bool {
 /// so a literal target like `::ffff:127.0.0.1` falls into the IPv4 branch and
 /// is caught by `is_loopback()` rather than slipping through `Ipv6Addr::is_loopback`
 /// (which matches only `::1`). Without this, the SSRF check is bypassable via
-/// the mapped form in `is_blocked_target`, `resolve_and_validate_host`, and
-/// `resolved_addrs_blocked` — all of which feed `is_private_ip` raw IPs.
+/// the mapped form in `is_blocked_target` and `resolved_addrs_blocked`, both
+/// of which feed `is_private_ip` raw IPs.
 ///
 /// "Private" here means "not a public unicast address": besides the RFC 1918
 /// ranges it covers every special-purpose block a proxy has no business
@@ -171,58 +169,9 @@ pub fn is_ipv6_link_local(ipv6: &Ipv6Addr) -> bool {
     (segments[0] & 0xffc0) == 0xfe80
 }
 
-/// Resolve hostname to IP addresses (DNS rebinding protection).
-///
-/// Delegates the hostname-to-IPs step to the supplied `DnsClient` — Mode 1
-/// uses `DnsClient::Upstream` (forwards to configured upstreams), Modes 2 & 3
-/// use `DnsClient::Os` (wraps `os_resolve` with optional cache). Literal IPs
-/// short-circuit the resolver entirely. The SSRF/rebinding check on the
-/// returned IPs is unchanged.
-pub async fn resolve_and_validate_host(
-    host: &str,
-    port: u16,
-    security: &SecurityConfig,
-    dns_client: &Arc<DnsClient>,
-) -> Result<Vec<SocketAddr>, &'static str> {
-    // Literal IP shortcut — same behavior as before, no resolver call.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if security.block_private_ips && is_private_ip(&ip) {
-            return Err("Resolved to private/internal IP (blocked)");
-        }
-        return Ok(vec![SocketAddr::new(ip, port)]);
-    }
-
-    let ips = dns_client
-        .resolve(host)
-        .await
-        .map_err(|_| "DNS resolution failed")?;
-
-    if ips.is_empty() {
-        return Err("DNS resolution returned no addresses");
-    }
-
-    let addrs: Vec<SocketAddr> = ips
-        .into_iter()
-        .map(|ip| SocketAddr::new(ip, port))
-        .collect();
-
-    // DNS Rebinding Protection: Check ALL resolved IPs
-    if security.block_private_ips {
-        for addr in &addrs {
-            if is_private_ip(&addr.ip()) {
-                return Err("DNS resolved to private/internal IP (rebinding attack blocked)");
-            }
-        }
-    }
-
-    Ok(addrs)
-}
-
 /// DNS-rebinding check on already-resolved addresses: returns Some(reason) if
 /// any resolved IP is private/internal and `block_private_ips` is on. Sync — the
-/// async resolution itself is the caller's job (so this works on any runtime,
-/// unlike `resolve_and_validate_host` which is tied to tokio's resolver).
-#[allow(dead_code)] // used by the engine feature; dead in the default binary
+/// async resolution itself is the caller's job, so this works on any runtime.
 pub fn resolved_addrs_blocked(
     addrs: &[SocketAddr],
     security: &SecurityConfig,

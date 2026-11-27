@@ -1,13 +1,6 @@
-//! HTTP/HTTPS proxy module with connection pooling.
+//! The forward proxy: the thread-per-core engine and the pure request/response
+//! handling it is built on.
 
-mod connect;
-#[cfg(feature = "engine")]
 pub mod engine;
-#[cfg(feature = "engine")]
 pub mod forward;
 pub mod framing;
-mod handler;
-mod pool;
-
-pub use handler::handle_client;
-pub use pool::ShardedSenderPool;

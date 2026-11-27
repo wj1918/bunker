@@ -1,26 +1,10 @@
-//! Helper functions for TLS, responses, and TCP settings.
+//! Small helpers shared by the proxy: TCP keep-alive and the fixed responses
+//! written when a connection is refused at accept time.
 
-use crate::body::{BodyExt, BoxBody, Empty, Full};
 use crate::config::TcpKeepaliveConfig;
-use bytes::Bytes;
-use hyper::Response;
 use socket2::{SockRef, TcpKeepalive};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
-
-/// Create a TLS connector with system root certificates
-pub fn create_tls_connector() -> Result<TlsConnector, Box<dyn std::error::Error + Send + Sync>> {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
-}
 
 /// Apply TCP keep-alive settings to a socket
 pub fn apply_tcp_keepalive(stream: &TcpStream, config: &TcpKeepaliveConfig) -> std::io::Result<()> {
@@ -53,43 +37,9 @@ pub fn apply_tcp_keepalive_to(
     Ok(())
 }
 
-/// Create an error response with the given status code and message
-pub fn error_response(status: u16, msg: &'static str) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(status)
-        .body(
-            Full::new(Bytes::from(msg))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap()
-}
-
-/// Like `error_response`, but sets `Connection: close` so the server drops the
-/// keep-alive socket after sending. Use for *terminal* errors where the
-/// connection state can't safely accept another request — e.g. per-connection
-/// request-cap reached (429), oversized body (413), bad framing (400). Without
-/// this, hyper keeps the connection alive and the client just pipes the next
-/// request into the same stuck state.
-pub fn error_response_close(
-    status: u16,
-    msg: &'static str,
-) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONNECTION, "close")
-        .body(
-            Full::new(Bytes::from(msg))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .unwrap()
-}
-
-// Raw HTTP/1.1 responses used at *accept time*, before any per-connection
-// framing layer (hyper's serve_connection / engine's proxy_forward) has been
-// invoked. Both paths write these directly to the just-accepted TcpStream and
-// then close it. Retry-After values are hardcoded to reasonable defaults
+// Raw HTTP/1.1 responses used at *accept time*, before the connection is handed
+// to `proxy_forward`. They are written directly to the just-accepted socket,
+// which is then closed. Retry-After values are hardcoded to reasonable defaults
 // (matching `rate_limit.window_seconds` default of 60s for the rate-limit
 // response; 1s for capacity — clients should back off briefly but not long).
 // Operators on non-default windows get a slightly inaccurate hint here, which
@@ -103,87 +53,9 @@ pub const ACCEPT_RATELIMIT_RESP: &[u8] =
 pub const ACCEPT_CAPACITY_RESP: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 1\r\n\r\n";
 
-/// Create an empty response body
-pub fn empty_body() -> BoxBody<Bytes, hyper::Error> {
-    Empty::<Bytes>::new()
-        .map_err(|never| match never {})
-        .boxed()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_create_tls_connector() {
-        let result = create_tls_connector();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_error_response_400() {
-        let resp = error_response(400, "Bad Request");
-        assert_eq!(resp.status(), 400);
-    }
-
-    #[test]
-    fn test_error_response_502() {
-        let resp = error_response(502, "Bad Gateway");
-        assert_eq!(resp.status(), 502);
-    }
-
-    #[test]
-    fn test_error_response_500() {
-        let resp = error_response(500, "Internal Server Error");
-        assert_eq!(resp.status(), 500);
-    }
-
-    #[test]
-    fn test_error_response_403() {
-        let resp = error_response(403, "Forbidden");
-        assert_eq!(resp.status(), 403);
-    }
-
-    #[test]
-    fn test_error_response_504() {
-        let resp = error_response(504, "Gateway Timeout");
-        assert_eq!(resp.status(), 504);
-    }
-
-    #[test]
-    fn test_error_response_close_sets_header() {
-        let resp = error_response_close(413, "Payload Too Large");
-        assert_eq!(resp.status(), 413);
-        assert_eq!(
-            resp.headers()
-                .get(hyper::header::CONNECTION)
-                .and_then(|v| v.to_str().ok()),
-            Some("close")
-        );
-    }
-
-    #[test]
-    fn test_accept_responses_well_formed() {
-        // These constants are written verbatim to a TCP stream, so a typo in
-        // status line or framing would silently corrupt the rejection.
-        assert!(ACCEPT_RATELIMIT_RESP.starts_with(b"HTTP/1.1 429 Too Many Requests\r\n"));
-        assert!(ACCEPT_RATELIMIT_RESP
-            .windows(b"Retry-After:".len())
-            .any(|w| w == b"Retry-After:"));
-        assert!(ACCEPT_RATELIMIT_RESP.ends_with(b"\r\n\r\n"));
-
-        assert!(ACCEPT_CAPACITY_RESP.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
-        assert!(ACCEPT_CAPACITY_RESP
-            .windows(b"Retry-After:".len())
-            .any(|w| w == b"Retry-After:"));
-        assert!(ACCEPT_CAPACITY_RESP.ends_with(b"\r\n\r\n"));
-    }
-
-    #[test]
-    fn test_empty_body() {
-        let body = empty_body();
-        drop(body);
-    }
 
     #[test]
     fn test_apply_tcp_keepalive_disabled() {
@@ -201,7 +73,6 @@ mod tests {
         // Since we need a real socket, let's just verify the function exists and config works
         assert!(!config.enabled);
     }
-
     #[test]
     fn test_tcp_keepalive_config_values() {
         let config = TcpKeepaliveConfig {
@@ -217,7 +88,6 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(config.retries, 5);
     }
-
     #[tokio::test]
     async fn test_apply_tcp_keepalive_with_socket() {
         use tokio::net::TcpListener;

@@ -49,7 +49,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// * `X-Forwarded-For` — replaced by the real peer address, or dropped when
 ///   the proxy is configured not to send one. Copying the client's would put
 ///   a forged address first in the list, where origins that trust the header
-///   read it. (The hyper path drops it for the same reason.)
+///   read it.
 fn is_dropped_request_header(name: &str) -> bool {
     is_hop_by_hop(name)
         || name.eq_ignore_ascii_case("host")

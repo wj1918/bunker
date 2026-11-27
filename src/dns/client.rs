@@ -124,13 +124,11 @@ impl DnsClient {
     /// there panicked ("there is no reactor running"), killing the worker.
     /// From such a thread the lookup is run on the runtime registered with
     /// `set_resolver_runtime` and only the result is awaited here.
-    #[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
     pub async fn resolve_anywhere(self: &Arc<Self>, host: &str) -> Result<Vec<IpAddr>, DnsError> {
         resolve_on(RESOLVER_RUNTIME.get(), self, host).await
     }
 }
 
-#[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
 async fn resolve_on(
     home: Option<&tokio::runtime::Handle>,
     client: &Arc<DnsClient>,

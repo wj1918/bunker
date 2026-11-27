@@ -19,20 +19,14 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
-hyper = { version = "1", features = ["client", "server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 bytes = "1"
 httparse = "1"
 mimalloc = "0.1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-# OS randomness for DNS transaction IDs. Already in the dependency tree (via
-# ring), so this adds no new crate.
+# OS randomness for DNS transaction IDs.
 getrandom = "0.2"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "0.26"
 socket2 = { version = "0.6", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
@@ -52,16 +46,12 @@ embed-resource = "2"
 monoio = { version = "0.2", optional = true, features = ["sync"] }
 
 [features]
-# `engine` is on by default — plain `cargo build` and the released binary use
-# the thread-per-core proxy engine on the portable tokio backend. The previous
-# hyper-based path is still in the tree as a fallback; build it with
-# `--no-default-features` if you need to compare or bisect against it.
+# The proxy is the thread-per-core engine, always, on the portable tokio
+# backend. `engine` no longer switches anything: it used to select the engine
+# over an older hyper-based implementation, which has been removed. The name is
+# kept (and stays in `default`) so existing build commands keep working.
 default = ["engine"]
 engine = []
-# Adds the Linux io_uring (monoio) backend on top of `engine`. Linux only — do
-# not enable on Windows/macOS (monoio has no backend there); use `engine` instead.
+# Adds the Linux io_uring (monoio) backend. Linux only — do not enable on
+# Windows/macOS (monoio has no backend there).
 engine-uring = ["engine", "dep:monoio"]
-
-[dev-dependencies]
-mockall = "0.13"
-tokio-test = "0.4"

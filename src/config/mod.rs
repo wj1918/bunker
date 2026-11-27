@@ -290,26 +290,21 @@ pub struct ProxyConfig {
     pub connection_pool: ConnectionPoolConfig,
     #[serde(default)]
     pub tcp_keepalive: TcpKeepaliveConfig,
-    /// Preserve the original case of forwarded header names (and emit Title-Case
-    /// for synthesized ones). Faithful to the client's request — some
-    /// case-sensitive upstreams need it — but costs per-request CPU. Set false
-    /// for ~3% more throughput if your backends are well-behaved (case-insensitive
-    /// per RFC 7230); headers are then forwarded lowercase.
+    /// Accepted so existing config files keep loading; it has no effect. The
+    /// proxy forwards header names exactly as the client wrote them. (The
+    /// setting belonged to an older implementation that could lowercase them.)
+    #[allow(dead_code)]
     #[serde(default = "default_preserve_header_case")]
     pub preserve_header_case: bool,
     /// Add `X-Forwarded-For: <client address>` to forwarded HTTP requests
     /// (default true). Set to false to keep clients' internal addresses from
     /// being sent to the sites they visit. Either way a client-supplied
     /// `X-Forwarded-For` is never passed on. Engine path only.
-    #[cfg_attr(not(feature = "engine"), allow(dead_code))]
     #[serde(default = "default_forwarded_for")]
     pub forwarded_for: bool,
-    /// Use the experimental thread-per-core engine instead of the default hyper
-    /// proxy path. Defaults to ON when the binary is built with the `engine`
-    /// feature, and OFF otherwise — so a feature build runs the engine by default
-    /// while the stock (no-feature) binary still boots on the hyper path. Set
-    /// explicitly to override. The backend (io_uring on Linux, tokio elsewhere)
-    /// is chosen at build time from the compiled features + target OS.
+    /// Accepted so existing config files keep loading; it no longer selects
+    /// anything. `false` used to switch to an older proxy implementation,
+    /// which has been removed — it now only produces a startup warning.
     #[serde(default = "default_engine")]
     pub engine: bool,
 }
@@ -322,10 +317,8 @@ fn default_preserve_header_case() -> bool {
     true
 }
 
-/// Engine defaults ON only when compiled in (the `engine` feature), so the stock
-/// binary stays on the hyper path and still boots with a default config.
 fn default_engine() -> bool {
-    cfg!(feature = "engine")
+    true
 }
 
 fn default_forwarded_for() -> bool {
@@ -376,6 +369,9 @@ impl Default for AppConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionPoolConfig {
+    /// Keep idle upstream connections for reuse by later client connections.
+    /// With `false` an upstream connection is still reused for consecutive
+    /// requests on the same client connection, then closed.
     #[serde(default = "default_pool_enabled")]
     pub enabled: bool,
     #[serde(default = "default_max_connections_per_host")]
@@ -623,7 +619,6 @@ pub struct SecurityConfig {
     /// response, so long downloads and event streams that keep sending are
     /// unaffected; an origin that goes silent gets a 504 or a closed
     /// connection instead of holding one forever. Engine path only.
-    #[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
     #[serde(default = "default_upstream_read_timeout_seconds")]
     pub upstream_read_timeout_seconds: u64,
     /// Longest wait, in seconds, for the client to send more of a request
@@ -634,7 +629,6 @@ pub struct SecurityConfig {
     /// forever. Does not apply to CONNECT tunnels, which may legitimately sit
     /// idle; dead tunnel peers are detected by `tcp_keepalive`. Engine path
     /// only.
-    #[cfg_attr(not(feature = "engine"), allow(dead_code))] // engine path only
     #[serde(default = "default_client_idle_timeout_seconds")]
     pub client_idle_timeout_seconds: u64,
     /// Maximum requests per connection (0 = unlimited, default 100).
@@ -835,8 +829,14 @@ pub struct LoggingConfig {
     pub log_requests: bool,
     #[serde(default)]
     pub format: LogFormat,
+    /// Accepted so existing config files keep loading; neither setting has
+    /// any effect. The proxy never logs request or response headers, so
+    /// there is nothing to redact. (They belonged to an older implementation
+    /// that could log headers.)
+    #[allow(dead_code)]
     #[serde(default = "default_redact_sensitive")]
     pub redact_sensitive_headers: bool,
+    #[allow(dead_code)]
     #[serde(default = "default_sensitive_headers")]
     pub sensitive_headers: Vec<String>,
     /// File logging configuration
@@ -2030,6 +2030,21 @@ app:
         let local =
             config_from("proxy:\n  listen: \"127.0.0.1:8080\"\ndns:\n  listen: \"[::1]:53\"\n");
         assert!(local.warnings().is_empty());
+    }
+
+    /// Settings that belonged to the removed hyper-based implementation must
+    /// still be accepted (unknown keys are an error), or existing config
+    /// files would stop loading after an upgrade.
+    #[test]
+    fn settings_of_the_removed_implementation_still_load() {
+        let config = config_from(
+            "proxy:\n  engine: false\n  preserve_header_case: false\n\
+             logging:\n  redact_sensitive_headers: false\n  sensitive_headers: [\"cookie\"]\n",
+        );
+        assert!(config.validate().is_ok());
+        assert!(!config.proxy.engine);
+        // And the defaults when they are absent.
+        assert!(Config::default_for_tests().proxy.engine);
     }
 
     impl Config {

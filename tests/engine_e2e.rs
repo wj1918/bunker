@@ -5,8 +5,6 @@
 //! needed, so every assertion is a hard one. These are the only tests that
 //! drive the engine through real sockets — its unit tests use scripted
 //! in-memory connections.
-#![cfg(feature = "engine")]
-
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};

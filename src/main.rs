@@ -1,7 +1,7 @@
 //! Bunker - A lightweight HTTP/HTTPS and DNS proxy
 //!
-//! This is a generic HTTP/HTTPS forward proxy with an optional DNS server,
-//! built with Rust using hyper 1.x. Supports both IPv4 and IPv6.
+//! This is a generic HTTP/HTTPS forward proxy with an optional DNS server.
+//! Supports both IPv4 and IPv6.
 
 // Use mimalloc instead of the system allocator. The perf profile showed ~6.6%
 // of forward-path time in glibc malloc/free (vs ~2.6% for nginx's arena pools,
@@ -9,7 +9,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod body;
 mod config;
 mod dns;
 mod error;
@@ -18,24 +17,18 @@ mod logging;
 mod platform;
 mod proxy;
 mod security;
-mod tokio_io;
 
 use config::{customize_default_config, load_config, user_config_path, AllowlistOverride, Config};
 use dns::{bind_dns_socket, run_dns_server_on, DnsCache, DnsClient};
-use helpers::create_tls_connector;
 use platform::net_discovery::{
     assume_slash_24, discover_all_lan_interfaces, discover_lan_interface, interface_for_ipv4,
 };
-use proxy::{handle_client, ShardedSenderPool};
-use security::{is_source_ip_allowed, RateLimiter};
 
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 #[cfg(windows)]
 use std::sync::mpsc;
@@ -217,11 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // Spawn the tray reader thread right after the sender exists — before any
-    // downstream path diverges (`!proxy.enabled` pending-forever, `proxy.engine`
-    // block_in_place return, or the hyper accept loop). Putting this next to
-    // the accept loop instead leaves the engine and DNS-only paths with a
-    // sender but no reader, so tray clicks queue forever and Quit/Minimize/
-    // Bring-to-Front silently do nothing.
+    // downstream path diverges (`!proxy.enabled` pending-forever, or the
+    // engine's block_in_place). Starting it any later leaves one of those
+    // paths with a sender but no reader, so tray clicks queue forever and
+    // Quit/Minimize/Bring-to-Front silently do nothing.
     #[cfg(windows)]
     if let Some(rx) = tray_rx {
         std::thread::spawn(move || {
@@ -244,9 +236,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
-
-    // Setup TLS connector for HTTPS connections to target servers
-    let tls_connector = Arc::new(create_tls_connector()?);
 
     // ---- Bunker DNS engine wiring (shared between DNS server + proxy) ----
     //
@@ -402,242 +391,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         unreachable!();
     }
 
-    // Forward-proxy engine path (config-selected). Replaces the hyper accept loop
-    // with the thread-per-core engine. The DNS server spawned above keeps running
-    // on this tokio runtime while block_in_place drives the engine's own per-core
-    // runtimes.
-    if config.proxy.engine {
-        #[cfg(feature = "engine")]
-        {
-            use proxy::engine::Backend;
-            let listen_addr: SocketAddr = config.proxy.listen.parse()?;
-            // Backend is a build-time decision: io_uring on Linux when the
-            // engine-uring feature is compiled, tokio everywhere else.
-            let backend = Backend::Auto;
-            let backend_name = if cfg!(all(feature = "engine-uring", target_os = "linux")) {
-                "io_uring"
-            } else {
-                "tokio"
-            };
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            let pool = &config.proxy.connection_pool;
-            let sec = &config.proxy.security;
-            let engine_cfg = Arc::new(proxy::engine::EngineConfig {
-                security: Arc::new(sec.clone()),
-                dns_client: Arc::clone(&dns_client),
-                rate_limit: sec.rate_limit.clone(),
-                pool_max_per_host: pool.max_connections_per_host,
-                pool_max_total: pool.max_total_connections,
-                pool_idle_timeout: std::time::Duration::from_secs(pool.idle_timeout_seconds),
-                pool_max_lifetime: std::time::Duration::from_secs(pool.max_lifetime_seconds),
-                connect_timeout: std::time::Duration::from_secs(pool.connect_timeout_seconds),
-                header_read_timeout: std::time::Duration::from_secs(
-                    sec.header_read_timeout_seconds,
-                ),
-                upstream_read_timeout: std::time::Duration::from_secs(
-                    sec.upstream_read_timeout_seconds,
-                ),
-                client_idle_timeout: std::time::Duration::from_secs(
-                    sec.client_idle_timeout_seconds,
-                ),
-                tcp_keepalive: config.proxy.tcp_keepalive.clone(),
-                forwarded_for: config.proxy.forwarded_for,
-                max_request_body_bytes: sec.max_request_body_bytes,
-                max_requests_per_conn: sec.max_requests_per_connection,
-                max_connections: sec.max_connections,
-                log_requests: config.logging.log_requests,
-            });
-            println!(
-                "Forward proxy (engine, {}) listening on http://{} ({} threads)",
-                backend_name, listen_addr, threads
-            );
-            return tokio::task::block_in_place(|| {
-                proxy::engine::run_forward(listen_addr, engine_cfg, threads, backend)
-            })
-            .map_err(Into::into);
-        }
-        #[cfg(not(feature = "engine"))]
-        {
-            eprintln!("Error: proxy.engine = true, but this binary was built without the `engine` feature.");
-            eprintln!("Rebuild with: cargo build --release --features engine   (or `engine-uring` on Linux for the io_uring backend).");
-            std::process::exit(1);
-        }
+    // Run the forward proxy: the thread-per-core engine. The DNS server
+    // spawned above keeps running on this tokio runtime while block_in_place
+    // drives the engine's own per-core runtimes.
+    if !config.proxy.engine {
+        // The setting used to select an older implementation, since removed.
+        let note = "proxy.engine: false is no longer supported and is ignored \
+                    (the older proxy implementation was removed)";
+        eprintln!("WARNING: {note}");
+        warn!("{note}");
     }
-
+    use proxy::engine::Backend;
     let listen_addr: SocketAddr = config.proxy.listen.parse()?;
-    let listener = TcpListener::bind(listen_addr).await?;
-    println!("Forward proxy listening on http://{}", listen_addr);
-
-    // Share configs across tasks
-    let security_config = Arc::new(config.proxy.security.clone());
-    let logging_config = Arc::new(config.logging.clone());
-    let tcp_keepalive_config = Arc::new(config.proxy.tcp_keepalive.clone());
-    let preserve_header_case = config.proxy.preserve_header_case;
-
-    // Log TCP keep-alive settings
-    if config.proxy.tcp_keepalive.enabled {
-        println!(
-            "TCP keep-alive: enabled (time={}s, interval={}s)",
-            config.proxy.tcp_keepalive.time_seconds, config.proxy.tcp_keepalive.interval_seconds
-        );
-    }
-
-    // Create rate limiter
-    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(
-        config.proxy.security.rate_limit.clone(),
-    )));
-
-    // Spawn cleanup task for rate limiter
-    let rate_limiter_cleanup = Arc::clone(&rate_limiter);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            rate_limiter_cleanup.lock().await.cleanup();
-        }
-    });
-
-    // Create sender pool for HTTP keep-alive
-    let pool_config = config.proxy.connection_pool.clone();
-    let sender_pool = Arc::new(ShardedSenderPool::new(pool_config.clone()));
-    // Cache the connect timeout once: it's immutable for the process lifetime, so the
-    // request path must not lock the pool just to read it.
-    let connect_timeout = std::time::Duration::from_secs(pool_config.connect_timeout_seconds);
-    if pool_config.enabled {
-        println!(
-            "Connection pool: enabled (max {} per host, idle {}s, lifetime {}s)",
-            pool_config.max_connections_per_host,
-            pool_config.idle_timeout_seconds,
-            pool_config.max_lifetime_seconds
-        );
+    // Backend is a build-time decision: io_uring on Linux when the
+    // engine-uring feature is compiled, tokio everywhere else.
+    let backend = Backend::Auto;
+    let backend_name = if cfg!(all(feature = "engine-uring", target_os = "linux")) {
+        "io_uring"
     } else {
-        println!("Connection pool: disabled");
-    }
-
-    // Spawn cleanup task for sender pool
-    let pool_cleanup = Arc::clone(&sender_pool);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            pool_cleanup.cleanup();
-        }
-    });
-
-    // Create connection semaphore (0 = unlimited)
-    let max_connections = config.proxy.security.max_connections;
-    let connection_semaphore = if max_connections > 0 {
-        println!(
-            "Connection limit: {} max concurrent connections",
-            max_connections
-        );
-        Some(Arc::new(tokio::sync::Semaphore::new(max_connections)))
-    } else {
-        println!("Connection limit: unlimited");
-        None
+        "tokio"
     };
-
-    // Pre-compute allowed source IPs for fast lookup
-    let allowed_source_ips = config.proxy.security.allowed_source_ips.clone();
-    let has_ip_allowlist = !allowed_source_ips.is_empty();
-    if has_ip_allowlist {
-        println!("Source IP allowlist: {:?}", allowed_source_ips);
-    }
-
-    loop {
-        let (stream, client_addr) = listener.accept().await?;
-
-        // Check source IP allowlist
-        if has_ip_allowlist && !is_source_ip_allowed(&client_addr.ip(), &allowed_source_ips) {
-            warn!(
-                client = %client_addr.ip(),
-                "Rejected: not in allowed source IPs"
-            );
-            drop(stream);
-            continue;
-        }
-
-        // Check connection limit (semaphore)
-        let permit = if let Some(ref sem) = connection_semaphore {
-            match sem.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    warn!(
-                        client = %client_addr,
-                        max_connections = max_connections,
-                        "Rejected: max connections reached"
-                    );
-                    // Tell the client we're at capacity instead of silently
-                    // dropping the socket — well-behaved clients will back off
-                    // (Retry-After) instead of immediately reconnecting.
-                    let mut stream = stream;
-                    let _ = stream.write_all(helpers::ACCEPT_CAPACITY_RESP).await;
-                    drop(stream);
-                    continue;
-                }
-            }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool = &config.proxy.connection_pool;
+    let sec = &config.proxy.security;
+    let engine_cfg = Arc::new(proxy::engine::EngineConfig {
+        security: Arc::new(sec.clone()),
+        dns_client: Arc::clone(&dns_client),
+        rate_limit: sec.rate_limit.clone(),
+        // `enabled: false` = pool nothing (a per-host cap of zero).
+        pool_max_per_host: if pool.enabled {
+            pool.max_connections_per_host
         } else {
-            None
-        };
-
-        let tls_connector = Arc::clone(&tls_connector);
-        let security = Arc::clone(&security_config);
-        let logging = Arc::clone(&logging_config);
-        let tcp_keepalive = Arc::clone(&tcp_keepalive_config);
-        let limiter = Arc::clone(&rate_limiter);
-        let pool = Arc::clone(&sender_pool);
-        let dns = Arc::clone(&dns_client);
-
-        tokio::task::spawn(async move {
-            // Permit is held for duration of connection, released on drop
-            let _permit = permit;
-
-            // Check rate limit before handling request
-            let mut stream = stream;
-            {
-                let mut limiter = limiter.lock().await;
-                if !limiter.is_allowed(client_addr.ip()) {
-                    warn!(
-                        client = %client_addr.ip(),
-                        max_requests = security.rate_limit.max_requests,
-                        window_seconds = security.rate_limit.window_seconds,
-                        "HTTP rate limit exceeded"
-                    );
-                    // Send 429 with Retry-After so the client knows to back
-                    // off rather than busy-reconnecting.
-                    let _ = stream.write_all(helpers::ACCEPT_RATELIMIT_RESP).await;
-                    return;
-                }
-            }
-
-            if let Err(err) = handle_client(
-                stream,
-                client_addr,
-                tls_connector,
-                security,
-                logging,
-                tcp_keepalive,
-                pool,
-                connect_timeout,
-                preserve_header_case,
-                dns,
-            )
-            .await
-            {
-                // Demote benign client-lifecycle errors (idle keep-alive timeout, peer FIN
-                // mid-parse) to debug. Real proxy errors still log at error level.
-                let benign = err
-                    .downcast_ref::<hyper::Error>()
-                    .map(|e| e.is_timeout() || e.is_incomplete_message())
-                    .unwrap_or(false);
-                if benign {
-                    debug!(client = %client_addr, error = ?err, "Client connection closed");
-                } else {
-                    error!(client = %client_addr, error = ?err, "Error serving client");
-                }
-            }
-        });
-    }
+            0
+        },
+        pool_max_total: pool.max_total_connections,
+        pool_idle_timeout: std::time::Duration::from_secs(pool.idle_timeout_seconds),
+        pool_max_lifetime: std::time::Duration::from_secs(pool.max_lifetime_seconds),
+        connect_timeout: std::time::Duration::from_secs(pool.connect_timeout_seconds),
+        header_read_timeout: std::time::Duration::from_secs(sec.header_read_timeout_seconds),
+        upstream_read_timeout: std::time::Duration::from_secs(sec.upstream_read_timeout_seconds),
+        client_idle_timeout: std::time::Duration::from_secs(sec.client_idle_timeout_seconds),
+        tcp_keepalive: config.proxy.tcp_keepalive.clone(),
+        forwarded_for: config.proxy.forwarded_for,
+        max_request_body_bytes: sec.max_request_body_bytes,
+        max_requests_per_conn: sec.max_requests_per_connection,
+        max_connections: sec.max_connections,
+        log_requests: config.logging.log_requests,
+    });
+    println!(
+        "Forward proxy (engine, {}) listening on http://{} ({} threads)",
+        backend_name, listen_addr, threads
+    );
+    tokio::task::block_in_place(|| {
+        proxy::engine::run_forward(listen_addr, engine_cfg, threads, backend)
+    })
+    .map_err(Into::into)
 }
 
 /// Resolves when the process is asked to stop: Ctrl-C everywhere, and

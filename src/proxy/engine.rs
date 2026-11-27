@@ -16,8 +16,8 @@ use crate::proxy::forward::{
     parse_connect_target, rewrite_forward_with_metadata, ForwardError, Target,
 };
 use crate::proxy::framing::{
-    scan_message_with_metadata, scan_response_head, BodyFraming, ChunkProgress, ChunkedTracker,
-    MessageError, MessageMetadata, MessageScan, ResponseBody, ResponseHead,
+    scan_response_head, BodyFraming, ChunkProgress, ChunkedTracker, MessageError, MessageMetadata,
+    ResponseBody, ResponseHead,
 };
 use crate::security::{
     is_blocked_target, is_source_ip_allowed, resolved_addrs_blocked, RateLimiter,
@@ -70,7 +70,7 @@ pub struct EngineConfig {
     /// Max concurrent client connections across all workers; 0 = unlimited.
     pub max_connections: usize,
     /// Emit per-request INFO logs for HTTP forwards and CONNECT tunnels.
-    /// Mirrors `logging.log_requests` in the hyper path.
+    /// (`logging.log_requests`.)
     pub log_requests: bool,
 }
 
@@ -137,27 +137,6 @@ pub enum RelayErr {
     /// A head or body framing the proxy refuses to interpret (-> 400). These
     /// are the shapes request smuggling is made of, so they are logged.
     Malformed,
-}
-
-/// Read exactly one complete HTTP/1 message from `src` into `acc`, returning its
-/// bytes and leaving any trailing (pipelined) bytes in `acc`. Runtime-agnostic.
-///
-/// `head_timeout` (when Some) bounds the *total* time to receive a complete head
-/// (CRLFCRLF) — slowloris defense; it does NOT bound body transfer (the metadata
-/// variant takes a separate idle limit for that). `max_body`
-/// (>0) rejects an oversized declared Content-Length up front (-> TooLarge).
-pub async fn relay_once<C: ProxyIo>(
-    src: &mut C,
-    acc: &mut BytesMut,
-    is_request: bool,
-    head_timeout: Option<Duration>,
-    max_body: u64,
-) -> Result<Bytes, RelayErr> {
-    // Backward-compat wrapper: tests and the response path call this; only
-    // proxy_forward needs the metadata variant.
-    relay_once_with_metadata(src, acc, is_request, head_timeout, None, max_body)
-        .await
-        .map(|(b, _)| b)
 }
 
 #[cfg(test)]
@@ -352,46 +331,6 @@ pub async fn read_request<C: ProxyIo>(
                 }
                 more(src, acc, body_idle_timeout).await?;
             }
-        }
-    }
-}
-
-/// Like `relay_once`, but also returns the routing metadata extracted while
-/// framing the message. A request is always read whole here; the engine's
-/// request loop uses `read_request` directly so it can stream large bodies.
-pub async fn relay_once_with_metadata<C: ProxyIo>(
-    src: &mut C,
-    acc: &mut BytesMut,
-    is_request: bool,
-    head_timeout: Option<Duration>,
-    body_idle_timeout: Option<Duration>,
-    max_body: u64,
-) -> Result<(Bytes, Option<MessageMetadata>), RelayErr> {
-    if is_request {
-        let request = read_request(
-            src,
-            acc,
-            head_timeout,
-            body_idle_timeout,
-            max_body,
-            usize::MAX, // never hand back a partial body
-        )
-        .await?;
-        return Ok((request.bytes, Some(request.meta)));
-    }
-    // Responses (only the fixed-upstream `proxy_pair` runner reads them this
-    // way; the forward engine frames responses with `scan_response_head`).
-    loop {
-        match scan_message_with_metadata(acc, false, max_body).0 {
-            MessageScan::Complete { total, .. } => {
-                return Ok((acc.split_to(total).freeze(), None));
-            }
-            MessageScan::Error(MessageError::BodyTooLarge) => return Err(RelayErr::TooLarge),
-            MessageScan::Error(_) => return Err(RelayErr::Malformed),
-            MessageScan::Incomplete => match src.read_append(acc).await {
-                Ok(n) if n > 0 => {}
-                _ => return Err(RelayErr::Closed),
-            },
         }
     }
 }
@@ -735,6 +674,21 @@ fn log_accept_error(error: &std::io::Error, consecutive: u32) {
     if consecutive == 1 || consecutive.is_multiple_of(100) {
         warn!(error = %error, consecutive, "Accepting a connection failed");
     }
+}
+
+/// Periodically drop rate-limiter records that have aged out of the window.
+/// Without this an address stays in the table until it is evicted for space,
+/// so the table only ever grows to its cap.
+fn spawn_rate_limiter_cleanup(limiter: Arc<Mutex<RateLimiter>>) {
+    let _ = std::thread::Builder::new()
+        .name("rate-limit-cleanup".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cleanup();
+        });
 }
 
 /// Releases a reserved connection slot when the connection task ends.
@@ -1588,33 +1542,10 @@ async fn relay_response<C: ProxyIo>(
     }
 }
 
-/// Relay one client connection against one upstream connection for their shared
-/// lifetime (HTTP/1 keep-alive): request -> upstream, response -> client, repeat
-/// until either closes or a message is rejected. This is the entire proxy hot
-/// loop, written once for every runtime.
-pub async fn proxy_pair<C: ProxyIo>(mut client: C, mut upstream: C) {
-    let mut req_acc: BytesMut = BytesMut::with_capacity(512);
-    let mut resp_acc: BytesMut = BytesMut::with_capacity(512);
-    loop {
-        let Ok(req) = relay_once(&mut client, &mut req_acc, true, None, 0).await else {
-            return;
-        };
-        if upstream.write_all(&req).await.is_err() {
-            return;
-        }
-        let Ok(resp) = relay_once(&mut upstream, &mut resp_acc, false, None, 0).await else {
-            return;
-        };
-        if client.write_all(&resp).await.is_err() {
-            return;
-        }
-    }
-}
-
 // ===================== tokio backend (portable) =====================
 
 mod tokio_backend {
-    use super::{proxy_forward, proxy_pair, ConnGuard, Connect, EngineConfig, ProxyIo};
+    use super::{proxy_forward, ConnGuard, Connect, EngineConfig, ProxyIo};
     use crate::security::RateLimiter;
     use bytes::BytesMut;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1726,6 +1657,7 @@ mod tokio_backend {
         let listener = reuseaddr_listener(listen)?;
         // Shared across workers: per-IP rate limiter + global connection count.
         let limiter = Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit.clone())));
+        super::spawn_rate_limiter_cleanup(Arc::clone(&limiter));
         let conns = Arc::new(AtomicUsize::new(0));
         let mut senders = Vec::with_capacity(threads);
         let mut workers = Vec::with_capacity(threads);
@@ -1791,49 +1723,6 @@ mod tokio_backend {
                         tokio::task::spawn_local(async move {
                             let _g = guard;
                             proxy_forward(TokioConn(client), connector, cfg, peer, pool).await;
-                        });
-                    }
-                });
-            }));
-        }
-        accept_loop(listener, &senders, threads);
-        for w in workers {
-            let _ = w.join();
-        }
-        Ok(())
-    }
-
-    /// Portable thread-per-core runner: one blocking acceptor distributes
-    /// accepted sockets round-robin to N `current_thread` + `LocalSet` workers.
-    /// No SO_REUSEPORT, so it works on Windows as well as Linux; each connection
-    /// is pinned to one worker thread (shared-nothing, no work-stealing).
-    pub fn run(listen: SocketAddr, upstream: SocketAddr, threads: usize) -> std::io::Result<()> {
-        let listener = reuseaddr_listener(listen)?;
-        let mut senders = Vec::with_capacity(threads);
-        let mut workers = Vec::with_capacity(threads);
-
-        for _ in 0..threads {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
-            senders.push(tx);
-            workers.push(std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("current_thread runtime");
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    while let Some(std_stream) = rx.recv().await {
-                        let _ = std_stream.set_nonblocking(true);
-                        let client = match tokio::net::TcpStream::from_std(std_stream) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        let _ = client.set_nodelay(true);
-                        tokio::task::spawn_local(async move {
-                            if let Ok(up) = tokio::net::TcpStream::connect(upstream).await {
-                                let _ = up.set_nodelay(true);
-                                proxy_pair(TokioConn(client), TokioConn(up)).await;
-                            }
                         });
                     }
                 });
@@ -1932,15 +1821,13 @@ mod tokio_backend {
 }
 
 #[allow(unused_imports)] // used by examples (separate crates), not the lib/bin
-pub use tokio_backend::{
-    run as run_tokio, run_forward as run_tokio_forward, TokioConn, TokioConnector,
-};
+pub use tokio_backend::{run_forward as run_tokio_forward, TokioConn, TokioConnector};
 
 // ===================== monoio backend (Linux / io_uring) =====================
 
 #[cfg(all(feature = "engine-uring", target_os = "linux"))]
 mod monoio_backend {
-    use super::{proxy_forward, proxy_pair, ConnGuard, Connect, EngineConfig, ProxyIo};
+    use super::{proxy_forward, ConnGuard, Connect, EngineConfig, ProxyIo};
     use crate::security::RateLimiter;
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
     use monoio::net::{TcpListener, TcpStream};
@@ -2034,48 +1921,6 @@ mod monoio_backend {
         let _ = crate::helpers::apply_tcp_keepalive_to(socket2::SockRef::from(&fd), config);
     }
 
-    /// Thread-per-core io_uring runner: each worker has its own monoio runtime
-    /// and its own SO_REUSEPORT listener; the kernel load-balances connections.
-    pub fn run(listen: SocketAddr, upstream: SocketAddr, threads: usize) -> std::io::Result<()> {
-        let mut handles = Vec::with_capacity(threads);
-        for _ in 0..threads {
-            handles.push(std::thread::spawn(move || worker(listen, upstream)));
-        }
-        for h in handles {
-            let _ = h.join();
-        }
-        Ok(())
-    }
-
-    fn worker(listen: SocketAddr, upstream: SocketAddr) {
-        let std_listener = reuseport_listener(listen);
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .expect("monoio runtime");
-        rt.block_on(async move {
-            let listener = TcpListener::from_std(std_listener).expect("from_std");
-            loop {
-                match listener.accept().await {
-                    Ok((client, _)) => {
-                        monoio::spawn(handle(client, upstream));
-                    }
-                    Err(_) => continue,
-                }
-            }
-        });
-    }
-
-    async fn handle(client: TcpStream, upstream: SocketAddr) {
-        let _ = client.set_nodelay(true);
-        let up = match TcpStream::connect(upstream).await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let _ = up.set_nodelay(true);
-        proxy_pair(MonoConn::new(client), MonoConn::new(up)).await;
-    }
-
     fn reuseport_listener(addr: SocketAddr) -> std::net::TcpListener {
         let sock =
             Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP)).unwrap();
@@ -2150,6 +1995,7 @@ mod monoio_backend {
         threads: usize,
     ) -> std::io::Result<()> {
         let limiter = Arc::new(Mutex::new(RateLimiter::new(cfg.rate_limit.clone())));
+        super::spawn_rate_limiter_cleanup(Arc::clone(&limiter));
         let conns = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
@@ -2242,9 +2088,7 @@ mod monoio_backend {
 
 #[cfg(all(feature = "engine-uring", target_os = "linux"))]
 #[allow(unused_imports)]
-pub use monoio_backend::{
-    run as run_monoio, run_forward as run_monoio_forward, MonoConn, MonoConnector,
-};
+pub use monoio_backend::{run_forward as run_monoio_forward, MonoConn, MonoConnector};
 
 // ===================== platform-selecting entry point =====================
 
@@ -2257,57 +2101,6 @@ pub enum Backend {
     Tokio,
     /// io_uring (monoio) — Linux only.
     Uring,
-}
-
-impl Backend {
-    pub fn parse(s: &str) -> Option<Backend> {
-        match s {
-            "auto" => Some(Backend::Auto),
-            "tokio" => Some(Backend::Tokio),
-            "uring" => Some(Backend::Uring),
-            _ => None,
-        }
-    }
-}
-
-/// Run the proxy with the chosen backend, selecting per platform. `Auto` uses
-/// io_uring on Linux and tokio everywhere else; `Uring` is rejected off Linux.
-/// The same `ProxyIo` core runs underneath regardless.
-pub fn run(
-    listen: std::net::SocketAddr,
-    upstream: std::net::SocketAddr,
-    threads: usize,
-    backend: Backend,
-) -> std::io::Result<()> {
-    // Auto picks io_uring only when that backend was actually compiled in
-    // (engine-uring + Linux); otherwise the portable tokio backend.
-    let resolved = match backend {
-        Backend::Auto => {
-            if cfg!(all(feature = "engine-uring", target_os = "linux")) {
-                Backend::Uring
-            } else {
-                Backend::Tokio
-            }
-        }
-        b => b,
-    };
-    match resolved {
-        Backend::Tokio => run_tokio(listen, upstream, threads),
-        Backend::Uring => {
-            #[cfg(all(feature = "engine-uring", target_os = "linux"))]
-            {
-                run_monoio(listen, upstream, threads)
-            }
-            #[cfg(not(all(feature = "engine-uring", target_os = "linux")))]
-            {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "io_uring backend not built (enable feature `engine-uring` on Linux)",
-                ))
-            }
-        }
-        Backend::Auto => unreachable!("resolved above"),
-    }
 }
 
 /// Run the FORWARD proxy (per-request routing + SSRF) with the chosen backend,
@@ -2353,6 +2146,40 @@ pub fn run_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read one whole request (never a partial body), as most of these tests
+    /// want it: its bytes, with anything after it left in `acc`.
+    async fn relay_once<C: ProxyIo>(
+        src: &mut C,
+        acc: &mut BytesMut,
+        head_timeout: Option<Duration>,
+        max_body: u64,
+    ) -> Result<Bytes, RelayErr> {
+        relay_once_with_metadata(src, acc, head_timeout, None, max_body)
+            .await
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// `relay_once`, with a body idle limit and the parsed head's metadata.
+    async fn relay_once_with_metadata<C: ProxyIo>(
+        src: &mut C,
+        acc: &mut BytesMut,
+        head_timeout: Option<Duration>,
+        body_idle_timeout: Option<Duration>,
+        max_body: u64,
+    ) -> Result<(Bytes, MessageMetadata), RelayErr> {
+        let request = read_request(
+            src,
+            acc,
+            head_timeout,
+            body_idle_timeout,
+            max_body,
+            usize::MAX,
+        )
+        .await?;
+        assert!(matches!(request.rest, BodyRest::Complete));
+        Ok((request.bytes, request.meta))
+    }
 
     /// In-memory ProxyIo: replays scripted read chunks, captures writes.
     struct MockConn {
@@ -2412,7 +2239,7 @@ mod tests {
             b"lo",
         ]);
         let mut acc = bytes::BytesMut::new();
-        let msg = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).expect("complete");
+        let msg = block_on(relay_once(&mut conn, &mut acc, None, 0)).expect("complete");
         assert_eq!(
             &msg[..],
             &b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"[..]
@@ -2426,10 +2253,10 @@ mod tests {
             b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n",
         ]);
         let mut acc = bytes::BytesMut::new();
-        let first = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).expect("first");
+        let first = block_on(relay_once(&mut conn, &mut acc, None, 0)).expect("first");
         assert_eq!(&first[..], &b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"[..]);
         // The second request stays buffered for the next call.
-        let second = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).expect("second");
+        let second = block_on(relay_once(&mut conn, &mut acc, None, 0)).expect("second");
         assert_eq!(&second[..], &b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n"[..]);
     }
 
@@ -2439,42 +2266,14 @@ mod tests {
             b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         ]);
         let mut acc = bytes::BytesMut::new();
-        assert!(block_on(relay_once(&mut conn, &mut acc, true, None, 0)).is_err());
+        assert!(block_on(relay_once(&mut conn, &mut acc, None, 0)).is_err());
     }
 
     #[test]
     fn relay_eof_returns_none() {
         let mut conn = MockConn::new(vec![]); // immediate EOF
         let mut acc = bytes::BytesMut::new();
-        assert!(block_on(relay_once(&mut conn, &mut acc, true, None, 0)).is_err());
-    }
-
-    #[test]
-    fn proxy_pair_relays_request_and_response() {
-        // client sends one GET; upstream replies once; then both EOF.
-        let client = MockConn::new(vec![b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"]);
-        let upstream = MockConn::new(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"]);
-        // We need to inspect writes afterward; run and check via a wrapper.
-        let mut client = client;
-        let mut upstream = upstream;
-        block_on(async {
-            // inline the loop once to capture written buffers
-            let mut req_acc = bytes::BytesMut::new();
-            let req = relay_once(&mut client, &mut req_acc, true, None, 0)
-                .await
-                .unwrap();
-            upstream.write_all(&req).await.unwrap();
-            let mut resp_acc = bytes::BytesMut::new();
-            let resp = relay_once(&mut upstream, &mut resp_acc, false, None, 0)
-                .await
-                .unwrap();
-            client.write_all(&resp).await.unwrap();
-        });
-        assert_eq!(&upstream.written, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert_eq!(
-            &client.written,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-        );
+        assert!(block_on(relay_once(&mut conn, &mut acc, None, 0)).is_err());
     }
 
     /// Stub Connect that panics on any use — proves resolve_target's literal-IP
@@ -2502,8 +2301,10 @@ mod tests {
     /// block_private_ips is on, including the IPv4-mapped IPv6 form.
     #[test]
     fn resolve_target_blocks_literal_private_ip_defense_in_depth() {
-        let mut sec = SecurityConfig::default();
-        sec.block_private_ips = true;
+        let sec = SecurityConfig {
+            block_private_ips: true,
+            ..SecurityConfig::default()
+        };
         let dns = panic_client();
 
         // Native IPv4 private.
@@ -2524,8 +2325,10 @@ mod tests {
         assert!(block_on(resolve_target("8.8.8.8", 80, &sec, &dns)).is_ok());
 
         // When block_private_ips is OFF, private literal IPs are allowed (sanity).
-        let mut off = SecurityConfig::default();
-        off.block_private_ips = false;
+        let off = SecurityConfig {
+            block_private_ips: false,
+            ..SecurityConfig::default()
+        };
         assert!(block_on(resolve_target("127.0.0.1", 80, &off, &dns)).is_ok());
     }
 
@@ -3133,7 +2936,6 @@ mod tests {
         let result = block_on(relay_once_with_metadata(
             &mut conn,
             &mut acc,
-            true,
             Some(head_limit),
             Some(idle),
             0,
@@ -3149,9 +2951,7 @@ mod tests {
         // Without the limit the body reads are untimed, as before.
         let mut conn = SharedConn::new(vec![head, b"abc", b"defghij"]);
         let mut acc = BytesMut::new();
-        let result = block_on(relay_once_with_metadata(
-            &mut conn, &mut acc, true, None, None, 0,
-        ));
+        let result = block_on(relay_once_with_metadata(&mut conn, &mut acc, None, None, 0));
         assert!(result.is_ok());
         assert!(conn.timed_reads().is_empty());
     }
@@ -3526,7 +3326,7 @@ mod tests {
         script.extend(std::iter::repeat_n(&b"8\r\n01234567\r\n"[..], 1000));
         let mut conn = MockConn::new(script);
         let mut acc = BytesMut::new();
-        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 100));
+        let result = block_on(relay_once(&mut conn, &mut acc, None, 100));
         assert!(matches!(result, Err(RelayErr::TooLarge)), "{result:?}");
         assert!(conn.reads.len() > 900, "{} reads left", conn.reads.len());
 
@@ -3537,7 +3337,7 @@ mod tests {
             b"0\r\n\r\n",
         ]);
         let mut acc = BytesMut::new();
-        assert!(block_on(relay_once(&mut ok, &mut acc, true, None, 100)).is_ok());
+        assert!(block_on(relay_once(&mut ok, &mut acc, None, 100)).is_ok());
     }
 
     /// Regression: every read re-scanned the whole request, so an upload sent
@@ -3550,7 +3350,7 @@ mod tests {
             HEAD_PARSES.with(|n| n.set(0));
             let mut conn = MockConn::new(script);
             let mut acc = BytesMut::new();
-            let msg = block_on(relay_once(&mut conn, &mut acc, true, None, 0)).unwrap();
+            let msg = block_on(relay_once(&mut conn, &mut acc, None, 0)).unwrap();
             (HEAD_PARSES.with(|n| n.get()), msg.len())
         };
 
@@ -3595,7 +3395,7 @@ mod tests {
             b"0\r\n\r\n",
         ]);
         let mut acc = BytesMut::new();
-        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 0));
+        let result = block_on(relay_once(&mut conn, &mut acc, None, 0));
         assert!(matches!(result, Err(RelayErr::Malformed)), "{result:?}");
         assert_eq!(
             conn.reads.len(),
@@ -3620,7 +3420,7 @@ mod tests {
         script.extend(std::iter::repeat_n(&filler[..], 1000));
         let mut conn = MockConn::new(script);
         let mut acc = BytesMut::new();
-        let result = block_on(relay_once(&mut conn, &mut acc, true, None, 0));
+        let result = block_on(relay_once(&mut conn, &mut acc, None, 0));
         assert!(matches!(result, Err(RelayErr::Closed)), "{result:?}");
         assert!(conn.reads.len() > 900, "{} reads left", conn.reads.len());
     }
@@ -3661,6 +3461,16 @@ mod tests {
         assert_eq!(pool.sweep(start + Duration::from_secs(40)), 1);
         assert_eq!(pool.total, 1);
         assert_eq!(pool.checkout("a.test", 80).map(|(c, _)| c), Some(2));
+    }
+
+    /// `connection_pool.enabled: false` is passed down as a per-host cap of
+    /// zero: nothing is kept.
+    #[test]
+    fn pool_with_a_zero_per_host_cap_keeps_nothing() {
+        let mut pool: ConnPool<u8> = ConnPool::new(0, 16, Duration::ZERO, Duration::ZERO);
+        pool.checkin("a.test".into(), 80, 1, std::time::Instant::now());
+        assert_eq!(pool.total, 0);
+        assert!(pool.checkout("a.test", 80).is_none());
     }
 
     #[test]

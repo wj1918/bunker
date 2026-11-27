@@ -191,7 +191,6 @@ logging:
   # them. Use "debug" to record every request.
   level: info
   format: text
-  redact_sensitive_headers: true
   # Create the log_dir before first run: New-Item -ItemType Directory C:\Bunker\logs -Force
   file:
     log_dir: "C:\\Bunker\\logs"
@@ -387,7 +386,6 @@ dig @192.168.1.1 google.com
 | Rate Limiting | Per-IP request limits with IPv6 /64 subnet support |
 | Connection Limits | Configurable max concurrent connections |
 | IP Allowlist | Restrict proxy access to specific IPs/CIDRs |
-| Header Sanitization | Redacts sensitive headers in logs |
 | Slowloris Protection | Header read timeout |
 | HTTPS Only via CONNECT | An `https://` URL sent as a plain proxy request is refused (400) instead of being forwarded unencrypted |
 | Request Smuggling Defense | Ambiguous or malformed request framing is rejected (400) |
