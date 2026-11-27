@@ -98,7 +98,9 @@ type Datagram = (Vec<u8>, SocketAddr);
 type Inflight = Arc<Mutex<HashMap<u16, mpsc::Sender<Datagram>>>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The one socket all queries to an upstream share.
@@ -265,9 +267,8 @@ impl UdpDnsResolver {
         if let Some(existing) = lock(&self.sockets).get(&upstream) {
             return Ok(Arc::clone(existing));
         }
-        let opened = Arc::new(
-            UpstreamSocket::open(upstream, self.security.verify_upstream_source).await?,
-        );
+        let opened =
+            Arc::new(UpstreamSocket::open(upstream, self.security.verify_upstream_source).await?);
         // Two first queries can both get here; the second one's socket is
         // dropped and both use the first.
         Ok(Arc::clone(
@@ -358,8 +359,7 @@ impl DnsResolver for UdpDnsResolver {
         // single junk packet, before the genuine answer had a chance to
         // arrive. (One with another transaction ID never gets this far.)
         loop {
-            let (mut answer, from) = match tokio::time::timeout_at(deadline, answers.recv()).await
-            {
+            let (mut answer, from) = match tokio::time::timeout_at(deadline, answers.recv()).await {
                 Ok(Some(datagram)) => datagram,
                 Ok(None) | Err(_) => return Err(DnsError::Timeout),
             };
@@ -706,7 +706,10 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (_, from) = upstream.recv_from(&mut buf).await.unwrap();
-            upstream.send_to(&with_id_of(&buf, &big), from).await.unwrap();
+            upstream
+                .send_to(&with_id_of(&buf, &big), from)
+                .await
+                .unwrap();
         });
 
         let resolver = UdpDnsResolver::new(DnsSecurityConfig::default());
@@ -989,8 +992,7 @@ mod tests {
             while let Ok((len, from)) = socket.recv_from(&mut buf).await {
                 seen.lock().unwrap().push(from);
                 let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
-                let reply =
-                    builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
+                let reply = builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
                 let _ = socket.send_to(&reply, from).await;
             }
         });
@@ -1102,8 +1104,7 @@ mod tests {
             let mut buf = [0u8; 512];
             while let Ok((len, from)) = upstream.recv_from(&mut buf).await {
                 let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
-                let reply =
-                    builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
+                let reply = builder::build_response_with_ips(&buf[..len], &[ip], RecordType::A, 60);
                 let _ = upstream.send_to(&reply, from).await;
             }
         });
